@@ -72,7 +72,8 @@ impl OptWorkerSimple {
         })?;
 
         let irodori_root = settings.irodori_root();
-        let mut child = Command::new(&python)
+        let mut child_cmd = Command::new(&python);
+        child_cmd
             .arg("-u")
             .arg(&worker_script)
             .current_dir(irodori_root)
@@ -86,7 +87,9 @@ impl OptWorkerSimple {
             .env("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped());
+        crate::python_env::hide_console(&mut child_cmd);
+        let mut child = child_cmd
             .spawn()
             .map_err(|e| format!("failed to start opt worker ({python:?}): {e}"))?;
 

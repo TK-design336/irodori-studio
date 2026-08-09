@@ -260,9 +260,14 @@ pub fn start_train_job(
 
             #[cfg(windows)]
             {
-                use std::os::windows::process::CommandExt;
-                const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-                cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+                // CREATE_NEW_PROCESS_GROUP so cancel can signal the tree; CREATE_NO_WINDOW
+                // avoids a console flash that steals focus from the Studio UI.
+                const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+                crate::python_env::hide_console_with(&mut cmd, CREATE_NEW_PROCESS_GROUP);
+            }
+            #[cfg(not(windows))]
+            {
+                crate::python_env::hide_console(&mut cmd);
             }
 
             let mut child = cmd.spawn().map_err(|e| e.to_string())?;
@@ -420,8 +425,8 @@ pub fn run_blend(
         format!("Python が見つかりません: {}", settings.python_exe())
     })?;
 
-    let status = Command::new(&python)
-        .arg("-u")
+    let mut cmd = Command::new(&python);
+    cmd.arg("-u")
         .arg(&script)
         .arg("--embed-a")
         .arg(embed_a)
@@ -431,9 +436,9 @@ pub fn run_blend(
         .arg(alpha.to_string())
         .arg("--output")
         .arg(&out_path)
-        .current_dir(settings.irodori_root())
-        .status()
-        .map_err(|e| e.to_string())?;
+        .current_dir(settings.irodori_root());
+    crate::python_env::hide_console(&mut cmd);
+    let status = cmd.status().map_err(|e| e.to_string())?;
 
     if !status.success() {
         return Err(format!("blend failed: {status}"));
@@ -464,7 +469,8 @@ pub fn run_alkana_suggest(settings: &AppSettings, text: &str) -> Result<Vec<Kata
         format!("Python が見つかりません: {}", settings.python_exe())
     })?;
 
-    let mut child = Command::new(&python)
+    let mut child_cmd = Command::new(&python);
+    child_cmd
         .arg("-u")
         .arg(&script)
         .current_dir(settings.irodori_root())
@@ -473,9 +479,9 @@ pub fn run_alkana_suggest(settings: &AppSettings, text: &str) -> Result<Vec<Kata
         .env("PYTHONUTF8", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| e.to_string())?;
+        .stderr(Stdio::piped());
+    crate::python_env::hide_console(&mut child_cmd);
+    let mut child = child_cmd.spawn().map_err(|e| e.to_string())?;
 
     {
         let stdin = child.stdin.as_mut().ok_or("stdin unavailable")?;

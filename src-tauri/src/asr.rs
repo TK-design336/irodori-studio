@@ -64,7 +64,8 @@ fn run_python_json(
     }
     let python = resolve_python(settings)?;
 
-    let mut child = Command::new(&python)
+    let mut child_cmd = Command::new(&python);
+    child_cmd
         .arg("-u")
         .arg(&script)
         .current_dir(settings.irodori_root())
@@ -72,9 +73,9 @@ fn run_python_json(
         .env("PYTHONUTF8", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| e.to_string())?;
+        .stderr(Stdio::piped());
+    crate::python_env::hide_console(&mut child_cmd);
+    let mut child = child_cmd.spawn().map_err(|e| e.to_string())?;
 
     {
         let stdin = child.stdin.as_mut().ok_or("stdin unavailable")?;
@@ -216,7 +217,8 @@ impl AsrWorker {
         }
         let python = resolve_python(settings)?;
 
-        let mut child = Command::new(&python)
+        let mut child_cmd = Command::new(&python);
+        child_cmd
             .arg("-u")
             .arg(&script)
             .current_dir(&python_dir)
@@ -228,7 +230,9 @@ impl AsrWorker {
             .env("CT2_FORCE_CPU", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped());
+        crate::python_env::hide_console(&mut child_cmd);
+        let mut child = child_cmd
             .spawn()
             .map_err(|e| format!("failed to start ASR worker: {e}"))?;
 

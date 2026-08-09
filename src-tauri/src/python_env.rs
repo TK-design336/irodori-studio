@@ -4,6 +4,35 @@ use crate::settings::{resolve_python_exe, AppSettings};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+/// Hide the console window on Windows so short-lived python/ffmpeg spawns
+/// do not flash a CMD window or steal focus from the UI (e.g. while typing).
+pub fn hide_console(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
+/// Like [`hide_console`], but OR-ed with extra Windows creation flags.
+pub fn hide_console_with(cmd: &mut Command, extra_flags: u32) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW | extra_flags);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (cmd, extra_flags);
+    }
+}
+
 pub fn resolve_python(settings: &AppSettings) -> Result<PathBuf, String> {
     resolve_python_exe(settings).ok_or_else(|| {
         format!("Python が見つかりません: {}", settings.python_exe())
@@ -11,13 +40,14 @@ pub fn resolve_python(settings: &AppSettings) -> Result<PathBuf, String> {
 }
 
 fn python_ok(python: &PathBuf, code: &str) -> bool {
-    Command::new(python)
-        .args(["-c", code])
+    let mut cmd = Command::new(python);
+    cmd.args(["-c", code])
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONUTF8", "1")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::null());
+    hide_console(&mut cmd);
+    cmd.status()
         .map(|s| s.success())
         .unwrap_or(false)
 }
@@ -28,12 +58,14 @@ pub fn ensure_pip(python: &PathBuf) -> Result<(), String> {
         return Ok(());
     }
 
-    let output = Command::new(python)
-        .args(["-m", "ensurepip", "--upgrade"])
+    let mut cmd = Command::new(python);
+    cmd.args(["-m", "ensurepip", "--upgrade"])
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONUTF8", "1")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    hide_console(&mut cmd);
+    let output = cmd
         .output()
         .map_err(|e| format!("ensurepip 起動失敗: {e}"))?;
 
@@ -70,12 +102,14 @@ pub fn ensure_packages(
     let mut args = vec!["-m", "pip", "install", "--upgrade"];
     args.extend(pip_packages.iter().copied());
 
-    let output = Command::new(python)
-        .args(&args)
+    let mut cmd = Command::new(python);
+    cmd.args(&args)
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONUTF8", "1")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    hide_console(&mut cmd);
+    let output = cmd
         .output()
         .map_err(|e| format!("pip 起動失敗: {e}"))?;
 

@@ -1080,6 +1080,12 @@ export function GenerateView({
   const skipSamplingAutoApply = useRef(false);
   const speedTimer = useRef<number | null>(null);
   const lineDraftsRef = useRef<Map<string, string>>(new Map());
+  /** Last text used for homograph detect (skip unchanged lines). */
+  const homoTextByLineRef = useRef<Record<string, string>>({});
+  const homoByLineRef = useRef<Record<string, HomographHitUi[]>>({});
+  useEffect(() => {
+    homoByLineRef.current = homoByLine;
+  }, [homoByLine]);
   const synthInflight = useRef(
     new Map<string, Promise<{ wav: string; line: ProjectLine } | null>>(),
   );
@@ -1797,13 +1803,25 @@ export function GenerateView({
     const p = projectRef.current;
     if (!p) {
       setHomoByLine({});
+      homoTextByLineRef.current = {};
       return;
     }
-    const next: Record<string, HomographHitUi[]> = {};
+    const prevTexts = homoTextByLineRef.current;
+    const nextTexts: Record<string, string> = {};
+    const next: Record<string, HomographHitUi[]> = { ...homoByLineRef.current };
+    let changed = false;
     for (const line of p.lines) {
       const text = lineDraftsRef.current.get(line.id) ?? line.text;
+      nextTexts[line.id] = text;
       if (!text.trim()) {
-        next[line.id] = [];
+        if ((next[line.id]?.length ?? 0) > 0 || prevTexts[line.id]) {
+          next[line.id] = [];
+          changed = true;
+        }
+        continue;
+      }
+      // Skip Python spawn when the line text is unchanged.
+      if (prevTexts[line.id] === text && next[line.id] !== undefined) {
         continue;
       }
       try {
@@ -1811,11 +1829,24 @@ export function GenerateView({
           text,
         });
         next[line.id] = hits;
+        changed = true;
       } catch {
         next[line.id] = [];
+        changed = true;
       }
     }
-    setHomoByLine(next);
+    // Drop removed lines
+    for (const id of Object.keys(next)) {
+      if (!(id in nextTexts)) {
+        delete next[id];
+        changed = true;
+      }
+    }
+    homoTextByLineRef.current = nextTexts;
+    if (changed) {
+      homoByLineRef.current = next;
+      setHomoByLine(next);
+    }
   }, []);
 
   // Keep ASR badge in sync with 要再生成 (dirty / missing wav).
@@ -1859,9 +1890,11 @@ export function GenerateView({
 
   useEffect(() => {
     if (!project) return;
+    // Debounce past typical IME / typing pauses so Python detect does not run
+    // (or steal focus) on every keystroke.
     const t = window.setTimeout(() => {
       void refreshHomographs();
-    }, 450);
+    }, 700);
     return () => window.clearTimeout(t);
   }, [project?.lines, refreshHomographs]);
 

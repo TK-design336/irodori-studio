@@ -429,10 +429,10 @@ fn run_ffmpeg_af(
     let ffmpeg = resolve_ffmpeg(settings).ok_or_else(|| {
         "ffmpeg が見つかりません。設定の ffmpeg パスか PATH を確認してください".to_string()
     })?;
-    let status = std::process::Command::new(ffmpeg)
-        .args(["-y", "-i", src, "-af", filter, dest])
-        .status()
-        .map_err(|e| e.to_string())?;
+    let mut cmd = std::process::Command::new(ffmpeg);
+    cmd.args(["-y", "-i", src, "-af", filter, dest]);
+    crate::python_env::hide_console(&mut cmd);
+    let status = cmd.status().map_err(|e| e.to_string())?;
     if !status.success() {
         return Err(format!("ffmpeg failed: {status}"));
     }
@@ -571,6 +571,7 @@ fn export_wavs_concatenated(
     };
 
     let mut cmd = std::process::Command::new(ffmpeg);
+    crate::python_env::hide_console(&mut cmd);
     cmd.arg("-y");
     for p in &seg_paths {
         cmd.arg("-i").arg(p);
@@ -683,7 +684,9 @@ fn wav_duration_secs(
     let settings = state.settings.lock().clone();
     // Prefer ffprobe (beside configured ffmpeg, else PATH)
     if let Some(ffprobe) = resolve_ffprobe(&settings) {
-        let output = std::process::Command::new(ffprobe)
+        let mut cmd = std::process::Command::new(ffprobe);
+        crate::python_env::hide_console(&mut cmd);
+        let output = cmd
             .args([
                 "-v",
                 "error",
