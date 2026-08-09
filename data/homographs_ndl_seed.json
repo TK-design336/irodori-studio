@@ -1,0 +1,746 @@
+{
+  "version": 1,
+  "stats": {
+    "count": 43
+  },
+  "entries": [
+    {
+      "surface": "上手",
+      "readings": [
+        "ウマ",
+        "ウワテ",
+        "カミテ",
+        "ジョウズ",
+        "ジョウテ",
+        "ンマ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "上手",
+        "旨い"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "下手",
+      "readings": [
+        "ゲシュ",
+        "シタテ",
+        "シタデ",
+        "シモテ",
+        "ヘタ",
+        "ベタ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "下手"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "人気",
+      "readings": [
+        "ジンキ",
+        "ニンキ",
+        "ヒトケ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "人気"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "今日",
+      "readings": [
+        "キョウ",
+        "コンニチ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "今日"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "作法",
+      "readings": [
+        "サクホウ",
+        "サホウ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "作法"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "係る",
+      "readings": [
+        "カカル",
+        "カカワル"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "掛かる",
+        "関わる"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "借家",
+      "readings": [
+        "シャクヤ",
+        "シャッカ",
+        "ジャクヤ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "借家"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "入る",
+      "readings": [
+        "イル",
+        "ハイル",
+        "バイル"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "入る"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "公文",
+      "readings": [
+        "クモン",
+        "コウブン"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "公文"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "口腔",
+      "readings": [
+        "クチムロ",
+        "コウクウ",
+        "コウコウ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "口腔"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "市場",
+      "readings": [
+        "イチバ",
+        "シジョウ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "市場"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "強い",
+      "readings": [
+        "コワイ",
+        "シイ",
+        "ジイ",
+        "ツヨイ",
+        "ヅヨイ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "強い",
+        "強いる"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "後世",
+      "readings": [
+        "コウセイ",
+        "ゴセ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "後世"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "教化",
+      "readings": [
+        "キョウカ",
+        "キョウケ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "教化"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "方",
+      "readings": [
+        "カタ",
+        "ガタ",
+        "ホウ",
+        "ポウ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "方"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "施行",
+      "readings": [
+        "シギョウ",
+        "シコウ",
+        "セギョウ",
+        "セコウ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "施行"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "早い",
+      "readings": [
+        "ハヤイ",
+        "バヤイ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "早い"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "明日",
+      "readings": [
+        "アシタ",
+        "アス",
+        "ミョウニチ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "明日"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "気質",
+      "readings": [
+        "カタギ",
+        "キシツ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "気質"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "求道",
+      "readings": [
+        "キュウドウ",
+        "グドウ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "求道"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "現世",
+      "readings": [
+        "ゲンセ",
+        "ゲンセイ",
+        "ゲンゼ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "現世"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "生",
+      "readings": [
+        "イキ",
+        "ウブ",
+        "ウマレ",
+        "キ",
+        "ショウ",
+        "ジョウ",
+        "セイ",
+        "ナ",
+        "ナマ",
+        "ハエ",
+        "ム"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "初",
+        "成す",
+        "生",
+        "生える",
+        "生きる",
+        "生す",
+        "生まれ",
+        "生る"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "生物",
+      "readings": [
+        "セイブツ",
+        "ナマモノ",
+        "ナマモン"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "生物"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "生花",
+      "readings": [
+        "イケバナ",
+        "セイカ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "生け花",
+        "生花"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "石綿",
+      "readings": [
+        "イシワタ",
+        "セキメン"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "石綿"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "空",
+      "readings": [
+        "ウツロ",
+        "ウロ",
+        "カラ",
+        "クウ",
+        "クウジ",
+        "クウズ",
+        "クウゼ",
+        "ソラ",
+        "ゾラ",
+        "ヘ",
+        "ムナシ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "減る",
+        "空",
+        "空しい",
+        "空ずる",
+        "虚",
+        "虚ろ"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "競売",
+      "readings": [
+        "キョウバイ",
+        "ケイバイ",
+        "セリウリ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "競り売り",
+        "競売"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "血脈",
+      "readings": [
+        "ケチミャク",
+        "ケツミャク"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "血脈"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "行",
+      "readings": [
+        "イキ",
+        "イク",
+        "ギョウ",
+        "コウ",
+        "ゴウ",
+        "ヤ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "行",
+        "行-銀行",
+        "行き",
+        "行く",
+        "遣る"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "行く",
+      "readings": [
+        "イク",
+        "ユク"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "行く"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "行方",
+      "readings": [
+        "ユキガタ",
+        "ユクエ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "行き方",
+        "行方"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "表",
+      "readings": [
+        "アラワ",
+        "オモテ",
+        "ヒョウ",
+        "ピョウ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "表",
+        "表する",
+        "表わす"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "角",
+      "readings": [
+        "カク",
+        "カッ",
+        "カド",
+        "スミ",
+        "ツノ",
+        "ヅノ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "角",
+        "角い",
+        "隅"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "言う",
+      "readings": [
+        "イウ",
+        "ユウ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "言う"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "足跡",
+      "readings": [
+        "アシアト",
+        "ソクセキ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "足跡"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "辛い",
+      "readings": [
+        "カライ",
+        "ガライ",
+        "ツライ",
+        "ヅライ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "辛い"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "通",
+      "readings": [
+        "ツウ",
+        "トオ",
+        "トオリ",
+        "ドオ",
+        "ドオリ",
+        "ミチ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "通",
+        "通す",
+        "通り",
+        "通る",
+        "道"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "開く",
+      "readings": [
+        "アク",
+        "ヒラク"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "開く"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "開眼",
+      "readings": [
+        "カイガン",
+        "カイゲン"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "開眼"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "雑",
+      "readings": [
+        "ザッ",
+        "ザツ",
+        "ゾウ",
+        "マザ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "混ざる",
+        "雑",
+        "雑い"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "風車",
+      "readings": [
+        "カザグルマ",
+        "フウシャ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "風車"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "高い",
+      "readings": [
+        "タカイ",
+        "ダカイ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "高い"
+      ],
+      "ndlSeed": true
+    },
+    {
+      "surface": "魚",
+      "readings": [
+        "ウオ",
+        "ギョ",
+        "サカナ",
+        "ザカナ"
+      ],
+      "sources": [
+        "csj",
+        "cwj"
+      ],
+      "lemmas": [
+        "魚"
+      ],
+      "ndlSeed": true
+    }
+  ]
+}
