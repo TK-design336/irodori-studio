@@ -18,6 +18,12 @@ def emit_fraction(i: int, n: int, detail: str = "") -> None:
     print(f"PROGRESS\t{json.dumps(payload, ensure_ascii=False)}", flush=True)
 
 
+def _ffmpeg_bin() -> str:
+    import os
+
+    return os.environ.get("FFMPEG_BINARY") or "ffmpeg"
+
+
 def atempo_filter(speed: float) -> str:
     """Build atempo chain; each factor must be in [0.5, 2.0]."""
     factors: list[float] = []
@@ -43,7 +49,7 @@ def speed_one(path: Path, speed: float) -> None:
         tmp_path = Path(tmp.name)
     try:
         cmd = [
-            "ffmpeg",
+            _ffmpeg_bin(),
             "-y",
             "-i",
             str(path),

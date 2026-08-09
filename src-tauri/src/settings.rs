@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use tauri::{AppHandle, Manager};
+use tauri::path::BaseDirectory;
+
+/// Resolved once at app startup (Tauri `$RESOURCE/python`).
+static STUDIO_PYTHON_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Per-engine path bundle (v3 and v4 keep separate roots / checkpoints / embeddings).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -27,6 +33,9 @@ pub struct AppSettings {
     pub model_device: String,
     pub codec_device: String,
     pub projects_root: String,
+    /// Absolute path to `ffmpeg` / `ffmpeg.exe`. Empty → resolve from PATH.
+    #[serde(default)]
+    pub ffmpeg_path: String,
     #[serde(default = "default_theme")]
     pub theme: String,
     /// Silence between chunks on batch play / default for concat export (ms).
@@ -184,6 +193,7 @@ impl Default for AppSettings {
                 .join("projects")
                 .display()
                 .to_string(),
+            ffmpeg_path: String::new(),
             theme: default_theme(),
             chunk_silence_ms: default_chunk_silence_ms(),
             utterance_max_chars: default_utterance_max_chars(),
@@ -231,10 +241,14 @@ impl AppSettings {
         }
     }
 
-    /// True when engine root / python / checkpoint / outputs / version differ.
+    /// True when engine root / python / checkpoint / outputs / version / device / precision differ.
     pub fn engine_identity_changed(&self, other: &AppSettings) -> bool {
         self.irodori_version != other.irodori_version
             || self.active_paths() != other.active_paths()
+            || self.model_device != other.model_device
+            || self.codec_device != other.codec_device
+            || self.model_precision != other.model_precision
+            || self.codec_precision != other.codec_precision
     }
 }
 
@@ -251,10 +265,12 @@ struct LegacyFlatSettings {
     model_device: Option<String>,
     codec_device: Option<String>,
     projects_root: Option<String>,
+    ffmpeg_path: Option<String>,
     theme: Option<String>,
     chunk_silence_ms: Option<u32>,
     utterance_max_chars: Option<u32>,
     export_filename_parts: Option<Vec<String>>,
+    asr_cer_warn_threshold: Option<f64>,
     irodori_version: Option<String>,
     paths_v3: Option<VersionPathSettings>,
     paths_v4: Option<VersionPathSettings>,
@@ -321,8 +337,14 @@ fn migrate_from_value(value: serde_json::Value) -> Option<AppSettings> {
     if let Some(v) = legacy.projects_root {
         settings.projects_root = v;
     }
+    if let Some(v) = legacy.ffmpeg_path {
+        settings.ffmpeg_path = v;
+    }
     if let Some(v) = legacy.theme {
         settings.theme = v;
+    }
+    if let Some(v) = legacy.asr_cer_warn_threshold {
+        settings.asr_cer_warn_threshold = v;
     }
     if let Some(v) = legacy.chunk_silence_ms {
         settings.chunk_silence_ms = v;
@@ -387,6 +409,11 @@ pub struct PathValidation {
     pub irodori_version: String,
     #[serde(default)]
     pub train_config_ok: bool,
+    /// Bundled Studio scripts (`opt_worker.py` etc.) resolved.
+    #[serde(default)]
+    pub studio_scripts_ok: bool,
+    #[serde(default)]
+    pub studio_python_dir: Option<String>,
 }
 
 /// Resolve a usable Python executable.
@@ -420,9 +447,10 @@ pub fn resolve_python_exe(settings: &AppSettings) -> Option<PathBuf> {
 }
 
 pub fn validate_settings(settings: &AppSettings) -> PathValidation {
-    let ffmpeg = which::which("ffmpeg").ok().map(|p| p.display().to_string());
+    let ffmpeg = resolve_ffmpeg(settings).map(|p| p.display().to_string());
     let python_ok = resolve_python_exe(settings).is_some();
     let train_cfg = Path::new(settings.irodori_root()).join(settings.train_config_rel());
+    let studio = studio_python_dir().ok();
     PathValidation {
         irodori_root_ok: Path::new(settings.irodori_root()).is_dir(),
         python_ok,
@@ -433,23 +461,160 @@ pub fn validate_settings(settings: &AppSettings) -> PathValidation {
         ffmpeg_path: ffmpeg,
         irodori_version: settings.irodori_version.clone(),
         train_config_ok: train_cfg.is_file(),
+        studio_scripts_ok: studio.is_some(),
+        studio_python_dir: studio.map(|p| p.display().to_string()),
     }
 }
 
-pub fn studio_python_dir() -> Result<PathBuf, String> {
-    // Dev: src-tauri/../python  | Release: next to resources
+fn studio_python_candidate_ok(dir: &Path) -> bool {
+    dir.join("opt_worker.py").is_file()
+}
+
+fn push_unique(tried: &mut Vec<String>, path: &Path) {
+    let s = path.display().to_string();
+    if !tried.iter().any(|t| t == &s) {
+        tried.push(s);
+    }
+}
+
+/// Dev / portable fallbacks that do not need Tauri PathResolver.
+fn discover_studio_python_dir_local(tried: &mut Vec<String>) -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            for name in ["python", "_up_/python"] {
+                let p = parent.join(name);
+                push_unique(tried, &p);
+                if studio_python_candidate_ok(&p) {
+                    return Some(p);
+                }
+            }
+        }
+    }
+
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let dev = manifest.join("..").join("python");
-    if dev.join("opt_worker.py").is_file() {
-        return Ok(dev.canonicalize().unwrap_or(dev));
+    push_unique(tried, &dev);
+    if studio_python_candidate_ok(&dev) {
+        return Some(dev.canonicalize().unwrap_or(dev));
     }
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let beside = exe
-        .parent()
-        .ok_or_else(|| "no exe parent".to_string())?
-        .join("python");
-    if beside.join("opt_worker.py").is_file() {
-        return Ok(beside);
+    None
+}
+
+fn discover_studio_python_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let mut tried = Vec::new();
+
+    // Preferred: mapped resource `python/` (tauri.conf.json bundle.resources).
+    // Legacy: array form `../python/**/*` landed under `_up_/python`.
+    for rel in ["python", "_up_/python"] {
+        match app.path().resolve(rel, BaseDirectory::Resource) {
+            Ok(p) => {
+                push_unique(&mut tried, &p);
+                if studio_python_candidate_ok(&p) {
+                    return Ok(p);
+                }
+            }
+            Err(e) => tried.push(format!("{rel} (resolve): {e}")),
+        }
     }
-    Err("python/ directory with opt_worker.py not found".into())
+
+    if let Ok(res) = app.path().resource_dir() {
+        for name in ["python", "_up_/python"] {
+            let p = res.join(name);
+            push_unique(&mut tried, &p);
+            if studio_python_candidate_ok(&p) {
+                return Ok(p);
+            }
+        }
+    }
+
+    if let Some(p) = discover_studio_python_dir_local(&mut tried) {
+        return Ok(p);
+    }
+
+    Err(format!(
+        "Studio 同梱の python/（opt_worker.py）が見つかりません。試行: {}",
+        tried.join(" | ")
+    ))
+}
+
+/// Call once from app `setup` so release installs resolve `$RESOURCE/python`.
+pub fn init_studio_resource_paths(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = discover_studio_python_dir(app)?;
+    let _ = STUDIO_PYTHON_DIR.set(dir.clone());
+    Ok(dir)
+}
+
+/// Directory containing Studio-owned scripts (`opt_worker.py`, preprocess, …).
+pub fn studio_python_dir() -> Result<PathBuf, String> {
+    if let Some(d) = STUDIO_PYTHON_DIR.get() {
+        return Ok(d.clone());
+    }
+    let mut tried = Vec::new();
+    if let Some(p) = discover_studio_python_dir_local(&mut tried) {
+        let _ = STUDIO_PYTHON_DIR.set(p.clone());
+        return Ok(p);
+    }
+    Err(format!(
+        "Studio 同梱の python/（opt_worker.py）が見つかりません。試行: {}",
+        tried.join(" | ")
+    ))
+}
+
+/// Resolve ffmpeg binary. Order: settings.ffmpegPath → PATH.
+pub fn resolve_ffmpeg(settings: &AppSettings) -> Option<PathBuf> {
+    let configured = settings.ffmpeg_path.trim();
+    if !configured.is_empty() {
+        let p = PathBuf::from(configured);
+        if p.is_file() {
+            return Some(p);
+        }
+        // Allow pointing at a directory that contains ffmpeg.exe
+        let beside = if cfg!(windows) {
+            p.join("ffmpeg.exe")
+        } else {
+            p.join("ffmpeg")
+        };
+        if beside.is_file() {
+            return Some(beside);
+        }
+    }
+    which::which("ffmpeg").ok()
+}
+
+/// Resolve ffprobe beside configured ffmpeg, else PATH.
+pub fn resolve_ffprobe(settings: &AppSettings) -> Option<PathBuf> {
+    if let Some(ff) = resolve_ffmpeg(settings) {
+        if let Some(dir) = ff.parent() {
+            let beside = if cfg!(windows) {
+                dir.join("ffprobe.exe")
+            } else {
+                dir.join("ffprobe")
+            };
+            if beside.is_file() {
+                return Some(beside);
+            }
+        }
+    }
+    which::which("ffprobe").ok()
+}
+
+/// Ensure child processes (Python preprocess) can find the chosen ffmpeg.
+pub fn apply_ffmpeg_env(cmd: &mut std::process::Command, settings: &AppSettings) {
+    let Some(ff) = resolve_ffmpeg(settings) else {
+        return;
+    };
+    cmd.env("FFMPEG_BINARY", &ff);
+    if let Some(dir) = ff.parent() {
+        let path_key = std::ffi::OsString::from("PATH");
+        let mut new_path = std::ffi::OsString::new();
+        new_path.push(dir.as_os_str());
+        #[cfg(windows)]
+        new_path.push(";");
+        #[cfg(not(windows))]
+        new_path.push(":");
+        if let Some(old) = std::env::var_os(&path_key) {
+            new_path.push(old);
+        }
+        cmd.env(path_key, new_path);
+    }
 }

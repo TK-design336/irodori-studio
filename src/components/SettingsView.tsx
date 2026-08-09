@@ -166,6 +166,17 @@ export function SettingsView({
     if (typeof selected === "string") setShared("projectsRoot", selected);
   };
 
+  const pickFfmpeg = async () => {
+    const selected = await open({
+      multiple: false,
+      filters: [
+        { name: "ffmpeg", extensions: ["exe"] },
+        { name: "All", extensions: ["*"] },
+      ],
+    });
+    if (typeof selected === "string") setShared("ffmpegPath", selected);
+  };
+
   const save = async () => {
     await persist(draft, "設定を保存しました");
   };
@@ -259,6 +270,20 @@ export function SettingsView({
             </div>
           </label>
 
+          <label>
+            ffmpeg（共通・任意）
+            <div className="row">
+              <input
+                value={draft.ffmpegPath ?? ""}
+                placeholder="空欄なら PATH の ffmpeg"
+                onChange={(e) => setShared("ffmpegPath", e.target.value)}
+              />
+              <button type="button" onClick={() => void pickFfmpeg()}>
+                参照
+              </button>
+            </div>
+          </label>
+
           <div className="blend-row">
             <label>
               Model precision
@@ -284,6 +309,33 @@ export function SettingsView({
                 ]}
                 onChange={(v) => setShared("codecPrecision", v)}
                 aria-label="Codec precision"
+              />
+            </label>
+          </div>
+
+          <div className="blend-row">
+            <label>
+              Model device
+              <BoundedSelect
+                value={draft.modelDevice || "cuda"}
+                options={[
+                  { value: "cuda", label: "cuda" },
+                  { value: "cpu", label: "cpu" },
+                ]}
+                onChange={(v) => setShared("modelDevice", v)}
+                aria-label="Model device"
+              />
+            </label>
+            <label>
+              Codec device
+              <BoundedSelect
+                value={draft.codecDevice || "cuda"}
+                options={[
+                  { value: "cuda", label: "cuda" },
+                  { value: "cpu", label: "cpu" },
+                ]}
+                onChange={(v) => setShared("codecDevice", v)}
+                aria-label="Codec device"
               />
             </label>
           </div>
@@ -320,12 +372,23 @@ export function SettingsView({
                 ok={validation.ffmpegOk}
                 label={`ffmpeg${validation.ffmpegPath ? ` (${validation.ffmpegPath})` : ""}`}
               />
+              <Flag
+                ok={validation.studioScriptsOk !== false}
+                label={`Studio 同梱スクリプト${
+                  validation.studioPythonDir
+                    ? ` (${validation.studioPythonDir})`
+                    : ""
+                }`}
+              />
             </ul>
           )}
           <p className="hint">
             Python は設定パス → `.venv` / `venv` → PATH の python/py
             の順で解決します。
             {resolvedPython ? ` 現在: ${resolvedPython}` : ""}
+          </p>
+          <p className="hint">
+            ffmpeg は設定パス（exe またはフォルダ）→ PATH の順です。学習前処理にも反映されます。
           </p>
           <p className="hint">
             アクティブ: {activePaths(draft).irodoriRoot}

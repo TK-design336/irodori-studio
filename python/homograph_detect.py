@@ -70,10 +70,12 @@ FALLBACK_AMBIGUOUS = {
 
 def _data_dirs() -> list[Path]:
     here = Path(__file__).resolve().parent
+    # Release layout: $RESOURCE/python/*.py + $RESOURCE/data/*.json
+    # Dev layout:     <repo>/python/*.py + <repo>/data/*.json
     candidates = [
         here.parent / "data",
-        Path.cwd() / "data",
         here / "data",
+        Path.cwd() / "data",
     ]
     out: list[Path] = []
     for p in candidates:

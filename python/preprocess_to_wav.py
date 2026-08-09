@@ -13,6 +13,12 @@ CONVERT_EXTS = {".mp3", ".mp4", ".m4a", ".flac", ".ogg", ".webm", ".aac", ".wma"
 WAV_EXT = ".wav"
 
 
+def _ffmpeg_bin() -> str:
+    import os
+
+    return os.environ.get("FFMPEG_BINARY") or "ffmpeg"
+
+
 def emit_fraction(i: int, n: int, detail: str = "") -> None:
     frac = (i / n) if n else 1.0
     payload = {"fraction": frac, "current": i, "total": n}
@@ -30,7 +36,7 @@ def convert_one(src: Path, dst: Path) -> None:
         return
 
     cmd = [
-        "ffmpeg",
+        _ffmpeg_bin(),
         "-y",
         "-i",
         str(src),

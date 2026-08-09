@@ -23,6 +23,8 @@ export type AppSettings = {
   modelDevice: string;
   codecDevice: string;
   projectsRoot: string;
+  /** Absolute path to ffmpeg.exe (or folder). Empty → PATH. */
+  ffmpegPath?: string;
   theme: "light" | "dark" | string;
   /** Batch play gap / concat-save default (ms). */
   chunkSilenceMs: number;
@@ -61,6 +63,8 @@ export type PathValidation = {
   ffmpegPath: string | null;
   irodoriVersion?: string;
   trainConfigOk?: boolean;
+  studioScriptsOk?: boolean;
+  studioPythonDir?: string | null;
 };
 
 /** `"trained" | "blend" | "ref" | "caption"` */

@@ -1,6 +1,6 @@
 [package]
 name = "irodori-studio"
-version = "0.1.0"
+version = "0.1.1"
 description = "Irodori Studio — speaker embedding training & OPT generation"
 authors = ["you"]
 edition = "2021"

@@ -1,4 +1,6 @@
-use crate::settings::{resolve_python_exe, studio_python_dir, AppSettings};
+use crate::settings::{
+    apply_ffmpeg_env, resolve_python_exe, studio_python_dir, AppSettings,
+};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
@@ -210,6 +212,12 @@ pub fn start_train_job(
                     ));
                 }
             };
+            // Slice step needs pydub; install into the configured Irodori venv if missing.
+            crate::python_env::ensure_packages_best_effort(
+                &python,
+                "import pydub",
+                &["pydub"],
+            );
             let python_str = python.display().to_string();
             let irodori_root = settings.irodori_root().to_string();
 
@@ -242,6 +250,7 @@ pub fn start_train_job(
                 .env("PYTHONUNBUFFERED", "1")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            apply_ffmpeg_env(&mut cmd, &settings);
 
             if let Some(ref jd) = job_dir {
                 if !jd.trim().is_empty() {

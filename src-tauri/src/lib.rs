@@ -9,7 +9,10 @@ mod worker;
 
 use parking_lot::Mutex;
 use serde_json::{json, Value};
-use settings::{load_settings, save_settings, studio_python_dir, validate_settings, AppSettings, PathValidation};
+use settings::{
+    init_studio_resource_paths, load_settings, resolve_ffmpeg, resolve_ffprobe, save_settings,
+    studio_python_dir, validate_settings, AppSettings, PathValidation,
+};
 use speakers::{SpeakerInfo, UpsertSpeakerProfileArgs};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -414,11 +417,18 @@ fn copy_file(src: String, dest: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-fn run_ffmpeg_af(src: &str, dest: &str, filter: &str) -> Result<(), String> {
+fn run_ffmpeg_af(
+    settings: &AppSettings,
+    src: &str,
+    dest: &str,
+    filter: &str,
+) -> Result<(), String> {
     if let Some(parent) = std::path::Path::new(dest).parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let ffmpeg = which::which("ffmpeg").map_err(|_| "ffmpeg が PATH にありません".to_string())?;
+    let ffmpeg = resolve_ffmpeg(settings).ok_or_else(|| {
+        "ffmpeg が見つかりません。設定の ffmpeg パスか PATH を確認してください".to_string()
+    })?;
     let status = std::process::Command::new(ffmpeg)
         .args(["-y", "-i", src, "-af", filter, dest])
         .status()
@@ -430,8 +440,8 @@ fn run_ffmpeg_af(src: &str, dest: &str, filter: &str) -> Result<(), String> {
 }
 
 /// Export WAV applying volume + speed (atempo, pitch-preserving) via ffmpeg.
-#[tauri::command]
-fn export_wav_adjusted(
+fn export_wav_adjusted_inner(
+    settings: &AppSettings,
     src: String,
     dest: String,
     volume: f64,
@@ -451,7 +461,19 @@ fn export_wav_adjusted(
     if !spd_ok {
         filters.push(format!("atempo={speed}"));
     }
-    run_ffmpeg_af(&src, &dest, &filters.join(","))
+    run_ffmpeg_af(settings, &src, &dest, &filters.join(","))
+}
+
+#[tauri::command]
+fn export_wav_adjusted(
+    state: tauri::State<'_, AppState>,
+    src: String,
+    dest: String,
+    volume: f64,
+    speed: f64,
+) -> Result<(), String> {
+    let settings = state.settings.lock().clone();
+    export_wav_adjusted_inner(&settings, src, dest, volume, speed)
 }
 
 #[derive(serde::Deserialize)]
@@ -465,6 +487,7 @@ struct WavExportSeg {
 /// Concatenate adjusted WAVs with optional silence between segments.
 #[tauri::command]
 fn export_wavs_concatenated(
+    state: tauri::State<'_, AppState>,
     segments: Vec<WavExportSeg>,
     silence_secs: f64,
     dest: String,
@@ -472,6 +495,8 @@ fn export_wavs_concatenated(
     if segments.is_empty() {
         return Err("連結する音声がありません".into());
     }
+
+    let settings = state.settings.lock().clone();
 
     let tmp_dir = studio_cache_dir()
         .join("export_batch")
@@ -485,7 +510,8 @@ fn export_wavs_concatenated(
     let mut seg_paths: Vec<PathBuf> = Vec::with_capacity(segments.len());
     for (i, seg) in segments.iter().enumerate() {
         let path = tmp_dir.join(format!("seg_{i:04}.wav"));
-        if let Err(e) = export_wav_adjusted(
+        if let Err(e) = export_wav_adjusted_inner(
+            &settings,
             seg.src.clone(),
             path.display().to_string(),
             seg.volume,
@@ -534,11 +560,13 @@ fn export_wavs_concatenated(
         }
     }
 
-    let ffmpeg = match which::which("ffmpeg") {
-        Ok(p) => p,
-        Err(_) => {
+    let ffmpeg = match resolve_ffmpeg(&settings) {
+        Some(p) => p,
+        None => {
             cleanup(&tmp_dir);
-            return Err("ffmpeg が PATH にありません".into());
+            return Err(
+                "ffmpeg が見つかりません。設定の ffmpeg パスか PATH を確認してください".into(),
+            );
         }
     };
 
@@ -565,7 +593,12 @@ fn export_wavs_concatenated(
 
 /// Pitch-preserving speed adjust into a temp file for playback (volume left to WebAudio).
 #[tauri::command]
-fn prepare_playback_wav(src: String, speed: f64) -> Result<String, String> {
+fn prepare_playback_wav(
+    state: tauri::State<'_, AppState>,
+    src: String,
+    speed: f64,
+) -> Result<String, String> {
+    let settings = state.settings.lock().clone();
     let speed = speed.clamp(0.5, 2.0);
     if (speed - 1.0).abs() < 0.001 {
         return Ok(src);
@@ -573,7 +606,12 @@ fn prepare_playback_wav(src: String, speed: f64) -> Result<String, String> {
     let dest = studio_cache_dir()
         .join("playback")
         .join(format!("play_{}.wav", uuid::Uuid::new_v4()));
-    run_ffmpeg_af(&src, &dest.display().to_string(), &format!("atempo={speed}"))?;
+    run_ffmpeg_af(
+        &settings,
+        &src,
+        &dest.display().to_string(),
+        &format!("atempo={speed}"),
+    )?;
     Ok(dest.display().to_string())
 }
 
@@ -638,9 +676,13 @@ fn ensure_asr_model_cmd(state: tauri::State<'_, AppState>) -> Result<String, Str
 
 /// Return WAV duration in seconds (via ffprobe or WAV header).
 #[tauri::command]
-fn wav_duration_secs(path: String) -> Result<f64, String> {
-    // Prefer ffprobe
-    if let Ok(ffprobe) = which::which("ffprobe") {
+fn wav_duration_secs(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<f64, String> {
+    let settings = state.settings.lock().clone();
+    // Prefer ffprobe (beside configured ffmpeg, else PATH)
+    if let Some(ffprobe) = resolve_ffprobe(&settings) {
         let output = std::process::Command::new(ffprobe)
             .args([
                 "-v",
@@ -711,6 +753,20 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .manage(state)
+        .setup(|app| {
+            match init_studio_resource_paths(app.handle()) {
+                Ok(dir) => {
+                    eprintln!(
+                        "[irodori-studio] studio python dir: {}",
+                        dir.display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[irodori-studio] WARNING: {e}");
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_settings,
             set_settings,
