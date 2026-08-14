@@ -5,6 +5,7 @@ import { BoundedSelect } from "./BoundedSelect";
 import type {
   AppSettings,
   ExportFilenamePart,
+  InferredPaths,
   IrodoriVersion,
   PathValidation,
   VersionPathSettings,
@@ -23,6 +24,7 @@ type Props = {
   validation: PathValidation | null;
   onSaved: (s: AppSettings) => void;
   onValidate: () => void;
+  firstSetup?: boolean;
 };
 
 type PathKey = keyof VersionPathSettings;
@@ -55,6 +57,7 @@ export function SettingsView({
   validation,
   onSaved,
   onValidate,
+  firstSetup = false,
 }: Props) {
   const [draft, setDraft] = useState(settings);
   const [msg, setMsg] = useState("");
@@ -70,6 +73,35 @@ export function SettingsView({
       .then(setResolvedPython)
       .catch(() => setResolvedPython(null));
   }, [settings, validation, draft.irodoriVersion]);
+
+  useEffect(() => {
+    if (!firstSetup) return;
+    const ver = normalizeVersion(settings.irodoriVersion);
+    const root = (
+      ver === "v4" ? settings.pathsV4 : settings.pathsV3
+    ).irodoriRoot.trim();
+    if (!root) return;
+    let cancelled = false;
+    void invoke<InferredPaths>("infer_engine_paths", { root, version: ver })
+      .then((inferred) => {
+        if (cancelled) return;
+        setDraft((d) => {
+          const next: VersionPathSettings = {
+            irodoriRoot: inferred.irodoriRoot,
+            outputsRoot: inferred.outputsRoot,
+            pythonExe: inferred.pythonExe,
+            checkpointPath: inferred.checkpointPath,
+          };
+          return ver === "v4" ? { ...d, pathsV4: next } : { ...d, pathsV3: next };
+        });
+      })
+      .catch((e) => {
+        if (!cancelled) setMsg(String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [firstSetup]);
 
   const version = normalizeVersion(draft.irodoriVersion);
   const editingPaths = version === "v4" ? draft.pathsV4 : draft.pathsV3;
@@ -135,6 +167,13 @@ export function SettingsView({
     if (normalizeVersion(draft.irodoriVersion) === next) return;
     const merged: AppSettings = { ...draft, irodoriVersion: next };
     setDraft(merged);
+    if (firstSetup) {
+      const root = (
+        next === "v4" ? merged.pathsV4 : merged.pathsV3
+      ).irodoriRoot.trim();
+      if (root) void inferFromRoot(root, next);
+      return;
+    }
     void persist(merged, `エンジンを ${next.toUpperCase()} に切り替えました`);
   };
 
@@ -148,9 +187,54 @@ export function SettingsView({
     });
   };
 
+  const applyInferred = (
+    inferred: InferredPaths,
+    ver: IrodoriVersion = version,
+  ) => {
+    setDraft((d) => {
+      const next: VersionPathSettings = {
+        irodoriRoot: inferred.irodoriRoot,
+        outputsRoot: inferred.outputsRoot,
+        pythonExe: inferred.pythonExe,
+        checkpointPath: inferred.checkpointPath,
+      };
+      if (ver === "v4") {
+        return { ...d, pathsV4: next };
+      }
+      return { ...d, pathsV3: next };
+    });
+    const notes: string[] = [];
+    if (!inferred.pythonFound) notes.push("Python が見つかりませんでした（手修正可）");
+    if (!inferred.checkpointFound) notes.push("Checkpoint が見つかりませんでした（手修正可）");
+    setMsg(notes.length ? notes.join(" / ") : "ルートからパスを推定しました");
+  };
+
+  const inferFromRoot = async (
+    root: string,
+    ver: IrodoriVersion = version,
+  ) => {
+    const trimmed = root.trim();
+    if (!trimmed) return;
+    try {
+      const inferred = await invoke<InferredPaths>("infer_engine_paths", {
+        root: trimmed,
+        version: ver,
+      });
+      applyInferred(inferred, ver);
+    } catch (e) {
+      setPath("irodoriRoot", trimmed);
+      setMsg(String(e));
+    }
+  };
+
   const pickDir = async (key: PathKey) => {
     const selected = await open({ directory: true, multiple: false });
-    if (typeof selected === "string") setPath(key, selected);
+    if (typeof selected !== "string") return;
+    if (key === "irodoriRoot") {
+      await inferFromRoot(selected);
+      return;
+    }
+    setPath(key, selected);
   };
 
   const pickFile = async (key: PathKey) => {
@@ -164,17 +248,6 @@ export function SettingsView({
   const pickProjectsDir = async () => {
     const selected = await open({ directory: true, multiple: false });
     if (typeof selected === "string") setShared("projectsRoot", selected);
-  };
-
-  const pickFfmpeg = async () => {
-    const selected = await open({
-      multiple: false,
-      filters: [
-        { name: "ffmpeg", extensions: ["exe"] },
-        { name: "All", extensions: ["*"] },
-      ],
-    });
-    if (typeof selected === "string") setShared("ffmpegPath", selected);
   };
 
   const save = async () => {
@@ -239,13 +312,31 @@ export function SettingsView({
           <h3>パス設定（{version.toUpperCase()}）</h3>
         </header>
         <div className="panel-body form-stack">
+          {firstSetup && (
+            <p className="hint warn-text">
+              まず Irodori-TTS のインストールフォルダを指定してください。Outputs・Python・Checkpoint はそこから自動で探します。
+            </p>
+          )}
           {PATH_FIELDS.map(([key, label, isDir]) => (
             <label key={`${version}-${key}`}>
               {label}
+              {key === "irodoriRoot" ? (
+                <span className="hint" style={{ display: "block", margin: "0 0 6px" }}>
+                  Irodori-TTS 本体のフォルダです。選ぶと他のパスを自動推定します。
+                </span>
+              ) : null}
+              {key === "checkpointPath" ? (
+                <span className="hint" style={{ display: "block", margin: "0 0 6px" }}>
+                  Hugging Face キャッシュ（.cache/huggingface/hub/models--Aratako--…/snapshots/リビジョン/model.safetensors）を優先します。v4 は v4.1 を先に探します。
+                </span>
+              ) : null}
               <div className="row">
                 <input
                   value={editingPaths[key]}
                   onChange={(e) => setPath(key, e.target.value)}
+                  onBlur={(e) => {
+                    if (key === "irodoriRoot") void inferFromRoot(e.currentTarget.value);
+                  }}
                 />
                 <button
                   type="button"
@@ -265,20 +356,6 @@ export function SettingsView({
                 onChange={(e) => setShared("projectsRoot", e.target.value)}
               />
               <button type="button" onClick={() => void pickProjectsDir()}>
-                参照
-              </button>
-            </div>
-          </label>
-
-          <label>
-            ffmpeg（共通・任意）
-            <div className="row">
-              <input
-                value={draft.ffmpegPath ?? ""}
-                placeholder="空欄なら PATH の ffmpeg"
-                onChange={(e) => setShared("ffmpegPath", e.target.value)}
-              />
-              <button type="button" onClick={() => void pickFfmpeg()}>
                 参照
               </button>
             </div>
@@ -349,6 +426,13 @@ export function SettingsView({
             >
               保存
             </button>
+            <button
+              type="button"
+              disabled={busy || !editingPaths.irodoriRoot.trim()}
+              onClick={() => void inferFromRoot(editingPaths.irodoriRoot)}
+            >
+              ルートから再推定
+            </button>
             <button type="button" disabled={busy} onClick={onValidate}>
               検証
             </button>
@@ -370,7 +454,7 @@ export function SettingsView({
               />
               <Flag
                 ok={validation.ffmpegOk}
-                label={`ffmpeg${validation.ffmpegPath ? ` (${validation.ffmpegPath})` : ""}`}
+                label={`ffmpeg（同梱${validation.ffmpegPath ? ` ${validation.ffmpegPath}` : ""}）`}
               />
               <Flag
                 ok={validation.studioScriptsOk !== false}
@@ -388,7 +472,7 @@ export function SettingsView({
             {resolvedPython ? ` 現在: ${resolvedPython}` : ""}
           </p>
           <p className="hint">
-            ffmpeg は設定パス（exe またはフォルダ）→ PATH の順です。学習前処理にも反映されます。
+            ffmpeg はアプリに同梱しています。外部インストールは不要です。
           </p>
           <p className="hint">
             アクティブ: {activePaths(draft).irodoriRoot}

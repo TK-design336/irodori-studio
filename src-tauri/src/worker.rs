@@ -1,5 +1,5 @@
 //! OPT worker process (stdio JSON-RPC).
-use crate::settings::{resolve_python_exe, AppSettings};
+use crate::settings::{apply_ffmpeg_env, resolve_python_exe, AppSettings};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -88,6 +88,7 @@ impl OptWorkerSimple {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        apply_ffmpeg_env(&mut child_cmd, settings);
         crate::python_env::hide_console(&mut child_cmd);
         let mut child = child_cmd
             .spawn()

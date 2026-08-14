@@ -7,6 +7,12 @@ use tauri::path::BaseDirectory;
 
 /// Resolved once at app startup (Tauri `$RESOURCE/python`).
 static STUDIO_PYTHON_DIR: OnceLock<PathBuf> = OnceLock::new();
+/// Bundled `ffmpeg` / `ffmpeg.exe` (never PATH / user override).
+static BUNDLED_FFMPEG: OnceLock<PathBuf> = OnceLock::new();
+/// Bundled `ffprobe` beside ffmpeg, if present.
+static BUNDLED_FFPROBE: OnceLock<PathBuf> = OnceLock::new();
+
+pub const MISSING_FFMPEG_MSG: &str = "同梱の ffmpeg が見つかりません";
 
 /// Per-engine path bundle (v3 and v4 keep separate roots / checkpoints / embeddings).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -33,7 +39,7 @@ pub struct AppSettings {
     pub model_device: String,
     pub codec_device: String,
     pub projects_root: String,
-    /// Absolute path to `ffmpeg` / `ffmpeg.exe`. Empty → resolve from PATH.
+    /// Legacy field (ignored). Bundled ffmpeg is always used.
     #[serde(default)]
     pub ffmpeg_path: String,
     #[serde(default = "default_theme")]
@@ -112,69 +118,298 @@ fn default_engine_root(folder: &str) -> PathBuf {
         .join(folder)
 }
 
-fn default_paths_v3() -> VersionPathSettings {
-    let root = default_engine_root("IrodoriTTS");
+fn empty_paths() -> VersionPathSettings {
     VersionPathSettings {
-        irodori_root: root.display().to_string(),
-        checkpoint_path: root
-            .join("checkpoints")
-            .join("Aratako_Irodori-TTS-500M-v3")
-            .join("model.safetensors")
-            .display()
-            .to_string(),
-        outputs_root: root.join("outputs").display().to_string(),
-        python_exe: root
-            .join(".venv")
-            .join("Scripts")
-            .join("python.exe")
-            .display()
-            .to_string(),
+        irodori_root: String::new(),
+        checkpoint_path: String::new(),
+        outputs_root: String::new(),
+        python_exe: String::new(),
     }
 }
 
-fn find_hf_v4_checkpoint() -> Option<PathBuf> {
-    let hub = dirs::home_dir()?.join(".cache").join("huggingface").join("hub");
-    let model_dir = hub.join("models--Aratako--Irodori-TTS-v4-Small").join("snapshots");
-    if !model_dir.is_dir() {
+fn default_paths_for(folder: &str, version: &str) -> VersionPathSettings {
+    let root = default_engine_root(folder);
+    if root.is_dir() {
+        infer_paths_from_root(&root.display().to_string(), version).into_version_paths()
+    } else {
+        empty_paths()
+    }
+}
+
+fn default_paths_v3() -> VersionPathSettings {
+    default_paths_for("IrodoriTTS", "v3")
+}
+
+fn hf_hub_roots() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut push = |p: PathBuf| {
+        if p.is_dir() && !out.iter().any(|x| x == &p) {
+            out.push(p);
+        }
+    };
+    if let Ok(v) = std::env::var("HF_HUB_CACHE") {
+        let t = v.trim();
+        if !t.is_empty() {
+            push(PathBuf::from(t));
+        }
+    }
+    if let Ok(v) = std::env::var("HF_HOME") {
+        let t = v.trim();
+        if !t.is_empty() {
+            push(PathBuf::from(t).join("hub"));
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        push(home.join(".cache").join("huggingface").join("hub"));
+    }
+    out
+}
+
+fn hf_repos_for_version(version: &str) -> &'static [&'static str] {
+    if version.eq_ignore_ascii_case("v4") {
+        &[
+            "Aratako/Irodori-TTS-v4.1-Small",
+            "Aratako/Irodori-TTS-v4-Small",
+        ]
+    } else {
+        &["Aratako/Irodori-TTS-500M-v3"]
+    }
+}
+
+fn snapshot_model_safetensors(model_root: &Path) -> Option<PathBuf> {
+    let snapshots = model_root.join("snapshots");
+    if !snapshots.is_dir() {
         return None;
     }
-    let mut snapshots: Vec<_> = fs::read_dir(&model_dir)
+    let refs_main = model_root.join("refs").join("main");
+    if let Ok(hash) = fs::read_to_string(&refs_main) {
+        let p = snapshots.join(hash.trim()).join("model.safetensors");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let mut dirs: Vec<_> = fs::read_dir(&snapshots)
         .ok()?
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
         .collect();
-    snapshots.sort_by_key(|e| e.file_name());
-    for snap in snapshots.into_iter().rev() {
-        let ckpt = snap.path().join("model.safetensors");
-        if ckpt.is_file() {
+    dirs.sort_by_key(|e| {
+        e.metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
+    for e in dirs.into_iter().rev() {
+        let p = e.path().join("model.safetensors");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn hub_dir_matches_version(dir_name: &str, version: &str) -> bool {
+    let n = dir_name.to_ascii_lowercase();
+    if !n.contains("irodori-tts") || n.contains("quantized") {
+        return false;
+    }
+    if version.eq_ignore_ascii_case("v4") {
+        n.contains("v4")
+    } else {
+        (n.contains("v3") || n.contains("500m")) && !n.contains("v4")
+    }
+}
+
+fn hf_dir_preference(dir_name: &str, version: &str) -> u8 {
+    let n = dir_name.to_ascii_lowercase();
+    if version.eq_ignore_ascii_case("v4") {
+        if n.contains("v4.1") {
+            0
+        } else {
+            1
+        }
+    } else if n.contains("500m") {
+        0
+    } else {
+        1
+    }
+}
+
+fn scan_hub_for_version(hub: &Path, version: &str) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = fs::read_dir(hub)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            hub_dir_matches_version(name, version)
+        })
+        .collect();
+    dirs.sort_by_key(|p| {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        hf_dir_preference(name, version)
+    });
+    for d in dirs {
+        if let Some(ckpt) = snapshot_model_safetensors(&d) {
             return Some(ckpt);
         }
     }
     None
 }
 
-fn default_paths_v4() -> VersionPathSettings {
-    let root = default_engine_root("IrodoriTTS-v4");
-    let local_ckpt = root
-        .join("checkpoints")
-        .join("Aratako_Irodori-TTS-v4-Small")
-        .join("model.safetensors");
-    let checkpoint = if local_ckpt.is_file() {
-        local_ckpt
-    } else {
-        find_hf_v4_checkpoint().unwrap_or(local_ckpt)
-    };
-    VersionPathSettings {
-        irodori_root: root.display().to_string(),
-        checkpoint_path: checkpoint.display().to_string(),
-        outputs_root: root.join("outputs").display().to_string(),
-        python_exe: root
-            .join(".venv")
-            .join("Scripts")
-            .join("python.exe")
-            .display()
-            .to_string(),
+/// Hugging Face hub: `hub/models--Aratako--…/snapshots/<revision>/model.safetensors`
+fn find_hf_checkpoint(version: &str) -> Option<PathBuf> {
+    let hubs = hf_hub_roots();
+    for repo in hf_repos_for_version(version) {
+        let dir_name = format!("models--{}", repo.replace('/', "--"));
+        for hub in &hubs {
+            if let Some(p) = snapshot_model_safetensors(&hub.join(&dir_name)) {
+                return Some(p);
+            }
+        }
     }
+    for hub in &hubs {
+        if let Some(p) = scan_hub_for_version(hub, version) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn find_checkpoint_for_version(root: &Path, version: &str) -> Option<PathBuf> {
+    if let Some(p) = find_hf_checkpoint(version) {
+        return Some(p);
+    }
+    let local_known = known_checkpoint(root, version);
+    if local_known.is_file() {
+        return Some(local_known);
+    }
+    find_model_safetensors(&root.join("checkpoints"), 0, 4)
+}
+
+fn default_paths_v4() -> VersionPathSettings {
+    default_paths_for("IrodoriTTS-v4", "v4")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InferredPaths {
+    pub irodori_root: String,
+    pub outputs_root: String,
+    pub python_exe: String,
+    pub checkpoint_path: String,
+    pub python_found: bool,
+    pub checkpoint_found: bool,
+}
+
+impl InferredPaths {
+    fn into_version_paths(self) -> VersionPathSettings {
+        VersionPathSettings {
+            irodori_root: self.irodori_root,
+            checkpoint_path: self.checkpoint_path,
+            outputs_root: self.outputs_root,
+            python_exe: self.python_exe,
+        }
+    }
+}
+
+fn python_under_root(root: &Path) -> Option<PathBuf> {
+    let candidates = [
+        root.join(".venv").join("Scripts").join("python.exe"),
+        root.join(".venv").join("bin").join("python"),
+        root.join("venv").join("Scripts").join("python.exe"),
+        root.join("venv").join("bin").join("python"),
+    ];
+    candidates.into_iter().find(|c| c.is_file())
+}
+
+fn conventional_python(root: &Path) -> PathBuf {
+    if cfg!(windows) {
+        root.join(".venv").join("Scripts").join("python.exe")
+    } else {
+        root.join(".venv").join("bin").join("python")
+    }
+}
+
+fn known_checkpoint(root: &Path, version: &str) -> PathBuf {
+    if version.eq_ignore_ascii_case("v4") {
+        root.join("checkpoints")
+            .join("Aratako_Irodori-TTS-v4-Small")
+            .join("model.safetensors")
+    } else {
+        root.join("checkpoints")
+            .join("Aratako_Irodori-TTS-500M-v3")
+            .join("model.safetensors")
+    }
+}
+
+fn find_model_safetensors(dir: &Path, depth: u32, max_depth: u32) -> Option<PathBuf> {
+    if depth > max_depth || !dir.is_dir() {
+        return None;
+    }
+    let direct = dir.join("model.safetensors");
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let mut entries: Vec<_> = fs::read_dir(dir).ok()?.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.file_name());
+    for e in entries {
+        let p = e.path();
+        if p.is_dir() {
+            if let Some(found) = find_model_safetensors(&p, depth + 1, max_depth) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Infer Outputs / Python / Checkpoint from an Irodori engine root.
+pub fn infer_paths_from_root(root: &str, version: &str) -> InferredPaths {
+    let root_str = root.trim().to_string();
+    let root_path = Path::new(&root_str);
+    let outputs = root_path.join("outputs");
+
+    let (python_exe, python_found) = match python_under_root(root_path) {
+        Some(p) => (p.display().to_string(), true),
+        None => (conventional_python(root_path).display().to_string(), false),
+    };
+
+    let found = find_checkpoint_for_version(root_path, version);
+    let known = known_checkpoint(root_path, version);
+    let (checkpoint_path, checkpoint_found) = match found {
+        Some(p) if p.is_file() => (p.display().to_string(), true),
+        _ => (known.display().to_string(), false),
+    };
+
+    InferredPaths {
+        irodori_root: if root_str.is_empty() {
+            String::new()
+        } else {
+            root_path.display().to_string()
+        },
+        outputs_root: if root_str.is_empty() {
+            String::new()
+        } else {
+            outputs.display().to_string()
+        },
+        python_exe: if root_str.is_empty() {
+            String::new()
+        } else {
+            python_exe
+        },
+        checkpoint_path: if root_str.is_empty() {
+            String::new()
+        } else {
+            checkpoint_path
+        },
+        python_found: python_found && !root_str.is_empty(),
+        checkpoint_found: checkpoint_found && !root_str.is_empty(),
+    }
+}
+
+pub fn needs_first_setup() -> bool {
+    !settings_path().is_file()
 }
 
 impl Default for AppSettings {
@@ -537,8 +772,9 @@ fn discover_studio_python_dir(app: &AppHandle) -> Result<PathBuf, String> {
     ))
 }
 
-/// Call once from app `setup` so release installs resolve `$RESOURCE/python`.
+/// Call once from app `setup` so release installs resolve `$RESOURCE/python` and bundled ffmpeg.
 pub fn init_studio_resource_paths(app: &AppHandle) -> Result<PathBuf, String> {
+    init_bundled_ffmpeg(Some(app));
     let dir = discover_studio_python_dir(app)?;
     let _ = STUDIO_PYTHON_DIR.set(dir.clone());
     Ok(dir)
@@ -560,61 +796,145 @@ pub fn studio_python_dir() -> Result<PathBuf, String> {
     ))
 }
 
-/// Resolve ffmpeg binary. Order: settings.ffmpegPath → PATH.
-pub fn resolve_ffmpeg(settings: &AppSettings) -> Option<PathBuf> {
-    let configured = settings.ffmpeg_path.trim();
-    if !configured.is_empty() {
-        let p = PathBuf::from(configured);
-        if p.is_file() {
-            return Some(p);
-        }
-        // Allow pointing at a directory that contains ffmpeg.exe
-        let beside = if cfg!(windows) {
-            p.join("ffmpeg.exe")
-        } else {
-            p.join("ffmpeg")
-        };
-        if beside.is_file() {
-            return Some(beside);
-        }
+fn ffmpeg_bin_name() -> &'static str {
+    if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
     }
-    which::which("ffmpeg").ok()
 }
 
-/// Resolve ffprobe beside configured ffmpeg, else PATH.
-pub fn resolve_ffprobe(settings: &AppSettings) -> Option<PathBuf> {
-    if let Some(ff) = resolve_ffmpeg(settings) {
-        if let Some(dir) = ff.parent() {
-            let beside = if cfg!(windows) {
-                dir.join("ffprobe.exe")
-            } else {
-                dir.join("ffprobe")
-            };
-            if beside.is_file() {
-                return Some(beside);
+fn ffprobe_bin_name() -> &'static str {
+    if cfg!(windows) {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    }
+}
+
+fn remember_ffprobe_beside(ffmpeg: &Path) {
+    if BUNDLED_FFPROBE.get().is_some() {
+        return;
+    }
+    if let Some(dir) = ffmpeg.parent() {
+        let probe = dir.join(ffprobe_bin_name());
+        if probe.is_file() {
+            let _ = BUNDLED_FFPROBE.set(probe);
+        }
+    }
+}
+
+fn discover_bundled_ffmpeg_local(tried: &mut Vec<String>) -> Option<PathBuf> {
+    let name = ffmpeg_bin_name();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            for rel in [
+                parent.join("ffmpeg").join(name),
+                parent.join(name),
+                parent.join("_up_").join("ffmpeg").join(name),
+            ] {
+                push_unique(tried, &rel);
+                if rel.is_file() {
+                    return Some(rel);
+                }
             }
         }
     }
-    which::which("ffprobe").ok()
+
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let vendor = manifest.join("..").join("vendor").join("ffmpeg").join(name);
+    push_unique(tried, &vendor);
+    if vendor.is_file() {
+        return Some(vendor.canonicalize().unwrap_or(vendor));
+    }
+    None
 }
 
-/// Ensure child processes (Python preprocess) can find the chosen ffmpeg.
+fn discover_bundled_ffmpeg(app: Option<&AppHandle>, tried: &mut Vec<String>) -> Option<PathBuf> {
+    let name = ffmpeg_bin_name();
+    if let Some(app) = app {
+        let file_rels = [
+            format!("ffmpeg/{name}"),
+            format!("_up_/ffmpeg/{name}"),
+        ];
+        for rel in file_rels {
+            match app.path().resolve(&rel, BaseDirectory::Resource) {
+                Ok(p) => {
+                    push_unique(tried, &p);
+                    if p.is_file() {
+                        return Some(p);
+                    }
+                }
+                Err(e) => tried.push(format!("{rel} (resolve): {e}")),
+            }
+        }
+        for rel in ["ffmpeg", "_up_/ffmpeg"] {
+            match app.path().resolve(rel, BaseDirectory::Resource) {
+                Ok(dir) => {
+                    let p = dir.join(name);
+                    push_unique(tried, &p);
+                    if p.is_file() {
+                        return Some(p);
+                    }
+                }
+                Err(e) => tried.push(format!("{rel} (resolve): {e}")),
+            }
+        }
+        if let Ok(res) = app.path().resource_dir() {
+            for dir_name in ["ffmpeg", "_up_/ffmpeg"] {
+                let p = res.join(dir_name).join(name);
+                push_unique(tried, &p);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    discover_bundled_ffmpeg_local(tried)
+}
+
+fn init_bundled_ffmpeg(app: Option<&AppHandle>) {
+    if BUNDLED_FFMPEG.get().is_some() {
+        return;
+    }
+    let mut tried = Vec::new();
+    if let Some(p) = discover_bundled_ffmpeg(app, &mut tried) {
+        remember_ffprobe_beside(&p);
+        eprintln!("[irodori-studio] bundled ffmpeg: {}", p.display());
+        let _ = BUNDLED_FFMPEG.set(p);
+    } else {
+        eprintln!(
+            "[irodori-studio] WARNING: {MISSING_FFMPEG_MSG}。試行: {}",
+            tried.join(" | ")
+        );
+    }
+}
+
+/// Resolve bundled ffmpeg only (never settings path or PATH).
+pub fn resolve_ffmpeg(_settings: &AppSettings) -> Option<PathBuf> {
+    if let Some(p) = BUNDLED_FFMPEG.get() {
+        return Some(p.clone());
+    }
+    init_bundled_ffmpeg(None);
+    BUNDLED_FFMPEG.get().cloned()
+}
+
+/// Resolve bundled ffprobe beside bundled ffmpeg.
+pub fn resolve_ffprobe(settings: &AppSettings) -> Option<PathBuf> {
+    if let Some(p) = BUNDLED_FFPROBE.get() {
+        return Some(p.clone());
+    }
+    if let Some(ff) = resolve_ffmpeg(settings) {
+        remember_ffprobe_beside(&ff);
+        return BUNDLED_FFPROBE.get().cloned();
+    }
+    None
+}
+
+/// Inject `FFMPEG_BINARY` (absolute bundled path). Does not modify PATH.
 pub fn apply_ffmpeg_env(cmd: &mut std::process::Command, settings: &AppSettings) {
     let Some(ff) = resolve_ffmpeg(settings) else {
         return;
     };
     cmd.env("FFMPEG_BINARY", &ff);
-    if let Some(dir) = ff.parent() {
-        let path_key = std::ffi::OsString::from("PATH");
-        let mut new_path = std::ffi::OsString::new();
-        new_path.push(dir.as_os_str());
-        #[cfg(windows)]
-        new_path.push(";");
-        #[cfg(not(windows))]
-        new_path.push(":");
-        if let Some(old) = std::env::var_os(&path_key) {
-            new_path.push(old);
-        }
-        cmd.env(path_key, new_path);
-    }
 }

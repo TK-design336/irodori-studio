@@ -1,0 +1,18 @@
+FFmpeg
+======
+
+This directory is populated at build/dev time with Windows `ffmpeg.exe` and
+`ffprobe.exe` from the gyan.dev essentials build:
+
+  https://www.gyan.dev/ffmpeg/builds/
+
+FFmpeg is licensed under the GNU General Public License (GPL) version 2 or later
+(essentials builds typically include GPL components). The full license text of
+the downloaded build is copied beside the binaries as `FFMPEG_BUILD_LICENSE.txt`
+when `npm run fetch-ffmpeg` runs.
+
+FFmpeg source: https://ffmpeg.org/
+gyan.dev builds: https://www.gyan.dev/ffmpeg/builds/
+
+Irodori Studio invokes these binaries as a separate process; it does not link
+against libav*.

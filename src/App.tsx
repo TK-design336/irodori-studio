@@ -22,6 +22,7 @@ function App() {
   const [validation, setValidation] = useState<PathValidation | null>(null);
   const [speakers, setSpeakers] = useState<SpeakerInfo[]>([]);
   const [training, setTraining] = useState(false);
+  const [setupIncomplete, setSetupIncomplete] = useState(false);
 
   const [openProjects, setOpenProjects] = useState<Project[]>([]);
   const [activeProjectName, setActiveProjectName] = useState<string | null>(
@@ -40,9 +41,10 @@ function App() {
   const selectTab = useCallback(
     (next: Tab) => {
       if (training && next !== "train") return;
+      if (setupIncomplete && next !== "settings") return;
       setTab(next);
     },
-    [training],
+    [training, setupIncomplete],
   );
 
   const refreshValidation = useCallback(async () => {
@@ -61,11 +63,14 @@ function App() {
 
   useEffect(() => {
     (async () => {
+      const first = await invoke<boolean>("needs_first_setup_cmd");
       const s = await invoke<AppSettings>("get_settings");
       if (!s.theme) s.theme = "light";
       setSettings(s);
       document.documentElement.dataset.theme =
         s.theme === "dark" ? "dark" : "light";
+      setSetupIncomplete(first);
+      if (first) setTab("settings");
       await refreshValidation();
       await refreshSpeakers();
     })();
@@ -137,9 +142,13 @@ function App() {
           <button
             type="button"
             className={tab === "generate" ? "active" : ""}
-            disabled={training}
+            disabled={training || setupIncomplete}
             title={
-              training ? "学習中は生成画面へ移動できません" : undefined
+              setupIncomplete
+                ? "先に Irodori ルートを設定してください"
+                : training
+                  ? "学習中は生成画面へ移動できません"
+                  : undefined
             }
             onClick={() => selectTab("generate")}
           >
@@ -148,6 +157,12 @@ function App() {
           <button
             type="button"
             className={tab === "train" ? "active" : ""}
+            disabled={setupIncomplete}
+            title={
+              setupIncomplete
+                ? "先に Irodori ルートを設定してください"
+                : undefined
+            }
             onClick={() => selectTab("train")}
           >
             学習
@@ -155,9 +170,13 @@ function App() {
           <button
             type="button"
             className={tab === "dictionary" ? "active" : ""}
-            disabled={training}
+            disabled={training || setupIncomplete}
             title={
-              training ? "学習中は辞書画面へ移動できません" : undefined
+              setupIncomplete
+                ? "先に Irodori ルートを設定してください"
+                : training
+                  ? "学習中は辞書画面へ移動できません"
+                  : undefined
             }
             onClick={() => selectTab("dictionary")}
           >
@@ -265,8 +284,12 @@ function App() {
           <SettingsView
             settings={settings}
             validation={validation}
-            onSaved={(s) => {
+            firstSetup={setupIncomplete}
+            onSaved={async (s) => {
               setSettings(s);
+              const v = await invoke<PathValidation>("validate_paths");
+              setValidation(v);
+              if (v.irodoriRootOk) setSetupIncomplete(false);
               refreshSpeakers();
             }}
             onValidate={refreshValidation}

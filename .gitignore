@@ -20,6 +20,16 @@ src-tauri/gen/schemas
 **/__pycache__/
 *.py[cod]
 
+# Bundled ffmpeg binaries (fetched at build/dev)
+vendor/ffmpeg/*.exe
+vendor/ffmpeg/*.zip
+vendor/ffmpeg/_extract/
+vendor/ffmpeg/FFMPEG_BUILD_LICENSE.txt
+vendor/ffmpeg/.fetched
+
+# Local portable tools (not part of the app)
+.tools/
+
 # Editor / OS
 .cursor
 .vscode/*

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,6 +66,75 @@ fn profiles_dir(outputs_root: &str) -> PathBuf {
 
 fn profile_path_for(outputs_root: &str, name: &str) -> PathBuf {
     profiles_dir(outputs_root).join(format!("{}.json", sanitize_speaker_name(name)))
+}
+
+fn refs_dir(outputs_root: &str) -> PathBuf {
+    profiles_dir(outputs_root).join("_refs")
+}
+
+fn is_soundfile_native(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref(),
+        Some("wav" | "flac" | "ogg")
+    )
+}
+
+/// Convert mp3/aac/… to 44.1kHz mono PCM WAV (same as preprocess_to_wav.py).
+fn convert_ref_to_wav(src: &Path, dest: &Path, ffmpeg: &Path) -> Result<(), String> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args([
+        "-y",
+        "-i",
+        &src.display().to_string(),
+        "-vn",
+        "-ar",
+        "44100",
+        "-ac",
+        "1",
+        "-c:a",
+        "pcm_s16le",
+        &dest.display().to_string(),
+    ]);
+    crate::python_env::hide_console(&mut cmd);
+    let output = cmd
+        .output()
+        .map_err(|e| format!("ffmpeg の起動に失敗しました: {e}"))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        let out = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "参照音源の WAV 化に失敗しました: {} {err} {out}",
+            src.display()
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_ref_wav(
+    outputs_root: &str,
+    speaker_name: &str,
+    src: &str,
+    ffmpeg: Option<&Path>,
+) -> Result<String, String> {
+    let src_path = Path::new(src);
+    if is_soundfile_native(src_path) {
+        return Ok(src.to_string());
+    }
+    let Some(ff) = ffmpeg else {
+        return Err(
+            "参照音源が wav/flac/ogg 以外です。同梱の ffmpeg が見つかりません"
+                .into(),
+        );
+    };
+    let dest = refs_dir(outputs_root).join(format!("{}.wav", sanitize_speaker_name(speaker_name)));
+    convert_ref_to_wav(src_path, &dest, ff)?;
+    Ok(dest.display().to_string())
 }
 
 /// Speaker folders only: `checkpoint_final.speaker.safetensors` (+ `_blends/*.speaker.safetensors`)
@@ -159,6 +229,7 @@ pub fn scan_speakers(outputs_root: &str) -> Result<Vec<SpeakerInfo>, String> {
 pub fn upsert_speaker_profile(
     outputs_root: &str,
     args: UpsertSpeakerProfileArgs,
+    ffmpeg: Option<PathBuf>,
 ) -> Result<SpeakerInfo, String> {
     let name = args.name.trim();
     if name.is_empty() {
@@ -188,6 +259,18 @@ pub fn upsert_speaker_profile(
             return Err(format!("参照音源が見つかりません: {wav}"));
         }
     }
+
+    let ref_wav = if kind == "ref" {
+        let src = ref_wav.as_deref().unwrap_or("");
+        Some(prepare_ref_wav(
+            outputs_root,
+            name,
+            src,
+            ffmpeg.as_deref(),
+        )?)
+    } else {
+        None
+    };
     if kind == "caption" && caption.is_none() {
         return Err("キャプションを入力してください".into());
     }

@@ -10,8 +10,9 @@ mod worker;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use settings::{
-    init_studio_resource_paths, load_settings, resolve_ffmpeg, resolve_ffprobe, save_settings,
-    studio_python_dir, validate_settings, AppSettings, PathValidation,
+    infer_paths_from_root, init_studio_resource_paths, load_settings, needs_first_setup,
+    resolve_ffmpeg, resolve_ffprobe, save_settings, studio_python_dir, validate_settings,
+    AppSettings, InferredPaths, PathValidation, MISSING_FFMPEG_MSG,
 };
 use speakers::{SpeakerInfo, UpsertSpeakerProfileArgs};
 use std::path::PathBuf;
@@ -53,6 +54,16 @@ fn set_settings(
 }
 
 #[tauri::command]
+fn infer_engine_paths(root: String, version: String) -> InferredPaths {
+    infer_paths_from_root(&root, &version)
+}
+
+#[tauri::command]
+fn needs_first_setup_cmd() -> bool {
+    needs_first_setup()
+}
+
+#[tauri::command]
 fn validate_paths(state: tauri::State<'_, AppState>) -> PathValidation {
     let settings = state.settings.lock().clone();
     validate_settings(&settings)
@@ -70,7 +81,11 @@ fn upsert_speaker_profile_cmd(
     args: UpsertSpeakerProfileArgs,
 ) -> Result<SpeakerInfo, String> {
     let settings = state.settings.lock().clone();
-    speakers::upsert_speaker_profile(settings.outputs_root(), args)
+    speakers::upsert_speaker_profile(
+        settings.outputs_root(),
+        args,
+        resolve_ffmpeg(&settings),
+    )
 }
 
 #[tauri::command]
@@ -426,9 +441,7 @@ fn run_ffmpeg_af(
     if let Some(parent) = std::path::Path::new(dest).parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let ffmpeg = resolve_ffmpeg(settings).ok_or_else(|| {
-        "ffmpeg が見つかりません。設定の ffmpeg パスか PATH を確認してください".to_string()
-    })?;
+    let ffmpeg = resolve_ffmpeg(settings).ok_or_else(|| MISSING_FFMPEG_MSG.to_string())?;
     let mut cmd = std::process::Command::new(ffmpeg);
     cmd.args(["-y", "-i", src, "-af", filter, dest]);
     crate::python_env::hide_console(&mut cmd);
@@ -564,9 +577,7 @@ fn export_wavs_concatenated(
         Some(p) => p,
         None => {
             cleanup(&tmp_dir);
-            return Err(
-                "ffmpeg が見つかりません。設定の ffmpeg パスか PATH を確認してください".into(),
-            );
+            return Err(MISSING_FFMPEG_MSG.into());
         }
     };
 
@@ -682,7 +693,7 @@ fn wav_duration_secs(
     path: String,
 ) -> Result<f64, String> {
     let settings = state.settings.lock().clone();
-    // Prefer ffprobe (beside configured ffmpeg, else PATH)
+    // Prefer bundled ffprobe (beside bundled ffmpeg)
     if let Some(ffprobe) = resolve_ffprobe(&settings) {
         let mut cmd = std::process::Command::new(ffprobe);
         crate::python_env::hide_console(&mut cmd);
@@ -774,6 +785,8 @@ pub fn run() {
             get_settings,
             set_settings,
             validate_paths,
+            infer_engine_paths,
+            needs_first_setup_cmd,
             list_speakers,
             upsert_speaker_profile_cmd,
             delete_speaker_profile_cmd,

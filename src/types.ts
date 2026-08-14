@@ -23,7 +23,7 @@ export type AppSettings = {
   modelDevice: string;
   codecDevice: string;
   projectsRoot: string;
-  /** Absolute path to ffmpeg.exe (or folder). Empty → PATH. */
+  /** Legacy; ignored. Bundled ffmpeg is always used. */
   ffmpegPath?: string;
   theme: "light" | "dark" | string;
   /** Batch play gap / concat-save default (ms). */
@@ -53,6 +53,15 @@ export function activePaths(settings: AppSettings): VersionPathSettings {
 export function isIrodoriV4(settings: AppSettings): boolean {
   return settings.irodoriVersion === "v4";
 }
+
+export type InferredPaths = {
+  irodoriRoot: string;
+  outputsRoot: string;
+  pythonExe: string;
+  checkpointPath: string;
+  pythonFound: boolean;
+  checkpointFound: boolean;
+};
 
 export type PathValidation = {
   irodoriRootOk: boolean;

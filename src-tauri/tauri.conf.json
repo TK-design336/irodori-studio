@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Irodori Studio",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "identifier": "com.irodori.studio",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run fetch-ffmpeg && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run fetch-ffmpeg && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -35,7 +35,8 @@
     ],
     "resources": {
       "../python": "python/",
-      "../data/homographs_ndl_seed.json": "data/homographs_ndl_seed.json"
+      "../data/homographs_ndl_seed.json": "data/homographs_ndl_seed.json",
+      "../vendor/ffmpeg": "ffmpeg/"
     }
   }
 }

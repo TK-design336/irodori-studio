@@ -860,6 +860,7 @@ export function TrainView({
             Embedding 学習なしで使えます。参照音源はゼロショットクローン、キャプションは
             No-Ref（声デザイン）です。v4 は統合モデルのため同一 Checkpoint
             で両方使えます。v3 の caption は VoiceDesign 系 Checkpoint が必要です。
+            mp3 / aac などは保存時に WAV へ変換します。
           </p>
 
           <div className="profile-kind-tabs" role="tablist">

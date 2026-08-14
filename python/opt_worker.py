@@ -12,12 +12,22 @@ Commands:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import subprocess
 import sys
 import traceback
 from pathlib import Path
 from typing import Any
+
+# soundfile 本線: torchaudio.load/save → torchcodec を避ける（WinError 87 対策）。
+try:
+    import soundfile as sf
+except ImportError as exc:  # noqa: BLE001
+    raise RuntimeError(
+        "soundfile が見つかりません。Irodori の venv で pip install soundfile してください"
+    ) from exc
 
 
 def _ensure_irodori_on_path() -> None:
@@ -48,12 +58,128 @@ import torch
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 
+import irodori_tts.inference_runtime as ir  # noqa: E402
 from irodori_tts.inference_runtime import (  # noqa: E402
     InferenceRuntime,
     RuntimeKey,
     SamplingRequest,
-    save_wav,
 )
+
+# wav / flac / ogg は soundfile が直接読める。それ以外は ffmpeg で WAV 化。
+_SF_NATIVE_EXTS = {".wav", ".flac", ".ogg"}
+
+
+def _ffmpeg_bin() -> str:
+    env = (os.environ.get("FFMPEG_BINARY") or "").strip()
+    if not env:
+        raise RuntimeError("同梱の ffmpeg が見つかりません（FFMPEG_BINARY が未設定です）")
+    return env
+
+
+def _hide_console_kwargs() -> dict[str, Any]:
+    if os.name != "nt":
+        return {}
+    # CREATE_NO_WINDOW — 生成中に CMD が点滅しないようにする
+    return {"creationflags": 0x08000000}
+
+
+def _ref_cache_dir() -> Path:
+    local = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_CACHE_HOME")
+    if local:
+        d = Path(local) / "irodori-studio" / "ref_wav_cache"
+    else:
+        d = Path.home() / ".cache" / "irodori-studio" / "ref_wav_cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _needs_wav_convert(path: Path) -> bool:
+    return path.suffix.lower() not in _SF_NATIVE_EXTS
+
+
+def _convert_ref_to_wav(src: Path) -> Path:
+    """ffmpeg で 44.1kHz mono PCM WAV に変換し、キャッシュパスを返す。"""
+    if not src.is_file():
+        raise FileNotFoundError(f"参照音源が見つかりません: {src}")
+    try:
+        resolved = src.resolve()
+        stamp = f"{resolved}|{resolved.stat().st_mtime_ns}|{resolved.stat().st_size}"
+    except OSError:
+        stamp = f"{src}|{src.stat().st_mtime_ns}|{src.stat().st_size}"
+    digest = hashlib.sha256(stamp.encode("utf-8", errors="replace")).hexdigest()[:16]
+    dest = _ref_cache_dir() / f"{digest}.wav"
+    if dest.is_file() and dest.stat().st_size > 0:
+        return dest
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        _ffmpeg_bin(),
+        "-y",
+        "-i",
+        str(src),
+        "-vn",
+        "-ar",
+        "44100",
+        "-ac",
+        "1",
+        "-c:a",
+        "pcm_s16le",
+        str(dest),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            **_hide_console_kwargs(),
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "参照音源が wav/flac/ogg 以外です。同梱の ffmpeg が見つかりません"
+        ) from exc
+    if proc.returncode != 0:
+        err = proc.stdout.decode("utf-8", errors="replace")[-800:]
+        raise RuntimeError(f"参照音源の WAV 化に失敗しました: {src.name}\n{err}")
+    return dest
+
+
+def _ensure_sf_readable(path: str | Path) -> Path:
+    src = Path(path)
+    if not _needs_wav_convert(src):
+        return src
+    return _convert_ref_to_wav(src)
+
+
+def _load_audio(path: str | Path) -> tuple[torch.Tensor, int]:
+    """Irodori `_load_audio` 互換（C, T）float32。torchcodec は使わない。"""
+    readable = _ensure_sf_readable(path)
+    data, sr = sf.read(str(readable), dtype="float32")
+    wav = torch.from_numpy(data)
+    if wav.ndim == 1:
+        wav = wav.unsqueeze(0)
+    else:
+        wav = wav.T
+    return wav, int(sr)
+
+
+def save_wav(path: str | Path, audio: torch.Tensor, sample_rate: int) -> Path:
+    """Irodori `save_wav` 互換。soundfile のみで書く。"""
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    audio_cpu = audio.detach().to(device="cpu", dtype=torch.float32)
+    if audio_cpu.ndim == 1:
+        audio_np = audio_cpu.numpy()
+    elif audio_cpu.shape[0] == 1:
+        audio_np = audio_cpu.squeeze(0).numpy()
+    else:
+        audio_np = audio_cpu.T.numpy()
+    sf.write(str(out_path), audio_np, int(sample_rate))
+    return out_path
+
+
+# synthesize 内の参照読み込みも soundfile 本線にする
+ir._load_audio = _load_audio
 
 
 RUNTIME: InferenceRuntime | None = None
@@ -105,6 +231,9 @@ def handle_synthesize(req: dict[str, Any]) -> None:
     no_ref = bool(req.get("no_ref", False))
     if caption is not None and not ref_embed and not ref_wav:
         no_ref = True
+
+    if ref_wav:
+        ref_wav = str(_ensure_sf_readable(ref_wav))
 
     sampling = SamplingRequest(
         text=str(req["text"]),

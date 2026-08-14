@@ -21,7 +21,10 @@ def emit_fraction(i: int, n: int, detail: str = "") -> None:
 def _ffmpeg_bin() -> str:
     import os
 
-    return os.environ.get("FFMPEG_BINARY") or "ffmpeg"
+    env = (os.environ.get("FFMPEG_BINARY") or "").strip()
+    if not env:
+        raise RuntimeError("同梱の ffmpeg が見つかりません（FFMPEG_BINARY が未設定です）")
+    return env
 
 
 def atempo_filter(speed: float) -> str:
