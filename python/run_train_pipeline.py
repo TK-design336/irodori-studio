@@ -56,6 +56,66 @@ def is_done(job_dir: Path, key: str) -> bool:
     return (job_dir / f".done_{key}").is_file()
 
 
+def manifest_has_rows(path: Path) -> bool:
+    """True if train_manifest.jsonl exists and has at least one non-empty line."""
+    if not path.is_file():
+        return False
+    try:
+        with path.open(encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def run_prepare_manifest(
+    *,
+    py: Path,
+    studio_py: Path,
+    irodori: Path,
+    job_dir: Path,
+    dataset_jsonl: Path,
+    manifest: Path,
+    latent_dir: Path,
+    device: str,
+    step: int,
+    total: int,
+) -> None:
+    """Encode latents via Studio soundfile path (avoids datasets.Audio / torchcodec)."""
+    print(f"STEP {step}/{total} prepare_manifest", flush=True)
+    if is_done(job_dir, "prepare_manifest") and manifest_has_rows(manifest):
+        print("SKIP prepare_manifest (already done)", flush=True)
+        emit_progress(step=step, total=total, name="prepare_manifest", fraction=1.0)
+        return
+    run(
+        [
+            str(py),
+            str(studio_py / "prepare_manifest_local.py"),
+            "--data-files",
+            str(dataset_jsonl),
+            "--output-manifest",
+            str(manifest),
+            "--latent-dir",
+            str(latent_dir),
+            "--device",
+            device,
+        ],
+        cwd=irodori,
+        step=step,
+        total=total,
+        name="prepare_manifest",
+    )
+    if not manifest_has_rows(manifest):
+        print(
+            f"ERROR: prepare_manifest wrote 0 samples: {manifest}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    mark_done(job_dir, "prepare_manifest")
+
+
 def strip_path_quotes(raw: str) -> str:
     """Remove copy-paste wrapping quotes from a filesystem path."""
     s = raw.strip()
@@ -434,38 +494,18 @@ def main() -> int:
             mark_done(job_dir, "dataset")
 
         # --- 4 prepare_manifest ---
-        print("STEP 4/5 prepare_manifest", flush=True)
-        if is_done(job_dir, "prepare_manifest") and manifest.is_file():
-            print("SKIP prepare_manifest (already done)", flush=True)
-            emit_progress(
-                step=4, total=total, name="prepare_manifest", fraction=1.0
-            )
-        else:
-            run(
-                [
-                    str(py),
-                    str(irodori / "prepare_manifest.py"),
-                    "--dataset",
-                    "json",
-                    "--data-files",
-                    str(dataset_jsonl),
-                    "--audio-column",
-                    "audio",
-                    "--text-column",
-                    "text",
-                    "--output-manifest",
-                    str(manifest),
-                    "--latent-dir",
-                    str(latent_dir),
-                    "--device",
-                    args.device,
-                ],
-                cwd=irodori,
-                step=4,
-                total=total,
-                name="prepare_manifest",
-            )
-            mark_done(job_dir, "prepare_manifest")
+        run_prepare_manifest(
+            py=py,
+            studio_py=studio_py,
+            irodori=irodori,
+            job_dir=job_dir,
+            dataset_jsonl=dataset_jsonl,
+            manifest=manifest,
+            latent_dir=latent_dir,
+            device=args.device,
+            step=4,
+            total=total,
+        )
 
         # --- 5 train ---
         print("STEP 5/5 train", flush=True)
@@ -594,38 +634,18 @@ def main() -> int:
             mark_done(job_dir, "dataset")
 
         # --- 5 prepare_manifest ---
-        print("STEP 5/6 prepare_manifest", flush=True)
-        if is_done(job_dir, "prepare_manifest") and manifest.is_file():
-            print("SKIP prepare_manifest (already done)", flush=True)
-            emit_progress(
-                step=5, total=total, name="prepare_manifest", fraction=1.0
-            )
-        else:
-            run(
-                [
-                    str(py),
-                    str(irodori / "prepare_manifest.py"),
-                    "--dataset",
-                    "json",
-                    "--data-files",
-                    str(dataset_jsonl),
-                    "--audio-column",
-                    "audio",
-                    "--text-column",
-                    "text",
-                    "--output-manifest",
-                    str(manifest),
-                    "--latent-dir",
-                    str(latent_dir),
-                    "--device",
-                    args.device,
-                ],
-                cwd=irodori,
-                step=5,
-                total=total,
-                name="prepare_manifest",
-            )
-            mark_done(job_dir, "prepare_manifest")
+        run_prepare_manifest(
+            py=py,
+            studio_py=studio_py,
+            irodori=irodori,
+            job_dir=job_dir,
+            dataset_jsonl=dataset_jsonl,
+            manifest=manifest,
+            latent_dir=latent_dir,
+            device=args.device,
+            step=5,
+            total=total,
+        )
 
         # --- 6 train ---
         print("STEP 6/6 train", flush=True)

@@ -212,11 +212,16 @@ pub fn start_train_job(
                     ));
                 }
             };
-            // Slice step needs pydub; install into the configured Irodori venv if missing.
+            // Slice step needs pydub; latent encode uses soundfile (not torchcodec).
             crate::python_env::ensure_packages_best_effort(
                 &python,
                 "import pydub",
                 &["pydub"],
+            );
+            crate::python_env::ensure_packages_best_effort(
+                &python,
+                "import soundfile",
+                &["soundfile"],
             );
             let python_str = python.display().to_string();
             let irodori_root = settings.irodori_root().to_string();
