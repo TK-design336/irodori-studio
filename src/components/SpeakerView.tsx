@@ -406,7 +406,7 @@ export function SpeakerView({ speakers, onSpeakersChanged, isV4 }: Props) {
           gender: gender || null,
           ageRange: ageRange || null,
           tags: tags && tags.length > 0 ? tags : null,
-          realName: realName.trim() || sp.name,
+          realName: (realName ?? "").trim() || sp.name,
         },
       });
       if (profileEditPath === sp.embedPath) {
