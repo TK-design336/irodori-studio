@@ -28,7 +28,7 @@ export function AudioAdjustmentPanel({
       {!collapsed && (
         <div className="panel-body">
           <label className="param-field">
-            <span className="param-label">Volume ({volume.toFixed(2)})</span>
+            <span className="param-label">音量 ({volume.toFixed(2)})</span>
             <div className="param-controls">
               <input
                 type="range"
@@ -59,7 +59,7 @@ export function AudioAdjustmentPanel({
             </div>
           </label>
           <label className="param-field">
-            <span className="param-label">Speed ({speed.toFixed(2)})</span>
+            <span className="param-label">速度 ({speed.toFixed(2)})</span>
             <div className="param-controls">
               <input
                 type="range"
@@ -102,7 +102,7 @@ export function AudioAdjustmentPanel({
             </button>
           </div>
           <p className="hint">
-            再生中は仮反映。保存時に Volume / Speed（ピッチ維持）を焼き込みます
+            再生中は仮反映。保存時に焼き込みます
           </p>
         </div>
       )}

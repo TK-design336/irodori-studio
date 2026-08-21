@@ -1,18 +1,19 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
-  type ReactNode,
 } from "react";
 import { createPortal, flushSync } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
   AppSettings,
+  ExportAudioFormat,
   Project,
   ProjectLine,
   SamplingParams,
@@ -28,21 +29,43 @@ import {
   lineCfgScaleCaption,
   DEFAULT_CFG_SCALE_CAPTION,
   asrCerWarnThreshold,
-  samplingEqual,
+  samplingEqualIgnoringSeed,
+  normalizeLineVariants,
+  primaryVariant,
+  syncLineWavPath,
+  wavPathBelongsToLine,
+  backfillLineVariants,
+  newVariantId,
+  clampCandidateCount,
+  MAX_LINE_VARIANTS,
+  multiGenerateModeOf,
+  type LineVariant,
 } from "../types";
 import { SamplingPanel } from "./SamplingPanel";
 import { AudioAdjustmentPanel } from "./AudioAdjustmentPanel";
 import { CaptionPanel } from "./CaptionPanel";
 import { BulkAddDialog } from "./BulkAddDialog";
-import { KatakanaReviewDialog } from "./KatakanaReviewDialog";
+import { isSupportedDocFile, filesFromDataTransfer, acceptFileDrag } from "../lib/docImport/index";
+import { AnnotationReviewDialog, type NumericConvertModes } from "./AnnotationReviewDialog";
+import { AnnotationOverlay } from "./AnnotationOverlay";
 import { BoundedSelect } from "./BoundedSelect";
 import { EmojiPalette } from "./EmojiPalette";
 import { BatchMoreMenu } from "./BatchMoreMenu";
 import { lineExportFileName } from "../lib/exportFileName";
+import {
+  EXPORT_AUDIO_FORMAT_LABELS,
+  EXPORT_AUDIO_FORMATS,
+  exportAudioExt,
+  exportAudioFormatOf,
+  exportBitrateKbps,
+  exportDialogFilters,
+  formatFromDestPath,
+  withAudioExt,
+} from "../lib/exportAudio";
+import { reconcileProjectSpeakers } from "../lib/speakerResolve";
 import { SpeakerApplyMenu } from "./SpeakerApplyMenu";
 import { IconSave, IconTrash } from "./icons";
 import { LineAudioPlayer, type PlaybackSnapshot } from "../lib/audioPlayer";
-import type { KatakanaHit } from "../lib/katakanaApply";
 import type { ImportedLine } from "../lib/scriptImport";
 import {
   applyAutoReplacements,
@@ -50,7 +73,22 @@ import {
   type ReplaceEntry,
   type ReplaceSnippet,
 } from "../lib/replaceApply";
-import type { Dictionaries } from "../lib/dictionaries";
+import {
+  DICTS_CHANGED_EVENT,
+  emitDictionariesChanged,
+  upsertReadingDictExtra,
+  type Dictionaries,
+} from "../lib/dictionaries";
+import {
+  filterPendingAnnotations,
+  isNovelCandidate,
+  newReadingId,
+  synthTextForLine,
+  validateReadings,
+  type AnnotationKind,
+  type AppliedReading,
+  type DetectedAnnotation,
+} from "../lib/annotations";
 import {
   buildLabelTrack,
   buildSrt,
@@ -80,9 +118,21 @@ function speakerOf(
   return speakers.find((s) => s.embedPath === embedPath);
 }
 
-/** Style caption UI / synth only for v4 参照音源 speakers. */
+function lineSpeakerDisplayLabel(
+  line: ProjectLine,
+  speakers: SpeakerInfo[],
+): string | undefined {
+  const sp = speakerOf(speakers, line.speakerEmbedPath);
+  if (sp) return speakerOptionLabel(sp);
+  const name = line.speakerName.trim();
+  if (name && !/[\\/]/.test(name) && !/^[a-zA-Z]:/.test(name)) return name;
+  return undefined;
+}
+
+/** Style caption UI / synth for v4 speakers (ref + embed kinds all support caption). */
 function usesStyleCaption(speaker: SpeakerInfo | null | undefined): boolean {
-  return speaker?.kind === "ref";
+  const k = speaker?.kind;
+  return k === "ref" || k === "trained" || k === "blend";
 }
 
 function effectiveLineCaption(
@@ -103,9 +153,17 @@ function effectiveCfgScaleCaption(
     : DEFAULT_CFG_SCALE_CAPTION;
 }
 
-function isDirty(line: ProjectLine, speakers: SpeakerInfo[]): boolean {
-  if (!line.wavPath) return true;
-  if ((line.generatedText ?? "") !== line.text) return true;
+function lineSynthText(line: ProjectLine): string {
+  return synthTextForLine(line.text, line.readings);
+}
+
+function isDirty(
+  line: ProjectLine,
+  speakers: SpeakerInfo[],
+): boolean {
+  const variants = normalizeLineVariants(line);
+  if (variants.length === 0 && !line.wavPath) return true;
+  if ((line.generatedText ?? "") !== lineSynthText(line)) return true;
   const key = speakerConditionKey(speakers, line.speakerEmbedPath);
   if ((line.generatedSpeakerEmbedPath ?? "") !== key) return true;
   const caption = effectiveLineCaption(line, speakers);
@@ -117,11 +175,48 @@ function isDirty(line: ProjectLine, speakers: SpeakerInfo[]): boolean {
   }
   if (
     line.generatedSampling != null &&
-    !samplingEqual(line.sampling, line.generatedSampling)
+    !samplingEqualIgnoringSeed(line.sampling, line.generatedSampling)
   ) {
     return true;
   }
   return false;
+}
+
+/** Persist a novel reading to the reading dict only if it is not already a candidate. */
+async function persistNovelReadingDict(
+  specs: {
+    kind: string;
+    surface: string;
+    reading: string;
+    candidateReadings: string[];
+  }[],
+): Promise<void> {
+  let dicts: Dictionaries;
+  try {
+    dicts = await invoke<Dictionaries>("get_dictionaries");
+  } catch {
+    return;
+  }
+  let reading = dicts.reading ?? [];
+  let changed = false;
+  for (const s of specs) {
+    const kind = s.kind as AnnotationKind;
+    if (kind !== "english" && kind !== "heteronym" && kind !== "numeric") continue;
+    const value = s.reading.trim();
+    if (!value || s.candidateReadings.includes(value)) continue;
+    const next = upsertReadingDictExtra(reading, kind, s.surface, value);
+    if (next !== reading) {
+      reading = next;
+      changed = true;
+    }
+  }
+  if (!changed) return;
+  try {
+    await invoke("set_dictionaries", { dicts: { ...dicts, reading } });
+    emitDictionariesChanged();
+  } catch {
+    /* dict extension is best-effort */
+  }
 }
 
 /** Legacy projects: assume current sampling matches the existing wav. */
@@ -130,11 +225,15 @@ function backfillGeneratedSampling(p: Project): Project {
   const lines = p.lines.map((l) => {
     if (l.wavPath && l.generatedSampling == null) {
       changed = true;
-      return { ...l, generatedSampling: { ...l.sampling } };
+      return { ...l, generatedSampling: { ...l.sampling, seed: null } };
     }
     return l;
   });
   return changed ? { ...p, lines } : p;
+}
+
+function backfillProject(p: Project): Project {
+  return backfillLineVariants(backfillGeneratedSampling(p));
 }
 
 /** Apply new sampling; freeze prior values as the generation snapshot if missing. */
@@ -153,11 +252,27 @@ function withLineSampling(
 }
 
 /** wavPath must belong to this line's cache file (guards against stale/shared paths). */
-function wavPathMatchesLine(line: ProjectLine): boolean {
-  if (!line.wavPath) return false;
-  const norm = line.wavPath.replace(/\//g, "\\").toLowerCase();
-  const id = line.id.toLowerCase();
-  return norm.endsWith(`\\${id}.wav`) || norm.endsWith(`/${id}.wav`);
+function wavPathMatchesLine(line: ProjectLine, wavPath?: string): boolean {
+  const path = wavPath ?? line.wavPath;
+  if (!path) return false;
+  return wavPathBelongsToLine(line, path);
+}
+
+function variantDurationKey(lineId: string, variantId: string, speed: number) {
+  return `${lineId}:${variantId}:${speed.toFixed(2)}`;
+}
+
+function samplingForContentKey(
+  sampling: SamplingParams | null | undefined,
+): SamplingParams | null {
+  if (!sampling) return null;
+  return { ...sampling, seed: null };
+}
+
+function generatedSamplingSnapshot(
+  sampling: SamplingParams,
+): SamplingParams {
+  return { ...sampling, seed: null };
 }
 
 function lineContentKey(
@@ -167,13 +282,20 @@ function lineContentKey(
   cfgScaleCaption = DEFAULT_CFG_SCALE_CAPTION,
   sampling: SamplingParams | null | undefined = null,
 ) {
-  const samp = sampling ? JSON.stringify(sampling) : "";
-  return `${speakerKey}\0${text}\0${caption}\0${cfgScaleCaption}\0${samp}`;
+  const samp = samplingForContentKey(sampling);
+  const sampStr = samp ? JSON.stringify(samp) : "";
+  return `${speakerKey}\0${text}\0${caption}\0${cfgScaleCaption}\0${sampStr}`;
 }
 
 function joinPath(dir: string, name: string) {
   const sep = /\\/.test(dir) && !/\//.test(dir) ? "\\" : "/";
   return `${dir.replace(/[/\\]+$/, "")}${sep}${name}`;
+}
+
+function parentDir(path: string): string {
+  const trimmed = path.replace(/[/\\]+$/, "");
+  const i = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  return i >= 0 ? trimmed.slice(0, i) : trimmed;
 }
 
 type BatchSaveMode = "individual" | "concat";
@@ -341,13 +463,6 @@ type LineFocusRequest = {
   nonce: number;
 };
 
-export type HomographHitUi = {
-  surface: string;
-  start: number;
-  end: number;
-  note?: string | null;
-};
-
 function AutoTextarea({
   value,
   onChange,
@@ -359,7 +474,10 @@ function AutoTextarea({
   focusRequest,
   insertRequest,
   onInsertConsumed,
-  highlightHits,
+  pendingAnnotations,
+  appliedReadings,
+  onApplyAnnotation,
+  onUndoReading,
   autoReplaceEntries,
 }: {
   value: string;
@@ -372,7 +490,10 @@ function AutoTextarea({
   focusRequest: LineFocusRequest | null;
   insertRequest: { nonce: number; emoji: string } | null;
   onInsertConsumed?: (nonce: number) => void;
-  highlightHits?: HomographHitUi[];
+  pendingAnnotations?: DetectedAnnotation[];
+  appliedReadings?: AppliedReading[];
+  onApplyAnnotation?: (annotation: DetectedAnnotation, reading: string) => void;
+  onUndoReading?: (readingId: string) => void;
   autoReplaceEntries?: ReplaceEntry[];
 }) {
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -609,26 +730,27 @@ function AutoTextarea({
     }
   };
 
+  const showOverlay =
+    !focused &&
+    ((pendingAnnotations && pendingAnnotations.length > 0) ||
+      (appliedReadings && appliedReadings.length > 0));
+
   return (
     <div className="line-text-wrap">
-      {!focused && highlightHits && highlightHits.length > 0 ? (
-        <div
-          className="line-text line-text-display"
-          onClick={(e) => {
-            e.stopPropagation();
-            ref.current?.focus();
-          }}
-          title="クリックで編集"
-        >
-          {renderHighlighted(draft, highlightHits)}
-        </div>
+      {showOverlay && onApplyAnnotation ? (
+        <AnnotationOverlay
+          text={draft}
+          pending={pendingAnnotations ?? []}
+          applied={appliedReadings ?? []}
+          onApply={onApplyAnnotation}
+          onUndo={onUndoReading ?? (() => {})}
+          onFocusEdit={() => ref.current?.focus()}
+        />
       ) : null}
       <textarea
       ref={ref}
       className={`line-text ${
-        !focused && highlightHits && highlightHits.length > 0
-          ? "line-text-editing-hidden"
-          : ""
+        showOverlay ? "line-text-editing-hidden" : ""
       }`}
       value={draft}
       rows={1}
@@ -702,35 +824,53 @@ function AutoTextarea({
   );
 }
 
-function renderHighlighted(text: string, hits: HomographHitUi[]) {
-  const sorted = [...hits].sort((a, b) => a.start - b.start);
-  const parts: ReactNode[] = [];
-  let cursor = 0;
-  sorted.forEach((h, i) => {
-    const start = Math.max(0, Math.min(h.start, text.length));
-    const end = Math.max(start, Math.min(h.end, text.length));
-    if (start < cursor) return;
-    if (start > cursor) {
-      parts.push(<span key={`t-${i}-${cursor}`}>{text.slice(cursor, start)}</span>);
-    }
-    const tip = h.note?.trim()
-      ? `同形異音警告 — ${h.note}`
-      : "同形異音警告";
-    parts.push(
-      <mark key={`h-${i}-${start}`} className="homograph-mark" title={tip}>
-        {text.slice(start, end)}
-      </mark>,
-    );
-    cursor = end;
-  });
-  if (cursor < text.length) {
-    parts.push(<span key="tail">{text.slice(cursor)}</span>);
-  }
-  return parts.length > 0 ? parts : text;
-}
-
 function elCaretAtStart(el: HTMLTextAreaElement) {
   return el.selectionStart === 0 && el.selectionEnd === 0;
+}
+
+const SELECT_DRAG_THRESHOLD_PX = 6;
+
+function isInteractiveLineTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) return false;
+  return !!target.closest(
+    "textarea, button, input, select, a, .drag-handle, .bounded-select-trigger, .bounded-select-menu, .line-text-wrap, .seek-bar, .variant-seek-stack, .speaker-apply",
+  );
+}
+
+function sameIdOrder(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((id, i) => id === b[i]);
+}
+
+function rangeIdsFromAnchor(
+  order: string[],
+  anchorId: string | null,
+  targetId: string,
+): string[] {
+  const anchor =
+    anchorId && order.includes(anchorId) ? anchorId : targetId;
+  const i = order.indexOf(anchor);
+  const j = order.indexOf(targetId);
+  if (i < 0 || j < 0) return [targetId];
+  const lo = Math.min(i, j);
+  const hi = Math.max(i, j);
+  return order.slice(lo, hi + 1);
+}
+
+/** Keep relative order; place the block so `grabbedId` stays at its index. */
+function packBlockAtGrab(
+  order: string[],
+  moving: string[],
+  grabbedId: string,
+): string[] {
+  const movingSet = new Set(moving);
+  if (!movingSet.has(grabbedId)) return order;
+  const block = order.filter((id) => movingSet.has(id));
+  const rest = order.filter((id) => !movingSet.has(id));
+  const grabIndex = order.indexOf(grabbedId);
+  const grabOffset = block.indexOf(grabbedId);
+  if (grabIndex < 0 || grabOffset < 0) return order;
+  const dest = grabIndex - grabOffset;
+  return [...rest.slice(0, dest), ...block, ...rest.slice(dest)];
 }
 
 /** Match Rust `project::sanitize_name` so create/load agree on folder names. */
@@ -777,6 +917,7 @@ type ProjectGatePanelsProps = {
   selectedName: string | null;
   onSelectName: (name: string) => void;
   onLoad: () => void;
+  onDelete: (name: string) => void;
   status: string;
   disabled?: boolean;
   openNames?: string[];
@@ -790,6 +931,7 @@ function ProjectGatePanels({
   selectedName,
   onSelectName,
   onLoad,
+  onDelete,
   status,
   disabled = false,
   openNames = [],
@@ -837,7 +979,7 @@ function ProjectGatePanels({
                 const isOpen = openNames.includes(name);
                 const selected = selectedName === name;
                 return (
-                  <li key={name}>
+                  <li key={name} className="project-pick-row">
                     <button
                       type="button"
                       role="option"
@@ -852,10 +994,20 @@ function ProjectGatePanels({
                         }
                       }}
                     >
-                      <span>{name}</span>
+                      <span className="project-pick-name">{name}</span>
                       {isOpen && (
                         <span className="project-pick-badge">開いています</span>
                       )}
+                    </button>
+                    <button
+                      type="button"
+                      className="danger icon-btn project-pick-delete"
+                      title={`「${name}」を削除`}
+                      aria-label={`「${name}」を削除`}
+                      disabled={disabled}
+                      onClick={() => onDelete(name)}
+                    >
+                      <IconTrash />
                     </button>
                   </li>
                 );
@@ -880,6 +1032,76 @@ function ProjectGatePanels({
   );
 }
 
+function ConfirmModal({
+  message,
+  onYes,
+  onCancel,
+}: {
+  message: string;
+  onYes: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" onClick={onCancel}>
+      <div className="modal panel" onClick={(e) => e.stopPropagation()}>
+        <header className="panel-header">
+          <h3>確認</h3>
+        </header>
+        <div className="panel-body form-stack">
+          <p>{message}</p>
+          <div className="row">
+            <button
+              type="button"
+              className="primary"
+              onClick={() => {
+                onYes();
+              }}
+            >
+              OK
+            </button>
+            <button type="button" onClick={onCancel}>
+              キャンセル
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+type PipelinePlaybackItem = {
+  line: ProjectLine;
+  wavPath: string;
+  variantId: string | null;
+};
+
+/** Queue consumed by sequential playback while generation keeps producing items. */
+function createPipelinePlaybackQueue() {
+  const queue: PipelinePlaybackItem[] = [];
+  const waiters: Array<(item: PipelinePlaybackItem | null) => void> = [];
+  let closed = false;
+
+  return {
+    push(item: PipelinePlaybackItem) {
+      if (closed) return;
+      if (waiters.length > 0) waiters.shift()!(item);
+      else queue.push(item);
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      while (waiters.length > 0) waiters.shift()!(null);
+    },
+    next(): Promise<PipelinePlaybackItem | null> {
+      if (queue.length > 0) return Promise.resolve(queue.shift()!);
+      if (closed) return Promise.resolve(null);
+      return new Promise((resolve) => {
+        waiters.push(resolve);
+      });
+    },
+  };
+}
+
 export function GenerateView({
   speakers,
   settings,
@@ -901,6 +1123,24 @@ export function GenerateView({
   const [audioCollapsed, setAudioCollapsed] = useState(false);
   const [captionCollapsed, setCaptionCollapsed] = useState(false);
   const [playback, setPlayback] = useState<PlaybackSnapshot | null>(null);
+  const [variantDurations, setVariantDurations] = useState<Record<string, number>>(
+    {},
+  );
+  const [seekDraft, setSeekDraft] = useState<{
+    lineId: string;
+    variantId: string;
+    time: number;
+  } | null>(null);
+  const [variantKeepByLine, setVariantKeepByLine] = useState<
+    Record<string, string[]>
+  >({});
+  const pendingSeekRef = useRef<{
+    lineId: string;
+    variantId: string | null;
+    time: number;
+  } | null>(null);
+  const loadSeekKeyRef = useRef<string | null>(null);
+  const userSeekingKeyRef = useRef<string | null>(null);
   const [confirm, setConfirm] = useState<{
     message: string;
     onYes: () => void;
@@ -911,16 +1151,24 @@ export function GenerateView({
   const [batchSilenceSecs, setBatchSilenceSecs] = useState("0.5");
   const [batchSubtitle, setBatchSubtitle] = useState<BatchSubtitleMode>("none");
   const [batchLabel, setBatchLabel] = useState<BatchLabelMode>("none");
+  const [batchFormat, setBatchFormat] = useState<ExportAudioFormat>("wav");
   const [batchSaving, setBatchSaving] = useState(false);
   const [bulkAddOpen, setBulkAddOpen] = useState(false);
-  const [katakanaReview, setKatakanaReview] = useState<{
+  const [bulkAddInitialFile, setBulkAddInitialFile] = useState<File | undefined>(undefined);
+  const [lineListDropOver, setLineListDropOver] = useState(false);
+  const [annotationReview, setAnnotationReview] = useState<{
     items: {
       lineId: string;
       text: string;
-      hits: KatakanaHit[];
+      annotations: DetectedAnnotation[];
+      applied: AppliedReading[];
       label: string;
     }[];
   } | null>(null);
+  const [numericModes, setNumericModes] = useState<NumericConvertModes>({
+    number: "hiragana",
+    unit: "hiragana",
+  });
   const [replacePreview, setReplacePreview] = useState<{
     changes: {
       lineId: string;
@@ -932,8 +1180,8 @@ export function GenerateView({
     total: number;
     selected: Record<string, boolean>;
   } | null>(null);
-  const [homoByLine, setHomoByLine] = useState<
-    Record<string, HomographHitUi[]>
+  const [annotationsByLine, setAnnotationsByLine] = useState<
+    Record<string, DetectedAnnotation[]>
   >({});
   const [asrByLine, setAsrByLine] = useState<Record<string, AsrLineResult>>(
     {},
@@ -943,7 +1191,7 @@ export function GenerateView({
     [],
   );
 
-  const reloadAutoReplaceDict = useCallback(async () => {
+  const reloadDicts = useCallback(async () => {
     try {
       const dicts = await invoke<Dictionaries>("get_dictionaries");
       setAutoReplaceEntries(
@@ -957,14 +1205,14 @@ export function GenerateView({
   }, []);
 
   useEffect(() => {
-    void reloadAutoReplaceDict();
-  }, [reloadAutoReplaceDict]);
+    void reloadDicts();
+  }, [reloadDicts]);
 
   useEffect(() => {
-    const onFocus = () => void reloadAutoReplaceDict();
+    const onFocus = () => void reloadDicts();
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, [reloadAutoReplaceDict]);
+  }, [reloadDicts]);
 
   const invalidateAsr = useCallback((lineId: string) => {
     setAsrByLine((prev) => {
@@ -1011,12 +1259,20 @@ export function GenerateView({
   const [selectedByProject, setSelectedByProject] = useState<
     Record<string, string | null>
   >({});
+  const [selectedIdsByProject, setSelectedIdsByProject] = useState<
+    Record<string, string[]>
+  >({});
   const [samplingByProject, setSamplingByProject] = useState<
     Record<string, SamplingParams>
   >({});
   const [tabRename, setTabRename] = useState<string | null>(null);
   const [tabContextMenu, setTabContextMenu] = useState<{
     name: string;
+    x: number;
+    y: number;
+  } | null>(null);
+  const [linePlayContextMenu, setLinePlayContextMenu] = useState<{
+    lineId: string;
     x: number;
     y: number;
   } | null>(null);
@@ -1027,17 +1283,33 @@ export function GenerateView({
     lineId: string;
   } | null>(null);
   const [dragOrder, setDragOrder] = useState<string[] | null>(null);
-  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [draggingIds, setDraggingIds] = useState<string[]>([]);
+  const [rangeSelecting, setRangeSelecting] = useState(false);
 
   const projectRef = useRef(project);
+  const openProjectsRef = useRef(openProjects);
+  openProjectsRef.current = openProjects;
   const selectedIdRef = useRef<string | null>(null);
+  const selectedIdsRef = useRef<string[]>([]);
+  const selectionAnchorRef = useRef<string | null>(null);
+  const displayOrderRef = useRef<string[]>([]);
+  const lineGestureConsumedRef = useRef(false);
   const lineListRef = useRef<HTMLDivElement>(null);
+  const projectTabsRef = useRef<HTMLDivElement>(null);
+  const docFileInputRef = useRef<HTMLInputElement>(null);
   const speakersRef = useRef(speakers);
   speakersRef.current = speakers;
 
   const selectedId = project
     ? (selectedByProject[project.name] ?? null)
     : null;
+  const selectedIds = useMemo(() => {
+    if (!project) return [] as string[];
+    const ids = selectedIdsByProject[project.name];
+    if (ids && ids.length > 0) return ids;
+    return selectedId ? [selectedId] : [];
+  }, [project, selectedIdsByProject, selectedId]);
+  const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
   const panelSampling = project
     ? (samplingByProject[project.name] ?? project.defaultSampling)
     : defaultSampling();
@@ -1062,11 +1334,19 @@ export function GenerateView({
       .map((id) => map.get(id))
       .filter((l): l is ProjectLine => !!l);
   }, [project, dragOrder]);
+  selectedIdsRef.current = selectedIds;
+  displayOrderRef.current = displayLines.map((l) => l.id);
 
   const onSelectedId = useCallback((id: string | null) => {
     const name = projectRef.current?.name;
     if (!name) return;
     setSelectedByProject((prev) => ({ ...prev, [name]: id }));
+    setSelectedIdsByProject((prev) => ({
+      ...prev,
+      [name]: id ? [id] : [],
+    }));
+    selectionAnchorRef.current = id;
+    selectedIdsRef.current = id ? [id] : [];
   }, []);
 
   const onPanelSampling = useCallback((s: SamplingParams) => {
@@ -1080,14 +1360,36 @@ export function GenerateView({
   const skipSamplingAutoApply = useRef(false);
   const speedTimer = useRef<number | null>(null);
   const lineDraftsRef = useRef<Map<string, string>>(new Map());
-  /** Last text used for homograph detect (skip unchanged lines). */
-  const homoTextByLineRef = useRef<Record<string, string>>({});
-  const homoByLineRef = useRef<Record<string, HomographHitUi[]>>({});
+  /** Last text used for annotation detect (skip unchanged lines). */
+  const annotationTextByLineRef = useRef<Record<string, string>>({});
+  const annotationsByLineRef = useRef<Record<string, DetectedAnnotation[]>>({});
   useEffect(() => {
-    homoByLineRef.current = homoByLine;
-  }, [homoByLine]);
+    annotationsByLineRef.current = annotationsByLine;
+  }, [annotationsByLine]);
+  useEffect(() => {
+    const el = projectTabsRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (el.scrollWidth <= el.clientWidth) return;
+      const delta =
+        Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+      if (delta === 0) return;
+      e.preventDefault();
+      el.scrollLeft += delta;
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [project != null]);
   const synthInflight = useRef(
-    new Map<string, Promise<{ wav: string; line: ProjectLine } | null>>(),
+    new Map<
+      string,
+      Promise<{
+        wav: string;
+        line: ProjectLine;
+        variantId: string;
+        seed: number;
+      } | null>
+    >(),
   );
   /** Survives flaky project state — prevents repeat synth for same content. */
   const readyCacheRef = useRef(
@@ -1097,16 +1399,35 @@ export function GenerateView({
   /** Bumped to abort an in-flight `playBatch` loop. */
   const batchPlayGenRef = useRef(0);
   const batchPlayActiveRef = useRef(false);
+  const [batchPlayActive, setBatchPlayActive] = useState(false);
   const dragRef = useRef<{
     id: string;
+    ids: string[];
     pointerId: number;
     fromIndex: number;
     currentIndex: number;
+    startOrder: string[];
     order: string[];
   } | null>(null);
   const dragListenersRef = useRef<{
     move: (e: PointerEvent) => void;
     up: (e: PointerEvent) => void;
+    key: (e: KeyboardEvent) => void;
+  } | null>(null);
+  const selectRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    startIndex: number;
+    startLineId: string;
+    additive: boolean;
+    startInGroup: boolean;
+    baseIds: string[];
+    mode: "pending" | "range";
+  } | null>(null);
+  const selectListenersRef = useRef<{
+    move: (e: PointerEvent) => void;
+    up: (e: Event) => void;
     key: (e: KeyboardEvent) => void;
   } | null>(null);
 
@@ -1125,7 +1446,7 @@ export function GenerateView({
       ) {
         readyCacheRef.current.set(line.id, {
           key: lineContentKey(
-            line.text,
+            lineSynthText(line),
             speakerConditionKey(speakersRef.current, line.speakerEmbedPath),
             effectiveLineCaption(line, speakersRef.current),
             effectiveCfgScaleCaption(line, speakersRef.current),
@@ -1165,11 +1486,25 @@ export function GenerateView({
 
   useEffect(() => {
     playerRef.current = new LineAudioPlayer({
-      onChange: setPlayback,
+      onChange: (snap) => {
+        setPlayback(snap);
+        if (snap?.variantId && snap.duration > 0) {
+          const speed =
+            projectRef.current?.lines.find((l) => l.id === snap.lineId)
+              ?.speed ?? 1;
+          const key = variantDurationKey(snap.lineId, snap.variantId, speed);
+          setVariantDurations((prev) =>
+            prev[key] === snap.duration
+              ? prev
+              : { ...prev, [key]: snap.duration },
+          );
+        }
+      },
     });
     return () => {
       batchPlayGenRef.current += 1;
       batchPlayActiveRef.current = false;
+      setBatchPlayActive(false);
       playerRef.current?.stop(true);
       if (speedTimer.current) window.clearTimeout(speedTimer.current);
     };
@@ -1187,14 +1522,80 @@ export function GenerateView({
     }
     if (batchPlayActiveRef.current) {
       batchPlayActiveRef.current = false;
+      setBatchPlayActive(false);
       setStatus("一括再生を停止");
     }
   };
+
+  const abortSequentialOnLeaveLine = (nextLineId: string | null) => {
+    if (!batchPlayActiveRef.current) return;
+    const playing = playerRef.current?.activeLineId;
+    if (playing && nextLineId && nextLineId !== playing) {
+      cancelBatchPlayback({ stopAudio: true });
+    }
+  };
+
+  const playingLineId = playback?.lineId ?? null;
+  useLayoutEffect(() => {
+    if (!batchPlayActive || !playingLineId) return;
+    const list = lineListRef.current;
+    if (!list) return;
+    const el = Array.from(
+      list.querySelectorAll<HTMLElement>(".line-item[data-line-id]"),
+    ).find((item) => item.dataset.lineId === playingLineId);
+    if (!el) return;
+    const listRect = list.getBoundingClientRect();
+    const elRect = el.getBoundingClientRect();
+    const fab = list.parentElement?.querySelector<HTMLElement>(".overlay-fab");
+    const fabTop = fab?.getBoundingClientRect().top;
+    const visibleBottom =
+      Math.min(listRect.bottom, fabTop ?? listRect.bottom) - 8;
+    const overflow = elRect.bottom - visibleBottom;
+    if (overflow > 1) {
+      list.scrollBy({ top: overflow, behavior: "smooth" });
+    }
+  }, [batchPlayActive, playingLineId]);
 
   const selected = useMemo(
     () => project?.lines.find((l) => l.id === selectedId) ?? null,
     [project, selectedId],
   );
+  const variantDurationsRef = useRef(variantDurations);
+  variantDurationsRef.current = variantDurations;
+  const selectedDurationSig = selected
+    ? `${selected.id}:${selected.speed}:${normalizeLineVariants(selected)
+        .map((v) => `${v.id}:${v.wavPath}`)
+        .join("|")}`
+    : "";
+
+  useEffect(() => {
+    if (!selected) return;
+    const variants = normalizeLineVariants(selected);
+    const speed = selected.speed;
+    const lineId = selected.id;
+    let cancelled = false;
+    for (const variant of variants) {
+      const key = variantDurationKey(lineId, variant.id, speed);
+      if (variantDurationsRef.current[key] != null) continue;
+      if (!wavPathBelongsToLine(selected, variant.wavPath)) continue;
+      void invoke<number>("wav_duration_secs", { path: variant.wavPath })
+        .then((secs) => {
+          if (cancelled || !(secs > 0)) return;
+          const playbackSecs = secs / Math.max(0.5, speed);
+          setVariantDurations((prev) =>
+            prev[key] === playbackSecs ? prev : { ...prev, [key]: playbackSecs },
+          );
+        })
+        .catch(() => {
+          /* duration stays unknown until playback */
+        });
+    }
+    return () => {
+      cancelled = true;
+    };
+    // selected is read for wav paths; signature avoids cancel-on-keystroke.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedDurationSig]);
 
   const selectedSpeaker = useMemo(
     () =>
@@ -1241,10 +1642,46 @@ export function GenerateView({
   // Already-open tabs / HMR: backfill sampling snapshots without forcing 要再生成
   useEffect(() => {
     if (!project) return;
-    if (!project.lines.some((l) => l.wavPath && l.generatedSampling == null))
+    if (
+      !project.lines.some(
+        (l) =>
+          (l.wavPath && l.generatedSampling == null) ||
+          (l.wavPath && (!l.variants || l.variants.length === 0)),
+      )
+    )
       return;
-    void persist((prev) => backfillGeneratedSampling(prev), false);
+    void persist((prev) => backfillProject(prev), false);
   }, [project, persist]);
+
+  // Remap stale speaker embed paths when outputs root / speaker scan changes.
+  useEffect(() => {
+    if (speakers.length === 0) return;
+    const prevOpen = openProjectsRef.current;
+    let anyChanged = false;
+    const nextOpen = prevOpen.map((p) => {
+      const r = reconcileProjectSpeakers(p, speakers);
+      if (r !== p) anyChanged = true;
+      return r;
+    });
+    if (!anyChanged) return;
+
+    onOpenProjectsChange(nextOpen);
+    const activeName = projectRef.current?.name;
+    if (activeName) {
+      const reconciled = nextOpen.find((p) => p.name === activeName);
+      if (reconciled) {
+        projectRef.current = reconciled;
+        onProjectChange(reconciled);
+      }
+    }
+    for (let i = 0; i < nextOpen.length; i++) {
+      if (nextOpen[i] !== prevOpen[i]) {
+        void invoke("save_project_cmd", { project: nextOpen[i] }).catch(
+          () => {},
+        );
+      }
+    }
+  }, [speakers, onOpenProjectsChange, onProjectChange]);
 
   /** Push any unflushed textarea drafts into project before generate/play. */
   const commitDrafts = useCallback(() => {
@@ -1391,9 +1828,6 @@ export function GenerateView({
     await persistChain.current;
   };
 
-  const openProjectsRef = useRef(openProjects);
-  openProjectsRef.current = openProjects;
-
   /** Activate a project already in memory (tab switch) without reloading the model. */
   const switchToOpenProject = async (name: string) => {
     if (projectRef.current?.name === name) return;
@@ -1433,7 +1867,10 @@ export function GenerateView({
       const ok = await ensureWorker();
       if (!ok) return;
 
-      const migrated = backfillGeneratedSampling(p);
+      const migrated = reconcileProjectSpeakers(
+        backfillProject(p),
+        speakersRef.current,
+      );
       if (migrated !== p) {
         try {
           await invoke("save_project_cmd", { project: migrated });
@@ -1485,6 +1922,10 @@ export function GenerateView({
 
     const next = list.filter((p) => p.name !== name);
     setSelectedByProject((prev) => {
+      const { [name]: _, ...rest } = prev;
+      return rest;
+    });
+    setSelectedIdsByProject((prev) => {
       const { [name]: _, ...rest } = prev;
       return rest;
     });
@@ -1589,33 +2030,47 @@ export function GenerateView({
       const lines: ProjectLine[] = [];
       for (const line of source.lines) {
         const newId = newLineId();
-        let wavPath: string | null = null;
-        if (line.wavPath && wavPathMatchesLine(line)) {
+        const sourceVariants = normalizeLineVariants(line);
+        const copiedVariants: LineVariant[] = [];
+        for (const variant of sourceVariants) {
+          if (!wavPathMatchesLine(line, variant.wavPath)) continue;
           try {
             const ok = await invoke<boolean>("file_exists", {
-              path: line.wavPath,
+              path: variant.wavPath,
             });
-            if (ok) {
-              const dest = await invoke<string>("line_cache_wav_path", {
-                projectName: newName,
-                lineId: newId,
-              });
-              await invoke("copy_file", { src: line.wavPath, dest });
-              wavPath = dest;
-            }
+            if (!ok) continue;
+            const copiedVariantId =
+              sourceVariants.length === 1 && variant.id === line.id
+                ? newId
+                : newVariantId();
+            const useLegacy =
+              sourceVariants.length === 1 && variant.id === line.id;
+            const dest = await invoke<string>("line_cache_wav_path", {
+              projectName: newName,
+              lineId: newId,
+              variantId: useLegacy ? null : copiedVariantId,
+            });
+            await invoke("copy_file", { src: variant.wavPath, dest });
+            copiedVariants.push({
+              id: copiedVariantId,
+              seed: variant.seed,
+              wavPath: dest,
+            });
           } catch {
-            wavPath = null;
+            /* skip missing variant files */
           }
         }
-        lines.push({
-          ...line,
-          id: newId,
-          wavPath,
-          sampling: { ...line.sampling },
-          generatedSampling: line.generatedSampling
-            ? { ...line.generatedSampling }
-            : line.generatedSampling,
-        });
+        lines.push(
+          syncLineWavPath({
+            ...line,
+            id: newId,
+            variants: copiedVariants,
+            sampling: { ...line.sampling },
+            generatedSampling: line.generatedSampling
+              ? { ...line.generatedSampling }
+              : line.generatedSampling,
+          }),
+        );
       }
 
       const copy: Project = {
@@ -1656,6 +2111,33 @@ export function GenerateView({
       await activateProjectSession(p, { asNewTab: true });
     } catch (e) {
       setStatus(`読み込み失敗: ${e}`);
+    } finally {
+      setGateBusy(false);
+    }
+  };
+
+  const deleteProjectByName = async (rawName: string) => {
+    const name = rawName.trim();
+    if (!name) return;
+    const isOpen = openProjectsRef.current.some((p) => p.name === name);
+    const extra = isOpen ? "開いているタブは閉じます。" : "";
+    askConfirm(
+      `プロジェクト「${name}」を削除しますか？フォルダはゴミ箱に移動します。${extra}`,
+      () => void doDeleteProject(name),
+    );
+  };
+
+  const doDeleteProject = async (name: string) => {
+    setGateBusy(true);
+    try {
+      if (openProjectsRef.current.some((p) => p.name === name)) {
+        await closeProjectTab(name);
+      }
+      await invoke("delete_project_cmd", { name });
+      await refreshProjectList();
+      setStatus(`「${name}」を削除しました`);
+    } catch (e) {
+      setStatus(`削除失敗: ${e}`);
     } finally {
       setGateBusy(false);
     }
@@ -1710,6 +2192,29 @@ export function GenerateView({
       window.removeEventListener("scroll", close, true);
     };
   }, [tabContextMenu]);
+
+  useEffect(() => {
+    if (!linePlayContextMenu) return;
+    const close = () => setLinePlayContextMenu(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    const t = window.setTimeout(() => {
+      document.addEventListener("mousedown", close);
+      document.addEventListener("keydown", onKey);
+      window.addEventListener("blur", close);
+      window.addEventListener("resize", close);
+      window.addEventListener("scroll", close, true);
+    }, 0);
+    return () => {
+      window.clearTimeout(t);
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", onKey);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("scroll", close, true);
+    };
+  }, [linePlayContextMenu]);
 
   const askConfirm = (message: string, onYes: () => void) => {
     setConfirm({ message, onYes });
@@ -1799,16 +2304,20 @@ export function GenerateView({
     setBulkAddOpen(false);
   };
 
-  const refreshHomographs = useCallback(async () => {
+  const annotationRunId = useRef(0);
+  const refreshAnnotations = useCallback(async () => {
+    const runId = ++annotationRunId.current;
     const p = projectRef.current;
     if (!p) {
-      setHomoByLine({});
-      homoTextByLineRef.current = {};
+      setAnnotationsByLine({});
+      annotationTextByLineRef.current = {};
       return;
     }
-    const prevTexts = homoTextByLineRef.current;
+    const prevTexts = annotationTextByLineRef.current;
     const nextTexts: Record<string, string> = {};
-    const next: Record<string, HomographHitUi[]> = { ...homoByLineRef.current };
+    const next: Record<string, DetectedAnnotation[]> = {
+      ...annotationsByLineRef.current,
+    };
     let changed = false;
     for (const line of p.lines) {
       const text = lineDraftsRef.current.get(line.id) ?? line.text;
@@ -1820,32 +2329,44 @@ export function GenerateView({
         }
         continue;
       }
-      // Skip Python spawn when the line text is unchanged.
       if (prevTexts[line.id] === text && next[line.id] !== undefined) {
         continue;
       }
       try {
-        const hits = await invoke<HomographHitUi[]>("detect_homographs_cmd", {
-          text,
-        });
-        next[line.id] = hits;
+        const detected = await invoke<DetectedAnnotation[]>(
+          "detect_annotations_cmd",
+          { text },
+        );
+        // Abort if a newer refresh has started while we were awaiting
+        if (runId !== annotationRunId.current) return;
+        // Re-read latest readings from projectRef (may have changed during await)
+        const freshLine = projectRef.current?.lines.find((l) => l.id === line.id);
+        const currentText = lineDraftsRef.current.get(line.id) ?? freshLine?.text ?? text;
+        // If text changed during detect, skip this result (next refresh will pick it up)
+        if (currentText !== text) {
+          delete nextTexts[line.id];
+          continue;
+        }
+        const applied = validateReadings(text, freshLine?.readings ?? line.readings ?? []);
+        next[line.id] = filterPendingAnnotations(detected, applied);
         changed = true;
-      } catch {
-        next[line.id] = [];
-        changed = true;
+      } catch (e) {
+        console.error("detect_annotations_cmd failed:", e);
+        delete nextTexts[line.id];
       }
     }
-    // Drop removed lines
+    // Final stale check
+    if (runId !== annotationRunId.current) return;
     for (const id of Object.keys(next)) {
       if (!(id in nextTexts)) {
         delete next[id];
         changed = true;
       }
     }
-    homoTextByLineRef.current = nextTexts;
+    annotationTextByLineRef.current = nextTexts;
     if (changed) {
-      homoByLineRef.current = next;
-      setHomoByLine(next);
+      annotationsByLineRef.current = next;
+      setAnnotationsByLine(next);
     }
   }, []);
 
@@ -1867,7 +2388,7 @@ export function GenerateView({
         if (!asr.needsReverify) staleIds.push(line.id);
       } else if (
         asr.needsReverify &&
-        line.text === asr.expectedText
+        lineSynthText(line) === asr.expectedText
       ) {
         restoreIds.push(line.id);
       }
@@ -1888,15 +2409,42 @@ export function GenerateView({
     }
   }, [project, speakers, asrByLine, invalidateAsrMany]);
 
+  // Reset annotation cache when project changes
+  useEffect(() => {
+    annotationTextByLineRef.current = {};
+    annotationsByLineRef.current = {};
+    setAnnotationsByLine({});
+  }, [project?.name]);
+
+  // Debounced annotation refresh — schedules Python detection 700ms after last
+  // trigger (text edit, project load, or dict change). Uses a ref timer so that
+  // draft keystrokes don't force a React re-render.
+  const annotationTimerRef = useRef<number | null>(null);
+  const scheduleAnnotationRefresh = useCallback(() => {
+    if (annotationTimerRef.current != null) {
+      window.clearTimeout(annotationTimerRef.current);
+    }
+    annotationTimerRef.current = window.setTimeout(() => {
+      annotationTimerRef.current = null;
+      void refreshAnnotations();
+    }, 700);
+  }, [refreshAnnotations]);
+
+  // Schedule when project lines change
   useEffect(() => {
     if (!project) return;
-    // Debounce past typical IME / typing pauses so Python detect does not run
-    // (or steal focus) on every keystroke.
-    const t = window.setTimeout(() => {
-      void refreshHomographs();
-    }, 700);
-    return () => window.clearTimeout(t);
-  }, [project?.lines, refreshHomographs]);
+    scheduleAnnotationRefresh();
+  }, [project?.lines, scheduleAnnotationRefresh]);
+
+  useEffect(() => {
+    const onDictsChanged = () => {
+      annotationTextByLineRef.current = {};
+      void reloadDicts();
+      scheduleAnnotationRefresh();
+    };
+    window.addEventListener(DICTS_CHANGED_EVENT, onDictsChanged);
+    return () => window.removeEventListener(DICTS_CHANGED_EVENT, onDictsChanged);
+  }, [reloadDicts, scheduleAnnotationRefresh]);
 
   const openReplacePreview = async () => {
     commitDrafts();
@@ -1922,7 +2470,7 @@ export function GenerateView({
       const selected: Record<string, boolean> = {};
       for (const c of changes) selected[c.lineId] = true;
       setReplacePreview({ changes, total, selected });
-      void reloadAutoReplaceDict();
+      void reloadDicts();
     } catch (e) {
       setStatus(`辞書読込失敗: ${e}`);
     }
@@ -1951,7 +2499,7 @@ export function GenerateView({
     }));
     invalidateAsrMany(picked.map((c) => c.lineId));
     setStatus(`語句置換: ${picked.length} 行 / ${n} 箇所を適用`);
-    void refreshHomographs();
+    void refreshAnnotations();
   };
 
   const runAsrVerifyLine = async (line: ProjectLine) => {
@@ -1968,7 +2516,7 @@ export function GenerateView({
       invalidateAsr(fresh.id);
       return;
     }
-    const text = lineDraftsRef.current.get(fresh.id) ?? fresh.text;
+    const text = lineSynthText(fresh);
     setAsrBusy(true);
     setStatus("文字起こし検証の準備中（Whisper small・CPU／初回のみモデル取得）…");
     try {
@@ -2059,7 +2607,7 @@ export function GenerateView({
       for (let i = 0; i < targets.length; i++) {
         const line = targets[i];
         setStatus(`文字起こし検証中… ${i + 1}/${targets.length}`);
-        const text = lineDraftsRef.current.get(line.id) ?? line.text;
+        const text = lineSynthText(line);
         const res = await invoke<{
           ok: boolean;
           asrText: string;
@@ -2101,7 +2649,66 @@ export function GenerateView({
     }
   };
 
-  const openKatakanaReview = async (line: ProjectLine) => {
+  const applyAnnotationReading = useCallback(
+    async (
+      lineId: string,
+      annotation: DetectedAnnotation,
+      reading: string,
+    ) => {
+      const trimmed = reading.trim();
+      if (!trimmed) return;
+      const entry: AppliedReading = {
+        id: newReadingId(),
+        kind: annotation.kind,
+        start: annotation.start,
+        end: annotation.end,
+        surface: annotation.surface,
+        reading: trimmed,
+      };
+      await persist((prev) => ({
+        ...prev,
+        lines: prev.lines.map((l) =>
+          l.id !== lineId
+            ? l
+            : { ...l, readings: [...(l.readings ?? []), entry] },
+        ),
+      }));
+      if (isNovelCandidate(annotation, trimmed)) {
+        await persistNovelReadingDict([
+          {
+            kind: annotation.kind,
+            surface: annotation.surface,
+            reading: trimmed,
+            candidateReadings: annotation.candidates.map((c) => c.reading),
+          },
+        ]);
+      }
+      invalidateAsr(lineId);
+      // Force re-detection by clearing the text cache for this line
+      delete annotationTextByLineRef.current[lineId];
+      void refreshAnnotations();
+    },
+    [invalidateAsr, persist, refreshAnnotations],
+  );
+
+  const undoReading = useCallback(
+    async (lineId: string, readingId: string) => {
+      await persist((prev) => ({
+        ...prev,
+        lines: prev.lines.map((l) =>
+          l.id !== lineId
+            ? l
+            : { ...l, readings: (l.readings ?? []).filter((r) => r.id !== readingId) },
+        ),
+      }));
+      invalidateAsr(lineId);
+      delete annotationTextByLineRef.current[lineId];
+      void refreshAnnotations();
+    },
+    [invalidateAsr, persist, refreshAnnotations],
+  );
+
+  const openAnnotationReview = async (line: ProjectLine) => {
     commitDrafts();
     const p = projectRef.current;
     const fresh = p?.lines.find((l) => l.id === line.id) ?? line;
@@ -2112,34 +2719,40 @@ export function GenerateView({
       return;
     }
     try {
-      setStatus("カタカナ提案を取得中…");
-      const hits = await invoke<KatakanaHit[]>("suggest_katakana", { text });
-      if (hits.length === 0) {
-        setStatus("英単語が見つかりませんでした");
+      setStatus("読み提案を取得中…");
+      const detected = await invoke<DetectedAnnotation[]>(
+        "detect_annotations_cmd",
+        { text },
+      );
+      const applied = validateReadings(text, fresh.readings ?? []);
+      const pending = filterPendingAnnotations(detected, applied);
+      if (pending.length === 0) {
+        setStatus("読み提案対象が見つかりませんでした");
         return;
       }
       const idx = (p?.lines.findIndex((l) => l.id === fresh.id) ?? 0) + 1;
-      setKatakanaReview({
+      setAnnotationReview({
         items: [
           {
             lineId: fresh.id,
             text,
-            hits,
+            annotations: pending,
+            applied,
             label: `${idx} 行目`,
           },
         ],
       });
       setStatus("");
     } catch (e) {
-      setStatus(String(e));
+      setStatus(`読み提案エラー: ${String(e)}`);
     }
   };
 
-  const openKatakanaReviewBatch = async () => {
+  const openAnnotationReviewBatch = async () => {
     commitDrafts();
     const p = projectRef.current;
     if (!p || p.lines.length === 0) {
-      setStatus("カタカナ提案する行がありません");
+      setStatus("読み提案する行がありません");
       return;
     }
     const candidates = p.lines
@@ -2153,36 +2766,43 @@ export function GenerateView({
       return;
     }
     try {
-      setStatus("カタカナ提案を取得中…");
+      setStatus("読み提案を取得中…");
       const items: {
         lineId: string;
         text: string;
-        hits: KatakanaHit[];
+        annotations: DetectedAnnotation[];
+        applied: AppliedReading[];
         label: string;
       }[] = [];
       for (let i = 0; i < candidates.length; i++) {
         const c = candidates[i];
-        setStatus(`カタカナ提案を取得中… ${i + 1}/${candidates.length}`);
-        const hits = await invoke<KatakanaHit[]>("suggest_katakana", {
-          text: c.text,
-        });
-        if (hits.length > 0) {
+        setStatus(`読み提案を取得中… ${i + 1}/${candidates.length}`);
+        // Always call detection directly to get fresh results for the modal
+        const detected = await invoke<DetectedAnnotation[]>(
+          "detect_annotations_cmd",
+          { text: c.text },
+        );
+        const applied = validateReadings(c.text, c.line.readings ?? []);
+        const pending = filterPendingAnnotations(detected, applied);
+        if (pending.length > 0) {
           items.push({
             lineId: c.line.id,
             text: c.text,
-            hits,
+            annotations: pending,
+            applied,
             label: c.label,
           });
         }
       }
       if (items.length === 0) {
-        setStatus("英単語が見つかりませんでした");
+        // Show what was detected for debugging
+        setStatus("読み提案対象が見つかりませんでした（英単語・同形異音・数字を含む行がありません）");
         return;
       }
-      setKatakanaReview({ items });
+      setAnnotationReview({ items });
       setStatus("");
     } catch (e) {
-      setStatus(String(e));
+      setStatus(`読み提案エラー: ${String(e)}`);
     }
   };
 
@@ -2294,6 +2914,11 @@ export function GenerateView({
         const { [prev.name]: _, ...rest } = map;
         return { ...rest, [trimmed]: v };
       });
+      setSelectedIdsByProject((map) => {
+        const v = map[prev.name];
+        const { [prev.name]: _, ...rest } = map;
+        return v !== undefined ? { ...rest, [trimmed]: v } : rest;
+      });
       setSamplingByProject((map) => {
         const v = map[prev.name];
         const { [prev.name]: _, ...rest } = map;
@@ -2312,6 +2937,7 @@ export function GenerateView({
   const updateLine = async (id: string, patch: Partial<ProjectLine>) => {
     const affectsAsr =
       "text" in patch ||
+      "readings" in patch ||
       "speakerEmbedPath" in patch ||
       "speakerName" in patch ||
       "sampling" in patch ||
@@ -2328,6 +2954,12 @@ export function GenerateView({
         nextLine = { ...withLineSampling(cur, nextSampling), ...rest };
       } else {
         nextLine = { ...cur, ...patch };
+      }
+      if ("text" in patch && patch.text !== undefined) {
+        nextLine = {
+          ...nextLine,
+          readings: validateReadings(patch.text, nextLine.readings ?? []),
+        };
       }
       if (nextLine === cur) return prev;
       // Skip no-op text/field writes (e.g. blur after split already persisted).
@@ -2378,17 +3010,40 @@ export function GenerateView({
     });
   };
 
-  const reorderIds = (ids: string[], from: number, to: number) => {
-    if (from === to || from < 0 || to < 0 || from >= ids.length || to >= ids.length) {
-      return ids;
+  const applyLineSelection = (
+    ids: string[],
+    focusId: string | null,
+    keepAnchor = false,
+  ) => {
+    const name = projectRef.current?.name;
+    if (!name) return;
+    const unique: string[] = [];
+    const seen = new Set<string>();
+    for (const id of ids) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      unique.push(id);
     }
-    const next = [...ids];
-    const [item] = next.splice(from, 1);
-    next.splice(to, 0, item);
-    return next;
+    const prevFocus = selectedIdRef.current;
+    setSelectedByProject((prev) =>
+      prev[name] === focusId ? prev : { ...prev, [name]: focusId },
+    );
+    setSelectedIdsByProject((prev) => {
+      const cur = prev[name];
+      if (cur && sameIdOrder(cur, unique)) return prev;
+      return { ...prev, [name]: unique };
+    });
+    selectedIdRef.current = focusId;
+    selectedIdsRef.current = unique;
+    if (!keepAnchor) selectionAnchorRef.current = focusId;
+    if (focusId && focusId !== prevFocus) {
+      abortSequentialOnLeaveLine(focusId);
+      const line = projectRef.current?.lines.find((l) => l.id === focusId);
+      if (line) syncPanelFromLine(line);
+    }
   };
 
-  const indexFromClientY = (clientY: number) => {
+  const indexContainingClientY = (clientY: number) => {
     const list = lineListRef.current;
     if (!list) return 0;
     const items = Array.from(
@@ -2397,9 +3052,45 @@ export function GenerateView({
     if (items.length === 0) return 0;
     for (let i = 0; i < items.length; i++) {
       const rect = items[i].getBoundingClientRect();
-      if (clientY < rect.top + rect.height / 2) return i;
+      if (clientY < rect.bottom) return i;
     }
     return items.length - 1;
+  };
+
+  const insertDestFromClientY = (
+    clientY: number,
+    movingSet: Set<string>,
+  ): number | null => {
+    const list = lineListRef.current;
+    if (!list) return 0;
+    const items = Array.from(
+      list.querySelectorAll<HTMLElement>(".line-item[data-line-id]"),
+    );
+    if (items.length === 0) return 0;
+    for (const el of items) {
+      const id = el.dataset.lineId ?? "";
+      if (!movingSet.has(id)) continue;
+      const rect = el.getBoundingClientRect();
+      if (clientY >= rect.top && clientY < rect.bottom) return null;
+    }
+    const rest = items.filter(
+      (el) => !movingSet.has(el.dataset.lineId ?? ""),
+    );
+    if (rest.length === 0) return 0;
+    for (let i = 0; i < rest.length; i++) {
+      const rect = rest[i].getBoundingClientRect();
+      if (clientY < rect.top + rect.height / 2) return i;
+    }
+    return rest.length;
+  };
+
+  const scrollLineListIfNeeded = (clientY: number) => {
+    const list = lineListRef.current;
+    if (!list) return;
+    const rect = list.getBoundingClientRect();
+    const margin = 36;
+    if (clientY < rect.top + margin) list.scrollTop -= 18;
+    else if (clientY > rect.bottom - margin) list.scrollTop += 18;
   };
 
   const detachDragListeners = useCallback(() => {
@@ -2413,20 +3104,31 @@ export function GenerateView({
     dragListenersRef.current = null;
   }, []);
 
+  const detachSelectListeners = useCallback(() => {
+    const listeners = selectListenersRef.current;
+    if (!listeners) return;
+    window.removeEventListener("pointermove", listeners.move);
+    window.removeEventListener("pointerup", listeners.up);
+    window.removeEventListener("pointercancel", listeners.up);
+    window.removeEventListener("blur", listeners.up as EventListener);
+    window.removeEventListener("keydown", listeners.key);
+    selectListenersRef.current = null;
+  }, []);
+
   const endDrag = useCallback(
     (commit: boolean) => {
       const drag = dragRef.current;
       if (!drag) {
         detachDragListeners();
-        setDraggingId(null);
+        setDraggingIds([]);
         setDragOrder(null);
         return;
       }
       const order = drag.order;
-      const changed = commit && drag.fromIndex !== drag.currentIndex;
+      const changed = commit && !sameIdOrder(drag.startOrder, order);
       dragRef.current = null;
       detachDragListeners();
-      setDraggingId(null);
+      setDraggingIds([]);
       setDragOrder(null);
       if (changed) {
         void persist((prev) => {
@@ -2445,46 +3147,81 @@ export function GenerateView({
   const endDragRef = useRef(endDrag);
   endDragRef.current = endDrag;
 
-  // Safety: clear stuck drag only on unmount
-  useEffect(() => () => endDragRef.current(false), []);
+  const endSelect = (restore: boolean) => {
+    const sel = selectRef.current;
+    selectRef.current = null;
+    detachSelectListeners();
+    setRangeSelecting(false);
+    if (restore && sel) {
+      const focus = sel.baseIds.includes(sel.startLineId)
+        ? sel.startLineId
+        : (sel.baseIds[0] ?? null);
+      applyLineSelection(sel.baseIds, focus, true);
+    }
+  };
 
-  const onHandlePointerDown = (
-    e: ReactPointerEvent,
+  // Safety: clear stuck drag only on unmount
+  useEffect(
+    () => () => {
+      endDragRef.current(false);
+      detachSelectListeners();
+    },
+    [detachSelectListeners],
+  );
+
+  const beginReorder = (
+    pointerId: number,
     lineId: string,
-    index: number,
+    movingIds: string[],
+    captureEl: HTMLElement | null,
   ) => {
-    if (e.button !== 0) return;
-    e.preventDefault();
-    e.stopPropagation();
     const p = projectRef.current;
     if (!p) return;
 
-    // End any previous stuck session first
     if (dragRef.current) endDrag(false);
+    endSelect(false);
 
-    const ids = p.lines.map((l) => l.id);
-    const pointerId = e.pointerId;
+    const startOrder = p.lines.map((l) => l.id);
+    const movingSet = new Set(
+      movingIds.includes(lineId) && movingIds.length > 0
+        ? movingIds
+        : [lineId],
+    );
+    const moving = startOrder.filter((id) => movingSet.has(id));
+    const packed = packBlockAtGrab(startOrder, moving, lineId);
+    const rest = packed.filter((id) => !movingSet.has(id));
+    const blockStart = packed.indexOf(moving[0] ?? lineId);
+    const dest = rest.length === 0 ? 0 : Math.max(0, blockStart);
+
     dragRef.current = {
       id: lineId,
+      ids: moving,
       pointerId,
-      fromIndex: index,
-      currentIndex: index,
-      order: ids,
+      fromIndex: dest,
+      currentIndex: dest,
+      startOrder,
+      order: packed,
     };
-    setDraggingId(lineId);
-    setDragOrder(ids);
+    setDraggingIds(moving);
+    setDragOrder(packed);
+    applyLineSelection(moving, lineId, moving.length > 1);
 
     const onMove = (ev: PointerEvent) => {
       const drag = dragRef.current;
       if (!drag || drag.pointerId !== ev.pointerId) return;
       ev.preventDefault();
-      const toIndex = indexFromClientY(ev.clientY);
-      if (toIndex === drag.currentIndex) return;
-      const from = drag.order.indexOf(drag.id);
-      if (from < 0) return;
-      const next = reorderIds(drag.order, from, toIndex);
+      scrollLineListIfNeeded(ev.clientY);
+      const movingNow = new Set(drag.ids);
+      const nextDest = insertDestFromClientY(ev.clientY, movingNow);
+      if (nextDest === null || nextDest === drag.currentIndex) return;
+      const restIds = drag.order.filter((id) => !movingNow.has(id));
+      const next = [
+        ...restIds.slice(0, nextDest),
+        ...drag.ids,
+        ...restIds.slice(nextDest),
+      ];
       drag.order = next;
-      drag.currentIndex = next.indexOf(drag.id);
+      drag.currentIndex = nextDest;
       setDragOrder(next);
     };
 
@@ -2506,10 +3243,153 @@ export function GenerateView({
     window.addEventListener("blur", onUp);
     window.addEventListener("keydown", onKey);
 
+    if (captureEl) {
+      try {
+        captureEl.setPointerCapture(pointerId);
+      } catch {
+        /* capture optional — window listeners are the source of truth */
+      }
+    }
+  };
+
+  const onHandlePointerDown = (
+    e: ReactPointerEvent,
+    lineId: string,
+  ) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    lineGestureConsumedRef.current = true;
+    const group = selectedIdsRef.current;
+    const moving =
+      group.includes(lineId) && group.length > 1 ? group : [lineId];
+    beginReorder(
+      e.pointerId,
+      lineId,
+      moving,
+      e.currentTarget as HTMLElement,
+    );
+  };
+
+  const onLinePointerDown = (
+    e: ReactPointerEvent,
+    lineId: string,
+    index: number,
+  ) => {
+    if (e.button !== 0) return;
+    if (isInteractiveLineTarget(e.target)) return;
+    if (dragRef.current) return;
+    e.preventDefault();
+    lineGestureConsumedRef.current = true;
+
+    const order = displayOrderRef.current;
+    const additive = e.ctrlKey || e.metaKey;
+    const range = e.shiftKey;
+    const group = selectedIdsRef.current;
+    const startInGroup = group.includes(lineId) && group.length > 1 && !additive && !range;
+    const anchorId =
+      selectionAnchorRef.current && order.includes(selectionAnchorRef.current)
+        ? selectionAnchorRef.current
+        : lineId;
+    const rangeStartIndex = range
+      ? Math.max(0, order.indexOf(anchorId))
+      : index;
+
+    if (range) {
+      const ids = rangeIdsFromAnchor(order, anchorId, lineId);
+      applyLineSelection(ids, lineId, true);
+    } else if (!additive && !startInGroup) {
+      applyLineSelection([lineId], lineId, false);
+    }
+
+    if (selectRef.current) endSelect(false);
+    selectRef.current = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      startIndex: rangeStartIndex,
+      startLineId: lineId,
+      additive,
+      startInGroup,
+      baseIds: startInGroup || additive ? [...group] : [lineId],
+      mode: range ? "range" : "pending",
+    };
+    if (range) setRangeSelecting(true);
+
+    const onMove = (ev: PointerEvent) => {
+      const sel = selectRef.current;
+      if (!sel || sel.pointerId !== ev.pointerId) return;
+      const dx = ev.clientX - sel.startX;
+      const dy = ev.clientY - sel.startY;
+      if (sel.mode === "pending") {
+        if (dx * dx + dy * dy < SELECT_DRAG_THRESHOLD_PX ** 2) return;
+        if (sel.startInGroup) {
+          const moving = sel.baseIds.includes(sel.startLineId)
+            ? sel.baseIds
+            : [sel.startLineId];
+          selectRef.current = null;
+          detachSelectListeners();
+          setRangeSelecting(false);
+          beginReorder(sel.pointerId, sel.startLineId, moving, null);
+          return;
+        }
+        sel.mode = "range";
+        setRangeSelecting(true);
+      }
+      if (sel.mode !== "range") return;
+      ev.preventDefault();
+      scrollLineListIfNeeded(ev.clientY);
+      const hover = indexContainingClientY(ev.clientY);
+      const orderNow = displayOrderRef.current;
+      const rangeNow = orderNow.slice(
+        Math.min(sel.startIndex, hover),
+        Math.max(sel.startIndex, hover) + 1,
+      );
+      const ids = sel.additive
+        ? [...sel.baseIds, ...rangeNow]
+        : rangeNow;
+      applyLineSelection(ids, sel.startLineId, true);
+    };
+
+    const onUp = (ev: Event) => {
+      const sel = selectRef.current;
+      if (!sel) return;
+      if (ev instanceof PointerEvent && sel.pointerId !== ev.pointerId) return;
+      if (sel.mode === "pending") {
+        if (sel.additive) {
+          const has = sel.baseIds.includes(sel.startLineId);
+          const next = has
+            ? sel.baseIds.filter((id) => id !== sel.startLineId)
+            : [...sel.baseIds, sel.startLineId];
+          const focus =
+            next.includes(sel.startLineId)
+              ? sel.startLineId
+              : (next[next.length - 1] ?? null);
+          applyLineSelection(next, focus, true);
+        } else if (sel.startInGroup) {
+          applyLineSelection([sel.startLineId], sel.startLineId, false);
+        }
+      }
+      selectRef.current = null;
+      detachSelectListeners();
+      setRangeSelecting(false);
+    };
+
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") endSelect(true);
+    };
+
+    selectListenersRef.current = { move: onMove, up: onUp, key: onKey };
+    window.addEventListener("pointermove", onMove, { passive: false });
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+    window.addEventListener("blur", onUp);
+    window.addEventListener("keydown", onKey);
+
     try {
-      (e.currentTarget as HTMLElement).setPointerCapture(pointerId);
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     } catch {
-      /* capture optional — window listeners are the source of truth */
+      /* capture optional */
     }
   };
 
@@ -2549,6 +3429,29 @@ export function GenerateView({
           })),
         }));
         setStatus("全行に話者を適用");
+      },
+    );
+  };
+
+  const applySpeakerFromHere = (source: ProjectLine, displayIndex: number) => {
+    if (!projectRef.current) return;
+    const { speakerEmbedPath, speakerName } = source;
+    const label = speakerName || "未選択";
+    const orderedIds =
+      dragOrder ?? projectRef.current.lines.map((l) => l.id);
+    const targetIds = new Set(orderedIds.slice(displayIndex));
+    askConfirm(
+      `話者「${label}」をこの行以降に適用します。よろしいですか？`,
+      () => {
+        void persist((prev) => ({
+          ...prev,
+          lines: prev.lines.map((l) =>
+            targetIds.has(l.id)
+              ? { ...l, speakerEmbedPath, speakerName }
+              : l,
+          ),
+        }));
+        setStatus("以降の行に話者を適用");
       },
     );
   };
@@ -2682,25 +3585,58 @@ export function GenerateView({
     );
   };
 
-  const synthesizeLine = async (
+  const synthesizeVariant = async (
     line: ProjectLine,
-    opts: { force?: boolean } = {},
-  ): Promise<{ wav: string; line: ProjectLine } | null> => {
+    variantId: string,
+    opts: {
+      force?: boolean;
+      useLegacyPath?: boolean;
+      randomSeed?: boolean;
+      persistToLine?: boolean;
+      manageBusy?: boolean;
+    } = {},
+  ): Promise<{
+    wav: string;
+    line: ProjectLine;
+    variantId: string;
+    seed: number;
+  } | null> => {
     const force = opts.force === true;
-    const inflight = synthInflight.current.get(line.id);
+    const useLegacyPath = opts.useLegacyPath === true;
+    const randomSeed = opts.randomSeed === true;
+    const persistToLine = opts.persistToLine !== false;
+    const manageBusy = opts.manageBusy !== false;
+    const inflightKey = `${line.id}:${variantId}`;
+    const inflight = synthInflight.current.get(inflightKey);
     if (inflight) return inflight;
 
-    let settle!: (v: { wav: string; line: ProjectLine } | null) => void;
-    const gate = new Promise<{ wav: string; line: ProjectLine } | null>(
-      (r) => {
-        settle = r;
-      },
-    );
-    // Register BEFORE any await so concurrent callers join this run
-    synthInflight.current.set(line.id, gate);
+    let settle!: (
+      v: {
+        wav: string;
+        line: ProjectLine;
+        variantId: string;
+        seed: number;
+      } | null,
+    ) => void;
+    const gate = new Promise<{
+      wav: string;
+      line: ProjectLine;
+      variantId: string;
+      seed: number;
+    } | null>((r) => {
+      settle = r;
+    });
+    synthInflight.current.set(inflightKey, gate);
 
-    const finish = (v: { wav: string; line: ProjectLine } | null) => {
-      synthInflight.current.delete(line.id);
+    const finish = (
+      v: {
+        wav: string;
+        line: ProjectLine;
+        variantId: string;
+        seed: number;
+      } | null,
+    ) => {
+      synthInflight.current.delete(inflightKey);
       settle(v);
       return v;
     };
@@ -2728,10 +3664,11 @@ export function GenerateView({
         fresh,
         speakersRef.current,
       );
+      const synthText = lineSynthText(fresh);
       const s =
         fresh.id === selectedIdRef.current ? panelSampling : fresh.sampling;
       const contentKey = lineContentKey(
-        fresh.text,
+        synthText,
         speakerKey,
         captionUsed,
         cfgCaptionUsed,
@@ -2740,66 +3677,67 @@ export function GenerateView({
       const outPath = await invoke<string>("line_cache_wav_path", {
         projectName: p.name,
         lineId: fresh.id,
+        variantId: useLegacyPath ? null : variantId,
       });
 
-      // Skip worker if this exact content is already ready (unless force)
-      if (!force) {
+      const existingVariants = normalizeLineVariants(fresh);
+      const existingVariant = existingVariants.find((v) => v.id === variantId);
+
+      if (!force && !randomSeed) {
         const mem = readyCacheRef.current.get(fresh.id);
-        if (mem && mem.key === contentKey) {
-          const ok = await invoke<boolean>("file_exists", {
-            path: mem.wavPath,
-          });
+        if (
+          mem &&
+          mem.key === contentKey &&
+          mem.wavPath === outPath &&
+          existingVariant?.wavPath === outPath
+        ) {
+          const ok = await invoke<boolean>("file_exists", { path: outPath });
           if (ok) {
-            const readyLine: ProjectLine = {
+            const readyLine = syncLineWavPath({
               ...fresh,
-              wavPath: mem.wavPath,
-              generatedText: fresh.text,
+              variants: existingVariants,
+              generatedText: synthText,
               generatedSpeakerEmbedPath: speakerKey,
               generatedCaption: captionUsed,
               generatedCfgScaleCaption: cfgCaptionUsed,
-              generatedSampling: { ...s },
-            };
-            await persist((prev) => ({
-              ...prev,
-              lines: prev.lines.map((l) =>
-                l.id === fresh.id
-                  ? {
-                      ...l,
-                      wavPath: mem.wavPath,
-                      generatedText: fresh.text,
-                      generatedSpeakerEmbedPath: speakerKey,
-                      generatedCaption: captionUsed,
-                      generatedCfgScaleCaption: cfgCaptionUsed,
-                      generatedSampling: { ...s },
-                    }
-                  : l,
-              ),
-            }));
-            return finish({ wav: mem.wavPath, line: readyLine });
+              generatedSampling: generatedSamplingSnapshot(s),
+            });
+            return finish({
+              wav: outPath,
+              line: readyLine,
+              variantId,
+              seed: existingVariant?.seed ?? 0,
+            });
           }
         }
         if (
           !isDirty(fresh, speakersRef.current) &&
-          wavPathMatchesLine(fresh) &&
-          fresh.wavPath
+          existingVariant &&
+          wavPathMatchesLine(fresh, existingVariant.wavPath)
         ) {
           const ok = await invoke<boolean>("file_exists", {
-            path: fresh.wavPath,
+            path: existingVariant.wavPath,
           });
           if (ok) {
             readyCacheRef.current.set(fresh.id, {
               key: contentKey,
-              wavPath: fresh.wavPath,
+              wavPath: existingVariant.wavPath,
             });
-            return finish({ wav: fresh.wavPath, line: fresh });
+            return finish({
+              wav: existingVariant.wavPath,
+              line: fresh,
+              variantId,
+              seed: existingVariant.seed,
+            });
           }
         }
       }
 
-      // Paint .generating before blocking IPC (otherwise busy on/off can collapse into one frame)
       flushSync(() => {
-        setBusy(true);
-        setBusyLineId(fresh.id);
+        if (manageBusy) {
+          setBusy(true);
+          setBusyLineId(fresh.id);
+        }
         setStatus(`生成中…「${fresh.text.slice(0, 20)}」`);
       });
 
@@ -2807,11 +3745,11 @@ export function GenerateView({
         (x) => x.embedPath === fresh.speakerEmbedPath,
       );
       const synthArgs: Record<string, unknown> = {
-        text: fresh.text,
+        text: synthText,
         outputWav: outPath,
         numSteps: s.numSteps,
-        numCandidates: s.numCandidates,
-        seed: s.seed,
+        numCandidates: 1,
+        seed: randomSeed ? null : s.seed,
         seconds: s.seconds,
         durationScale: s.durationScale,
         tScheduleMode: s.tScheduleMode,
@@ -2821,11 +3759,16 @@ export function GenerateView({
         cfgScaleSpeaker: s.cfgScaleSpeaker,
       };
       if (sp?.kind === "ref") {
-        if (!sp.refWav) {
+        const wavs = sp.refWavs?.filter(Boolean);
+        if (wavs && wavs.length > 0) {
+          synthArgs.refWavs = wavs;
+          synthArgs.refWav = wavs[0];
+        } else if (sp.refWav) {
+          synthArgs.refWav = sp.refWav;
+        } else {
           setStatus("参照音源が未設定の話者です");
           return finish(null);
         }
-        synthArgs.refWav = sp.refWav;
       } else if (sp?.kind === "caption") {
         if (!sp.caption?.trim()) {
           setStatus("キャプションが未設定の話者です");
@@ -2833,21 +3776,28 @@ export function GenerateView({
         }
         synthArgs.caption = sp.caption;
         synthArgs.noRef = true;
-        synthArgs.cfgScaleCaption = 3.0;
+        synthArgs.cfgScaleCaption = cfgCaptionUsed;
       } else {
+        // trained / blend → ref_embed
         synthArgs.refEmbed = fresh.speakerEmbedPath;
       }
-      // v4: style caption alongside 参照音源 only
+      // v4: 行キャプションを話者キャプションに上書き・追記（ref / trained / blend 共通）
       if (
         isIrodoriV4(settings) &&
-        sp?.kind === "ref" &&
+        sp?.kind !== "caption" &&
         captionUsed.trim()
       ) {
         synthArgs.caption = captionUsed.trim();
         synthArgs.cfgScaleCaption = cfgCaptionUsed;
       }
 
-      await invoke("synthesize_line", { args: synthArgs });
+      // DEV: log synthArgs to console for debugging
+      console.log("[synthesize_line args]", JSON.stringify(synthArgs, null, 2));
+      const resp = await invoke<{ used_seed?: number }>("synthesize_line", {
+        args: synthArgs,
+      });
+      const usedSeed =
+        typeof resp.used_seed === "number" ? resp.used_seed : 0;
 
       const exists = await invoke<boolean>("file_exists", { path: outPath });
       if (!exists) {
@@ -2855,8 +3805,9 @@ export function GenerateView({
         return finish(null);
       }
 
-      const textUsed = fresh.text;
+      const textUsed = synthText;
       const speakerUsed = speakerKey;
+      const genSampling = generatedSamplingSnapshot(s);
       readyCacheRef.current.set(fresh.id, {
         key: lineContentKey(
           textUsed,
@@ -2867,57 +3818,568 @@ export function GenerateView({
         ),
         wavPath: outPath,
       });
-      lineDraftsRef.current.set(fresh.id, textUsed);
+      lineDraftsRef.current.set(fresh.id, fresh.text);
 
-      const updated: ProjectLine = {
+      const nextVariant: LineVariant = {
+        id: variantId,
+        seed: usedSeed,
+        wavPath: outPath,
+      };
+      let updated = syncLineWavPath({
         ...(projectRef.current?.lines.find((l) => l.id === fresh.id) ??
           fresh),
-        text: textUsed,
-        wavPath: outPath,
+        text: fresh.text,
         sampling: { ...s },
         generatedText: textUsed,
         generatedSpeakerEmbedPath: speakerUsed,
         generatedCaption: captionUsed,
         generatedCfgScaleCaption: cfgCaptionUsed,
-        generatedSampling: { ...s },
-      };
-      await persist((prev) => ({
-        ...prev,
-        lines: prev.lines.map((l) =>
-          l.id === fresh.id
-            ? {
-                ...l,
-                text: textUsed,
-                wavPath: outPath,
-                sampling: { ...s },
-                generatedText: textUsed,
-                generatedSpeakerEmbedPath: speakerUsed,
-                generatedCaption: captionUsed,
-                generatedCfgScaleCaption: cfgCaptionUsed,
-                generatedSampling: { ...s },
-              }
-            : l,
-        ),
-      }));
-      // New WAV → previous ASR no longer applies (don't keep for restore)
-      clearAsr(fresh.id);
+        generatedSampling: genSampling,
+      });
+      if (persistToLine) {
+        let nextVariants: LineVariant[];
+        const idx = existingVariants.findIndex((v) => v.id === variantId);
+        if (idx >= 0) {
+          nextVariants = existingVariants.map((v, i) =>
+            i === idx ? nextVariant : v,
+          );
+        } else if (existingVariants.length === 0) {
+          nextVariants = [nextVariant];
+        } else {
+          nextVariants = [...existingVariants, nextVariant];
+        }
+        updated = syncLineWavPath({ ...updated, variants: nextVariants });
+        await persist((prev) => ({
+          ...prev,
+          lines: prev.lines.map((l) => (l.id === fresh.id ? updated : l)),
+        }));
+        clearAsr(fresh.id);
+      }
       setStatus("生成完了（キャッシュ）");
-      return finish({ wav: outPath, line: updated });
+      return finish({
+        wav: outPath,
+        line: updated,
+        variantId,
+        seed: usedSeed,
+      });
     } catch (e) {
       setStatus(String(e));
       return finish(null);
+    } finally {
+      if (manageBusy) {
+        setBusy(false);
+        setBusyLineId(null);
+      }
+    }
+  };
+
+  const persistVariantsForLine = async (
+    lineId: string,
+    variants: LineVariant[],
+    dropped: LineVariant[] = [],
+  ) => {
+    for (const v of dropped) {
+      try {
+        await invoke("delete_file", { path: v.wavPath });
+      } catch {
+        /* ignore missing cache files */
+      }
+    }
+    await persist((prev) => ({
+      ...prev,
+      lines: prev.lines.map((l) => {
+        if (l.id !== lineId) return l;
+        return syncLineWavPath({ ...l, variants });
+      }),
+    }));
+  };
+
+  const appendVariants = async (
+    line: ProjectLine,
+    added: LineVariant[],
+  ): Promise<ProjectLine | null> => {
+    const fresh =
+      projectRef.current?.lines.find((l) => l.id === line.id) ?? line;
+    const current = normalizeLineVariants(fresh);
+    const merged = [...current, ...added];
+    const dropped =
+      merged.length > MAX_LINE_VARIANTS
+        ? merged.slice(0, merged.length - MAX_LINE_VARIANTS)
+        : [];
+    const kept =
+      merged.length > MAX_LINE_VARIANTS
+        ? merged.slice(-MAX_LINE_VARIANTS)
+        : merged;
+    const speakerKey = speakerConditionKey(
+      speakersRef.current,
+      fresh.speakerEmbedPath,
+    );
+    const captionUsed = effectiveLineCaption(fresh, speakersRef.current);
+    const cfgCaptionUsed = effectiveCfgScaleCaption(
+      fresh,
+      speakersRef.current,
+    );
+    const s =
+      fresh.id === selectedIdRef.current ? panelSampling : fresh.sampling;
+    for (const v of dropped) {
+      try {
+        await invoke("delete_file", { path: v.wavPath });
+      } catch {
+        /* ignore missing cache files */
+      }
+    }
+    await persist((prev) => ({
+      ...prev,
+      lines: prev.lines.map((l) => {
+        if (l.id !== fresh.id) return l;
+        return syncLineWavPath({
+          ...l,
+          variants: kept,
+          generatedText: lineSynthText(l),
+          generatedSpeakerEmbedPath: speakerKey,
+          generatedCaption: captionUsed,
+          generatedCfgScaleCaption: cfgCaptionUsed,
+          generatedSampling: generatedSamplingSnapshot(s),
+        });
+      }),
+    }));
+    await persistChain.current;
+    return (
+      projectRef.current?.lines.find((l) => l.id === fresh.id) ??
+      syncLineWavPath({ ...fresh, variants: kept })
+    );
+  };
+
+  const synthesizeLine = async (
+    line: ProjectLine,
+    opts: { force?: boolean } = {},
+  ): Promise<{ wav: string; line: ProjectLine; variantId: string } | null> => {
+    const fresh =
+      projectRef.current?.lines.find((l) => l.id === line.id) ?? line;
+    const variants = normalizeLineVariants(fresh);
+    const variantId = variants[0]?.id ?? fresh.id;
+    const useLegacyPath = variants.length === 0;
+    const result = await synthesizeVariant(line, variantId, {
+      force: opts.force,
+      useLegacyPath,
+    });
+    if (!result) return null;
+    return {
+      wav: result.wav,
+      line: result.line,
+      variantId: result.variantId,
+    };
+  };
+
+  const samplingForLine = (line: ProjectLine): SamplingParams =>
+    line.id === selectedIdRef.current ? panelSampling : line.sampling;
+
+  const candidateCountForLine = (line: ProjectLine): number =>
+    clampCandidateCount(samplingForLine(line).numCandidates);
+
+  const generateModeForLine = (line: ProjectLine) =>
+    multiGenerateModeOf(samplingForLine(line));
+
+  const synthesizeCandidateBatch = async (
+    line: ProjectLine,
+    mode: "overwrite" | "append",
+  ): Promise<{
+    line: ProjectLine;
+    newVariants: LineVariant[];
+  } | null> => {
+    commitDrafts();
+    const p = projectRef.current;
+    if (!p) return null;
+    const fresh = p.lines.find((l) => l.id === line.id) ?? line;
+    if (!fresh.speakerEmbedPath) {
+      setStatus("話者を選択してください");
+      return null;
+    }
+    if (!fresh.text.trim()) {
+      setStatus("テキストが空です");
+      return null;
+    }
+
+    const n = candidateCountForLine(fresh);
+    const s = samplingForLine(fresh);
+    const speakerKey = speakerConditionKey(
+      speakersRef.current,
+      fresh.speakerEmbedPath,
+    );
+    const captionUsed = effectiveLineCaption(fresh, speakersRef.current);
+    const cfgCaptionUsed = effectiveCfgScaleCaption(
+      fresh,
+      speakersRef.current,
+    );
+    const synthText = lineSynthText(fresh);
+
+    const ids = Array.from({ length: n }, () => newVariantId());
+    const paths: string[] = [];
+    for (const id of ids) {
+      paths.push(
+        await invoke<string>("line_cache_wav_path", {
+          projectName: p.name,
+          lineId: fresh.id,
+          variantId: id,
+        }),
+      );
+    }
+
+    const sp = speakersRef.current.find(
+      (x) => x.embedPath === fresh.speakerEmbedPath,
+    );
+    const synthArgs: Record<string, unknown> = {
+      text: synthText,
+      outputWav: paths[0],
+      outputWavs: paths,
+      numSteps: s.numSteps,
+      numCandidates: n,
+      seed: null,
+      seconds: s.seconds,
+      durationScale: s.durationScale,
+      tScheduleMode: s.tScheduleMode,
+      swayCoeff: s.swayCoeff,
+      cfgGuidanceMode: s.cfgGuidanceMode,
+      cfgScaleText: s.cfgScaleText,
+      cfgScaleSpeaker: s.cfgScaleSpeaker,
+    };
+    if (sp?.kind === "ref") {
+      const wavs = sp.refWavs?.filter(Boolean);
+      if (wavs && wavs.length > 0) {
+        synthArgs.refWavs = wavs;
+        synthArgs.refWav = wavs[0];
+      } else if (sp.refWav) {
+        synthArgs.refWav = sp.refWav;
+      } else {
+        setStatus("参照音源が未設定の話者です");
+        return null;
+      }
+    } else if (sp?.kind === "caption") {
+      if (!sp.caption?.trim()) {
+        setStatus("キャプションが未設定の話者です");
+        return null;
+      }
+      synthArgs.caption = sp.caption;
+      synthArgs.noRef = true;
+      synthArgs.cfgScaleCaption = cfgCaptionUsed;
+    } else {
+      synthArgs.refEmbed = fresh.speakerEmbedPath;
+    }
+    if (
+      isIrodoriV4(settings) &&
+      sp?.kind !== "caption" &&
+      captionUsed.trim()
+    ) {
+      synthArgs.caption = captionUsed.trim();
+      synthArgs.cfgScaleCaption = cfgCaptionUsed;
+    }
+
+    flushSync(() => {
+      setBusy(true);
+      setBusyLineId(fresh.id);
+      setStatus(`生成中… ${n}件「${fresh.text.slice(0, 20)}」`);
+    });
+
+    try {
+      const resp = await invoke<{
+        used_seed?: number;
+        output_wavs?: string[];
+      }>("synthesize_line", { args: synthArgs });
+      const usedSeed =
+        typeof resp.used_seed === "number" ? resp.used_seed : 0;
+      const saved =
+        Array.isArray(resp.output_wavs) && resp.output_wavs.length > 0
+          ? resp.output_wavs
+          : paths;
+
+      const newVariants: LineVariant[] = [];
+      for (let i = 0; i < n; i++) {
+        const wavPath = saved[i] ?? paths[i];
+        const exists = await invoke<boolean>("file_exists", { path: wavPath });
+        if (!exists) {
+          if (newVariants.length === 0) {
+            setStatus(`生成失敗: 出力ファイルがありません (${wavPath})`);
+            return null;
+          }
+          break;
+        }
+        newVariants.push({ id: ids[i], seed: usedSeed, wavPath });
+      }
+      if (newVariants.length === 0) return null;
+
+      readyCacheRef.current.set(fresh.id, {
+        key: lineContentKey(
+          synthText,
+          speakerKey,
+          captionUsed,
+          cfgCaptionUsed,
+          s,
+        ),
+        wavPath: newVariants[0].wavPath,
+      });
+      lineDraftsRef.current.set(fresh.id, fresh.text);
+
+      let updatedLine: ProjectLine | null;
+      if (mode === "overwrite") {
+        const existing = normalizeLineVariants(fresh);
+        const dropped = existing.filter(
+          (v) => !newVariants.some((nv) => nv.wavPath === v.wavPath),
+        );
+        for (const v of dropped) {
+          try {
+            await invoke("delete_file", { path: v.wavPath });
+          } catch {
+            /* ignore missing cache files */
+          }
+        }
+        await persist((prev) => ({
+          ...prev,
+          lines: prev.lines.map((l) => {
+            if (l.id !== fresh.id) return l;
+            return syncLineWavPath({
+              ...l,
+              sampling: { ...s },
+              variants: newVariants,
+              generatedText: synthText,
+              generatedSpeakerEmbedPath: speakerKey,
+              generatedCaption: captionUsed,
+              generatedCfgScaleCaption: cfgCaptionUsed,
+              generatedSampling: generatedSamplingSnapshot(s),
+            });
+          }),
+        }));
+        await persistChain.current;
+        updatedLine =
+          projectRef.current?.lines.find((l) => l.id === fresh.id) ??
+          syncLineWavPath({ ...fresh, variants: newVariants });
+      } else {
+        updatedLine = await appendVariants(fresh, newVariants);
+      }
+
+      if (!updatedLine) return null;
+      clearAsr(fresh.id);
+      setStatus(
+        mode === "overwrite"
+          ? `上書き生成完了: ${newVariants.length} 件`
+          : `追加生成完了: ${newVariants.length} 件`,
+      );
+      return { line: updatedLine, newVariants };
+    } catch (e) {
+      setStatus(String(e));
+      return null;
     } finally {
       setBusy(false);
       setBusyLineId(null);
     }
   };
 
+  const runIndividualSynth = async (
+    line: ProjectLine,
+    mode: "overwrite" | "append",
+    opts?: {
+      onVariant?: (item: { line: ProjectLine; variant: LineVariant }) => void;
+      abortGen?: number;
+    },
+  ): Promise<{ line: ProjectLine; newVariants: LineVariant[] } | null> => {
+    commitDrafts();
+    const p = projectRef.current;
+    if (!p) return null;
+    let fresh = p.lines.find((l) => l.id === line.id) ?? line;
+    if (!fresh.speakerEmbedPath) {
+      setStatus("話者を選択してください");
+      return null;
+    }
+    if (!fresh.text.trim()) {
+      setStatus("テキストが空です");
+      return null;
+    }
+
+    const n = candidateCountForLine(fresh);
+    flushSync(() => {
+      setBusy(true);
+      setBusyLineId(fresh.id);
+      setStatus(`生成中… 1/${n}「${fresh.text.slice(0, 20)}」`);
+    });
+
+    const newVariants: LineVariant[] = [];
+    try {
+      if (mode === "overwrite") {
+        const existing = normalizeLineVariants(fresh);
+        if (existing.length > 0) {
+          await persistVariantsForLine(fresh.id, [], existing);
+          await persistChain.current;
+        }
+      }
+      fresh =
+        projectRef.current?.lines.find((l) => l.id === fresh.id) ?? fresh;
+
+      for (let i = 0; i < n; i++) {
+        if (
+          opts?.abortGen != null &&
+          opts.abortGen !== batchPlayGenRef.current
+        ) {
+          break;
+        }
+        setStatus(`生成中… ${i + 1}/${n}「${fresh.text.slice(0, 20)}」`);
+        const variantId = newVariantId();
+        const result = await synthesizeVariant(fresh, variantId, {
+          force: true,
+          randomSeed: true,
+          persistToLine: false,
+          manageBusy: false,
+        });
+        if (!result) {
+          if (newVariants.length === 0) return null;
+          break;
+        }
+        const variant: LineVariant = {
+          id: variantId,
+          seed: result.seed,
+          wavPath: result.wav,
+        };
+        const updated = await appendVariants(fresh, [variant]);
+        if (!updated) {
+          if (newVariants.length === 0) return null;
+          break;
+        }
+        newVariants.push(variant);
+        fresh = updated;
+        opts?.onVariant?.({ line: updated, variant });
+      }
+      if (newVariants.length === 0) return null;
+      setStatus(
+        mode === "overwrite"
+          ? `上書き生成完了: ${newVariants.length} 件`
+          : `追加生成完了: ${newVariants.length} 件`,
+      );
+      return { line: fresh, newVariants };
+    } catch (e) {
+      setStatus(String(e));
+      return null;
+    } finally {
+      setBusy(false);
+      setBusyLineId(null);
+    }
+  };
+
+  const synthesizeLineAudio = async (
+    line: ProjectLine,
+    mode: "overwrite" | "append",
+    opts?: {
+      onVariant?: (item: { line: ProjectLine; variant: LineVariant }) => void;
+      abortGen?: number;
+    },
+  ): Promise<{ line: ProjectLine; newVariants: LineVariant[] } | null> => {
+    if (generateModeForLine(line) === "individual") {
+      return runIndividualSynth(line, mode, opts);
+    }
+    const result = await synthesizeCandidateBatch(line, mode);
+    if (result && opts?.onVariant) {
+      for (const variant of result.newVariants) {
+        opts.onVariant({ line: result.line, variant });
+      }
+    }
+    return result;
+  };
+
+  const runLineGenerate = async (
+    line: ProjectLine,
+    mode: "overwrite" | "append",
+  ): Promise<{ line: ProjectLine; newVariants: LineVariant[] } | null> => {
+    const fresh =
+      projectRef.current?.lines.find((l) => l.id === line.id) ?? line;
+    const n = candidateCountForLine(fresh);
+    cancelBatchPlayback({ stopAudio: true });
+    onSelectedId(fresh.id);
+    syncPanelFromLine(fresh);
+
+    const gen = batchPlayGenRef.current;
+    playGenRef.current += 1;
+    const queue = createPipelinePlaybackQueue();
+    const playbackPromise = runPipelinePlaybackLoop(gen, queue, {
+      statusPrefix:
+        mode === "overwrite" ? "上書き結果を再生中…" : "追加結果を再生中…",
+      total: n,
+    });
+
+    const result = await synthesizeLineAudio(fresh, mode, {
+      abortGen: gen,
+      onVariant: ({ line: readyLine, variant }) => {
+        if (gen !== batchPlayGenRef.current) return;
+        queue.push({
+          line: readyLine,
+          wavPath: variant.wavPath,
+          variantId: variant.id,
+        });
+      },
+    });
+    queue.close();
+    await playbackPromise;
+    if (gen !== batchPlayGenRef.current) return null;
+    return result;
+  };
+
+  const requestAppendGenerate = (line: ProjectLine) => {
+    const fresh =
+      projectRef.current?.lines.find((l) => l.id === line.id) ?? line;
+    const current = normalizeLineVariants(fresh);
+    const n = candidateCountForLine(fresh);
+    const overflow = current.length + n - MAX_LINE_VARIANTS;
+    const run = () => {
+      void (async () => {
+        const result = await runLineGenerate(line, "append");
+        if (!result) return;
+        await persistChain.current;
+      })();
+    };
+    if (overflow > 0) {
+      askConfirm(
+        `追加すると古い音声から ${overflow} 件削除されます。続行しますか？`,
+        run,
+      );
+      return;
+    }
+    run();
+  };
+
+  const requestOverwriteGenerate = (line: ProjectLine) => {
+    const fresh =
+      projectRef.current?.lines.find((l) => l.id === line.id) ?? line;
+    const current = normalizeLineVariants(fresh);
+    const n = candidateCountForLine(fresh);
+    const run = () => {
+      void (async () => {
+        const result = await runLineGenerate(line, "overwrite");
+        if (!result) return;
+        await persistChain.current;
+      })();
+    };
+    if (current.length > 0) {
+      askConfirm(
+        `既存の ${current.length} 件を破棄し、${n} 件で上書きします。続行しますか？`,
+        run,
+      );
+      return;
+    }
+    run();
+  };
+
   const resolveWavForPlay = async (
     line: ProjectLine,
-  ): Promise<{ wav: string; line: ProjectLine } | null> => {
+    variantId?: string | null,
+  ): Promise<{ wav: string; line: ProjectLine; variantId: string } | null> => {
     commitDrafts();
     const fresh =
       projectRef.current?.lines.find((l) => l.id === line.id) ?? line;
+    const variants = normalizeLineVariants(fresh);
+    const target =
+      variants.find((v) => v.id === variantId) ?? primaryVariant(fresh);
+    if (target && !isDirty(fresh, speakersRef.current)) {
+      const ok = await invoke<boolean>("file_exists", { path: target.wavPath });
+      if (ok && wavPathMatchesLine(fresh, target.wavPath)) {
+        return { wav: target.wavPath, line: fresh, variantId: target.id };
+      }
+    }
 
     const speakerKey = speakerConditionKey(
       speakersRef.current,
@@ -2929,53 +4391,62 @@ export function GenerateView({
       speakersRef.current,
     );
     const contentKey = lineContentKey(
-      fresh.text,
+      lineSynthText(fresh),
       speakerKey,
       captionUsed,
       cfgCaptionUsed,
       fresh.sampling,
     );
     const mem = readyCacheRef.current.get(fresh.id);
-    if (mem && mem.key === contentKey) {
+    const primary = primaryVariant(fresh);
+    if (
+      mem &&
+      mem.key === contentKey &&
+      primary &&
+      (!variantId || variantId === primary.id)
+    ) {
       const ok = await invoke<boolean>("file_exists", { path: mem.wavPath });
       if (ok) {
         return {
           wav: mem.wavPath,
-          line: {
-            ...fresh,
-            wavPath: mem.wavPath,
-            generatedText: fresh.text,
-            generatedSpeakerEmbedPath: speakerKey,
-            generatedCaption: captionUsed,
-            generatedCfgScaleCaption: cfgCaptionUsed,
-            generatedSampling: { ...fresh.sampling },
-          },
+          line: fresh,
+          variantId: primary.id,
         };
       }
     }
 
     if (
       !isDirty(fresh, speakersRef.current) &&
-      wavPathMatchesLine(fresh) &&
-      fresh.wavPath
+      primary &&
+      wavPathMatchesLine(fresh, primary.wavPath)
     ) {
       const ok = await invoke<boolean>("file_exists", {
-        path: fresh.wavPath,
+        path: primary.wavPath,
       });
       if (ok) {
         readyCacheRef.current.set(fresh.id, {
           key: contentKey,
-          wavPath: fresh.wavPath,
+          wavPath: primary.wavPath,
         });
-        return { wav: fresh.wavPath, line: fresh };
+        return { wav: primary.wavPath, line: fresh, variantId: primary.id };
       }
     }
 
-    // Not ready → synthesize once (joins inflight if already running)
-    return synthesizeLine(fresh, { force: false });
+    const result = await synthesizeLine(fresh, { force: false });
+    if (!result) return null;
+    return {
+      wav: result.wav,
+      line: result.line,
+      variantId: result.variantId,
+    };
   };
 
-  const startPlayback = async (line: ProjectLine, wavPath: string) => {
+  const startPlayback = async (
+    line: ProjectLine,
+    wavPath: string,
+    variantId: string | null,
+    opts?: { autoplay?: boolean },
+  ) => {
     const player = playerRef.current;
     if (!player) return;
     const gen = ++playGenRef.current;
@@ -2995,22 +4466,252 @@ export function GenerateView({
         path: playPath,
       });
       if (gen !== playGenRef.current) return;
-      await player.playFromBytes(line.id, new Uint8Array(bytes), line.volume);
+      await player.loadFromBytes(
+        line.id,
+        variantId,
+        new Uint8Array(bytes),
+        line.volume,
+      );
+      if (gen !== playGenRef.current) return;
+      const pending = pendingSeekRef.current;
+      if (
+        pending &&
+        pending.lineId === line.id &&
+        pending.variantId === variantId
+      ) {
+        player.seek(pending.time);
+        pendingSeekRef.current = null;
+      }
+      setSeekDraft((d) =>
+        d && d.lineId === line.id && d.variantId === (variantId ?? d.variantId)
+          ? null
+          : d,
+      );
+      if (opts?.autoplay !== false) {
+        player.resume();
+      }
       onSelectedId(line.id);
     } catch (e) {
       if (gen === playGenRef.current) setStatus(`再生失敗: ${e}`);
     }
   };
 
-  /** Single-line play/pause (same behavior for toolbar legacy / line button). */
+  /** Play queued items in order while generation may still be running. */
+  const runPipelinePlaybackLoop = async (
+    gen: number,
+    queue: ReturnType<typeof createPipelinePlaybackQueue>,
+    opts: { statusPrefix: string; total?: number },
+  ) => {
+    const player = playerRef.current;
+    if (!player) return;
+    player.cancelSilence();
+    player.releaseEndedWaiters();
+    batchPlayActiveRef.current = true;
+    setBatchPlayActive(true);
+    const silenceMs = Math.max(0, Number(settings.chunkSilenceMs) || 0);
+    let playedAny = false;
+    let played = 0;
+    try {
+      while (true) {
+        if (gen !== batchPlayGenRef.current) return;
+        const item = await queue.next();
+        if (!item) break;
+        if (playedAny && silenceMs > 0) {
+          await player.waitSilenceMs(silenceMs);
+          if (gen !== batchPlayGenRef.current) return;
+        }
+        played += 1;
+        const totalLabel =
+          opts.total != null ? ` ${played}/${opts.total}` : ` ${played}`;
+        setStatus(`${opts.statusPrefix}${totalLabel}`);
+        const latest =
+          projectRef.current?.lines.find((l) => l.id === item.line.id) ??
+          item.line;
+        await startPlayback(latest, item.wavPath, item.variantId);
+        if (gen !== batchPlayGenRef.current) return;
+        await player.waitUntilInactive();
+        if (gen !== batchPlayGenRef.current) return;
+        playedAny = true;
+      }
+    } finally {
+      if (gen === batchPlayGenRef.current) {
+        batchPlayActiveRef.current = false;
+        setBatchPlayActive(false);
+      }
+    }
+  };
+
+  const lineSynthBusy = (lineId: string) => {
+    for (const key of synthInflight.current.keys()) {
+      if (key.startsWith(`${lineId}:`)) return true;
+    }
+    return false;
+  };
+
+  const playVariant = async (lineId: string, variantId: string) => {
+    const player = playerRef.current;
+    if (!player) return;
+    if (busy || lineSynthBusy(lineId)) return;
+    commitDrafts();
+    const p = projectRef.current;
+    if (!p) return;
+    const line = p.lines.find((l) => l.id === lineId);
+    if (!line) return;
+    onSelectedId(line.id);
+    syncPanelFromLine(line);
+
+    if (
+      player.isActiveVariant(line.id, variantId) &&
+      player.hasBuffer
+    ) {
+      player.togglePause();
+      return;
+    }
+
+    cancelBatchPlayback();
+
+    const variant = normalizeLineVariants(line).find((v) => v.id === variantId);
+    if (!variant) return;
+
+    if (
+      !isDirty(line, speakers) &&
+      (await invoke<boolean>("file_exists", { path: variant.wavPath }))
+    ) {
+      await startPlayback(line, variant.wavPath, variantId);
+      return;
+    }
+
+    const resolved = await resolveWavForPlay(line, variantId);
+    if (!resolved) return;
+    await startPlayback(resolved.line, resolved.wav, resolved.variantId);
+  };
+
+  const pruneVariantKeep = (lineId: string, keepIds: string[]) => {
+    setVariantKeepByLine((prev) => {
+      const cur = prev[lineId];
+      if (!cur) return prev;
+      if (keepIds.length === 0) {
+        const { [lineId]: _, ...rest } = prev;
+        return rest;
+      }
+      return { ...prev, [lineId]: keepIds };
+    });
+  };
+
+  const toggleVariantKeep = (lineId: string, variantId: string) => {
+    setVariantKeepByLine((prev) => {
+      const cur = prev[lineId] ?? [];
+      const next = cur.includes(variantId)
+        ? cur.filter((id) => id !== variantId)
+        : [...cur, variantId];
+      if (next.length === 0) {
+        const { [lineId]: _, ...rest } = prev;
+        return rest;
+      }
+      return { ...prev, [lineId]: next };
+    });
+  };
+
+  const keepOnlyVariants = async (lineId: string, keepIds: ReadonlySet<string>) => {
+    const p = projectRef.current;
+    if (!p) return;
+    const line = p.lines.find((l) => l.id === lineId);
+    if (!line) return;
+    const variants = normalizeLineVariants(line);
+    const kept = variants.filter((v) => keepIds.has(v.id));
+    const dropped = variants.filter((v) => !keepIds.has(v.id));
+    if (kept.length === 0 || dropped.length === 0) return;
+    const player = playerRef.current;
+    const droppingActive =
+      player != null &&
+      dropped.some((v) => player.isActiveVariant(lineId, v.id));
+    if (droppingActive) {
+      cancelBatchPlayback({ stopAudio: true });
+    }
+    await persistVariantsForLine(line.id, kept, dropped);
+    await persistChain.current;
+    pruneVariantKeep(lineId, []);
+    setStatus(`${dropped.length}本を削除しました（${kept.length}本を保持）`);
+  };
+
+  const deleteVariant = async (lineId: string, variantId: string) => {
+    const p = projectRef.current;
+    if (!p) return;
+    const line = p.lines.find((l) => l.id === lineId);
+    if (!line) return;
+    const variants = normalizeLineVariants(line);
+    const target = variants.find((v) => v.id === variantId);
+    if (!target) return;
+    const kept = variants.filter((v) => v.id !== variantId);
+    if (playerRef.current?.activeLineId === lineId) {
+      cancelBatchPlayback({ stopAudio: true });
+    }
+    await persistVariantsForLine(line.id, kept, [target]);
+    await persistChain.current;
+    setVariantKeepByLine((prev) => {
+      const cur = prev[lineId];
+      if (!cur) return prev;
+      const next = cur.filter((id) => id !== variantId);
+      if (next.length === 0) {
+        const { [lineId]: _, ...rest } = prev;
+        return rest;
+      }
+      return { ...prev, [lineId]: next };
+    });
+  };
+
+  const seekVariant = async (
+    line: ProjectLine,
+    variant: LineVariant,
+    time: number,
+  ) => {
+    const player = playerRef.current;
+    if (!player) return;
+    pendingSeekRef.current = {
+      lineId: line.id,
+      variantId: variant.id,
+      time,
+    };
+    if (player.isActiveVariant(line.id, variant.id) && player.hasBuffer) {
+      player.seek(time);
+      pendingSeekRef.current = null;
+      return;
+    }
+    const loadKey = `${line.id}:${variant.id}`;
+    if (loadSeekKeyRef.current === loadKey) return;
+    loadSeekKeyRef.current = loadKey;
+    if (
+      batchPlayActiveRef.current &&
+      !player.isActiveVariant(line.id, variant.id)
+    ) {
+      cancelBatchPlayback();
+    }
+    try {
+      const exists = await invoke<boolean>("file_exists", {
+        path: variant.wavPath,
+      });
+      if (!exists) return;
+      await startPlayback(line, variant.wavPath, variant.id, {
+        autoplay: false,
+      });
+      const pending = pendingSeekRef.current;
+      if (
+        pending &&
+        pending.lineId === line.id &&
+        pending.variantId === variant.id
+      ) {
+        player.seek(pending.time);
+        pendingSeekRef.current = null;
+      }
+    } finally {
+      if (loadSeekKeyRef.current === loadKey) loadSeekKeyRef.current = null;
+    }
+  };
+
   const playSingleLine = async (lineId: string) => {
     const player = playerRef.current;
     if (!player) return;
-    // Ignore extra clicks while this (or another) line is synthesizing
-    if (busy || synthInflight.current.has(lineId)) return;
-
-    // Hand control to single-line play; keep current audio if same line
-    cancelBatchPlayback();
+    if (busy || lineSynthBusy(lineId)) return;
 
     commitDrafts();
     const p = projectRef.current;
@@ -3021,32 +4722,56 @@ export function GenerateView({
     onSelectedId(line.id);
     syncPanelFromLine(line);
 
-    // Pause/resume only when this line already has a loaded buffer
-    if (player.activeLineId === line.id && player.hasBuffer) {
+    const variants = normalizeLineVariants(line);
+    if (
+      player.activeLineId === line.id &&
+      player.hasBuffer &&
+      (variants.length <= 1 || batchPlayActiveRef.current)
+    ) {
       player.togglePause();
       return;
     }
 
-    const resolved = await resolveWavForPlay(line);
-    if (!resolved) return;
-    const latest =
-      projectRef.current?.lines.find((l) => l.id === lineId) ?? resolved.line;
-    await startPlayback(
-      {
-        ...latest,
-        wavPath: resolved.wav,
-        generatedText: latest.generatedText ?? resolved.line.generatedText,
-        generatedSpeakerEmbedPath:
-          latest.generatedSpeakerEmbedPath ??
-          resolved.line.generatedSpeakerEmbedPath,
-      },
-      resolved.wav,
-    );
+    cancelBatchPlayback({ stopAudio: true });
+
+    const playable: LineVariant[] = [];
+    for (const variant of variants) {
+      const exists = await invoke<boolean>("file_exists", {
+        path: variant.wavPath,
+      });
+      if (exists) playable.push(variant);
+    }
+
+    if (playable.length === 0) {
+      requestOverwriteGenerate(line);
+      return;
+    }
+
+    if (playable.length === 1) {
+      await startPlayback(line, playable[0].wavPath, playable[0].id);
+      return;
+    }
+
+    const gen = batchPlayGenRef.current;
+    playGenRef.current += 1;
+    const queue = createPipelinePlaybackQueue();
+    const playbackPromise = runPipelinePlaybackLoop(gen, queue, {
+      statusPrefix: "再生中…",
+      total: playable.length,
+    });
+    for (const variant of playable) {
+      queue.push({
+        line,
+        wavPath: variant.wavPath,
+        variantId: variant.id,
+      });
+    }
+    queue.close();
+    await playbackPromise;
   };
 
   /** Generate all ungenerated / dirty lines from top to bottom. */
   const generateBatchDirty = async () => {
-    cancelBatchPlayback({ stopAudio: true });
     commitDrafts();
     const p = projectRef.current;
     if (!p || p.lines.length === 0) return;
@@ -3059,29 +4784,89 @@ export function GenerateView({
       return;
     }
 
-    let ok = 0;
-    let fail = 0;
-    for (let i = 0; i < targets.length; i++) {
-      const line =
-        projectRef.current?.lines.find((l) => l.id === targets[i].id) ??
-        targets[i];
-      if (!line.text.trim()) continue;
-      if (!isDirty(line, speakers)) continue;
+    const withExisting = targets.filter(
+      (line) => normalizeLineVariants(line).length > 0,
+    );
+    const run = () => {
+      void (async () => {
+        cancelBatchPlayback({ stopAudio: true });
+        const gen = batchPlayGenRef.current;
+        playGenRef.current += 1;
+        const queue = createPipelinePlaybackQueue();
+        const playbackPromise = runPipelinePlaybackLoop(gen, queue, {
+          statusPrefix: "一括再生中…",
+          total: targets.length,
+        });
 
-      onSelectedId(line.id);
-      syncPanelFromLine(line);
-      setStatus(`一括生成中… ${i + 1}/${targets.length}`);
-      const result = await synthesizeLine(line, { force: false });
-      await persistChain.current;
-      if (result) ok += 1;
-      else fail += 1;
-    }
+        let ok = 0;
+        let fail = 0;
+        for (let i = 0; i < targets.length; i++) {
+          if (gen !== batchPlayGenRef.current) break;
+          const line =
+            projectRef.current?.lines.find((l) => l.id === targets[i].id) ??
+            targets[i];
+          if (!line.text.trim()) continue;
+          if (!isDirty(line, speakers)) continue;
 
-    if (fail === 0) {
-      setStatus(`一括生成完了: ${ok} 行`);
-    } else {
-      setStatus(`一括生成完了: 成功 ${ok} / 失敗 ${fail}`);
+          onSelectedId(line.id);
+          syncPanelFromLine(line);
+          setStatus(`一括生成中… ${i + 1}/${targets.length}`);
+          const individual = generateModeForLine(line) === "individual";
+          const result = await synthesizeLineAudio(
+            line,
+            "overwrite",
+            individual
+              ? {
+                  abortGen: gen,
+                  onVariant: ({ line: readyLine, variant }) => {
+                    if (gen !== batchPlayGenRef.current) return;
+                    queue.push({
+                      line: readyLine,
+                      wavPath: variant.wavPath,
+                      variantId: variant.id,
+                    });
+                  },
+                }
+              : { abortGen: gen },
+          );
+          await persistChain.current;
+          if (result) {
+            ok += 1;
+            if (!individual) {
+              const primary = result.newVariants[0];
+              if (primary) {
+                queue.push({
+                  line: result.line,
+                  wavPath: primary.wavPath,
+                  variantId: primary.id,
+                });
+              }
+            }
+          } else {
+            fail += 1;
+          }
+        }
+
+        queue.close();
+        await playbackPromise;
+
+        if (gen !== batchPlayGenRef.current) return;
+        if (fail === 0) {
+          setStatus(`一括生成完了: ${ok} 行`);
+        } else {
+          setStatus(`一括生成完了: 成功 ${ok} / 失敗 ${fail}`);
+        }
+      })();
+    };
+
+    if (withExisting.length > 0) {
+      askConfirm(
+        `要再生成の ${targets.length} 行を各行の生成数で上書きします。既存音声がある ${withExisting.length} 行は破棄されます。続行しますか？`,
+        run,
+      );
+      return;
     }
+    run();
   };
 
   const playBatch = async () => {
@@ -3093,6 +4878,7 @@ export function GenerateView({
     player.cancelSilence();
     player.releaseEndedWaiters();
     batchPlayActiveRef.current = true;
+    setBatchPlayActive(true);
     const silenceMs = Math.max(0, Number(settings.chunkSilenceMs) || 0);
     setStatus("一括再生中…");
     try {
@@ -3100,16 +4886,40 @@ export function GenerateView({
       for (const line of p.lines) {
         if (gen !== batchPlayGenRef.current) return;
         if (!line.text.trim()) continue;
-        const resolved = await resolveWavForPlay(line);
+        const variants = normalizeLineVariants(line);
+        let playLine = line;
+        let playWav: string | null = null;
+        let playVariantId: string | null = null;
+        const primary = variants[0];
+        if (
+          primary &&
+          !isDirty(line, speakers) &&
+          wavPathMatchesLine(line, primary.wavPath)
+        ) {
+          const exists = await invoke<boolean>("file_exists", {
+            path: primary.wavPath,
+          });
+          if (exists) {
+            playWav = primary.wavPath;
+            playVariantId = primary.id;
+          }
+        }
+        if (!playWav) {
+          const result = await synthesizeLineAudio(line, "overwrite");
+          const first = result?.newVariants[0];
+          if (!result || !first) continue;
+          playLine = result.line;
+          playWav = first.wavPath;
+          playVariantId = first.id;
+        }
         if (gen !== batchPlayGenRef.current) return;
-        if (!resolved) continue;
         await persistChain.current;
         if (gen !== batchPlayGenRef.current) return;
         if (playedAny && silenceMs > 0) {
           await player.waitSilenceMs(silenceMs);
           if (gen !== batchPlayGenRef.current) return;
         }
-        await startPlayback(resolved.line, resolved.wav);
+        await startPlayback(playLine, playWav, playVariantId);
         if (gen !== batchPlayGenRef.current) return;
         await player.waitUntilInactive();
         if (gen !== batchPlayGenRef.current) return;
@@ -3121,22 +4931,9 @@ export function GenerateView({
     } finally {
       if (gen === batchPlayGenRef.current) {
         batchPlayActiveRef.current = false;
+        setBatchPlayActive(false);
       }
     }
-  };
-
-  const requestRegenerate = (line: ProjectLine) => {
-    askConfirm("この行を再生成しますか？", () => {
-      void (async () => {
-        cancelBatchPlayback({ stopAudio: true });
-        onSelectedId(line.id);
-        syncPanelFromLine(line);
-        const result = await synthesizeLine(line, { force: true });
-        if (!result) return;
-        await persistChain.current;
-        await startPlayback(result.line, result.wav);
-      })();
-    });
   };
 
   const ensureLineWav = async (
@@ -3152,37 +4949,130 @@ export function GenerateView({
         ? await invoke<boolean>("file_exists", { path: wav })
         : false;
     if (!wav || !pathOk || !exists || isDirty(fresh, speakers)) {
-      return synthesizeLine(fresh);
+      const result = await synthesizeLineAudio(fresh, "overwrite");
+      const primary = result?.newVariants[0];
+      if (!result || !primary) return null;
+      return { wav: primary.wavPath, line: result.line };
     }
     return { wav, line: fresh };
+  };
+
+  const collectExistingVariantWavs = async (
+    line: ProjectLine,
+  ): Promise<string[]> => {
+    const wavs: string[] = [];
+    for (const variant of normalizeLineVariants(line)) {
+      if (!variant.wavPath) continue;
+      if (!wavPathMatchesLine(line, variant.wavPath)) continue;
+      const exists = await invoke<boolean>("file_exists", {
+        path: variant.wavPath,
+      });
+      if (exists) wavs.push(variant.wavPath);
+    }
+    return wavs;
+  };
+
+  const lineExportName = (
+    projectName: string,
+    line: ProjectLine,
+    idx: number,
+    ext: string,
+    variantIndex?: number,
+    variantCount?: number,
+  ) =>
+    lineExportFileName({
+      projectName,
+      idx,
+      speakerName: line.speakerName,
+      text: line.text,
+      utteranceMaxChars: settings.utteranceMaxChars,
+      parts: settings.exportFilenameParts,
+      ext,
+      variantIndex,
+      variantCount,
+    });
+
+  const exportAdjustedWav = async (
+    src: string,
+    dest: string,
+    line: ProjectLine,
+    format: ExportAudioFormat,
+  ) => {
+    await invoke("export_wav_adjusted", {
+      src,
+      dest,
+      volume: line.volume,
+      speed: line.speed,
+      format,
+      bitrateKbps: exportBitrateKbps(format, settings),
+    });
+  };
+
+  const exportVariantWavsToFolder = async (
+    folder: string,
+    projectName: string,
+    line: ProjectLine,
+    idx: number,
+    wavs: string[],
+    format: ExportAudioFormat,
+  ) => {
+    const variantCount = wavs.length;
+    const ext = exportAudioExt(format);
+    for (let i = 0; i < wavs.length; i++) {
+      const name = lineExportName(
+        projectName,
+        line,
+        idx,
+        ext,
+        i + 1,
+        variantCount,
+      );
+      await exportAdjustedWav(wavs[i], joinPath(folder, name), line, format);
+    }
   };
 
   const saveLine = async (line: ProjectLine) => {
     const resolved = await ensureLineWav(line);
     if (!resolved) return;
+    const wavs = await collectExistingVariantWavs(resolved.line);
+    if (wavs.length === 0) {
+      setStatus("保存できる音声がありません");
+      return;
+    }
     const p = projectRef.current;
     const idx = (p?.lines.findIndex((l) => l.id === resolved.line.id) ?? 0) + 1;
-    const defaultName = lineExportFileName({
-      projectName: p?.name ?? "project",
+    const preferred = exportAudioFormatOf(settings);
+    const defaultName = lineExportName(
+      p?.name ?? "project",
+      resolved.line,
       idx,
-      speakerName: resolved.line.speakerName,
-      text: resolved.line.text,
-      utteranceMaxChars: settings.utteranceMaxChars,
-      parts: settings.exportFilenameParts,
-    });
+      exportAudioExt(preferred),
+      1,
+      wavs.length,
+    );
     const dest = await save({
       defaultPath: defaultName,
-      filters: [{ name: "WAV", extensions: ["wav"] }],
+      filters: exportDialogFilters(preferred),
     });
     if (!dest) return;
+    const format = formatFromDestPath(dest, preferred);
     try {
-      await invoke("export_wav_adjusted", {
-        src: resolved.wav,
-        dest,
-        volume: resolved.line.volume,
-        speed: resolved.line.speed,
-      });
-      setStatus(`保存: ${dest}`);
+      if (wavs.length === 1) {
+        const outPath = withAudioExt(dest, format);
+        await exportAdjustedWav(wavs[0], outPath, resolved.line, format);
+        setStatus(`保存: ${outPath}`);
+        return;
+      }
+      const folder = parentDir(dest);
+      await exportVariantWavsToFolder(
+        folder,
+        p?.name ?? "project",
+        resolved.line,
+        idx,
+        wavs,
+        format,
+      );
+      setStatus(`保存: ${wavs.length} ファイル → ${folder}`);
     } catch (e) {
       setStatus(String(e));
     }
@@ -3195,6 +5085,7 @@ export function GenerateView({
     setBatchSilenceSecs(String(secs));
     setBatchSubtitle("none");
     setBatchLabel("none");
+    setBatchFormat(exportAudioFormatOf(settings));
     setBatchSaveOpen(true);
   };
 
@@ -3218,7 +5109,7 @@ export function GenerateView({
 
     setBatchSaving(true);
     try {
-      const resolved: { wav: string; line: ProjectLine; idx: number }[] = [];
+      const resolved: { wavs: string[]; line: ProjectLine; idx: number }[] = [];
       for (let i = 0; i < p.lines.length; i++) {
         const line = p.lines[i];
         if (!line.text.trim()) continue;
@@ -3228,7 +5119,12 @@ export function GenerateView({
           setStatus(`一括保存中断: ${i + 1} 行目の生成に失敗しました`);
           return;
         }
-        resolved.push({ wav: got.wav, line: got.line, idx: i + 1 });
+        const wavs = await collectExistingVariantWavs(got.line);
+        if (wavs.length === 0) {
+          setStatus(`一括保存中断: ${i + 1} 行目の音声がありません`);
+          return;
+        }
+        resolved.push({ wavs, line: got.line, idx: i + 1 });
       }
 
       if (resolved.length === 0) {
@@ -3237,35 +5133,35 @@ export function GenerateView({
       }
 
       if (batchMode === "individual") {
+        let fileCount = 0;
         for (const item of resolved) {
-          const name = lineExportFileName({
-            projectName: p.name,
-            idx: item.idx,
-            speakerName: item.line.speakerName,
-            text: item.line.text,
-            utteranceMaxChars: settings.utteranceMaxChars,
-            parts: settings.exportFilenameParts,
-          });
-          const dest = joinPath(folder, name);
-          await invoke("export_wav_adjusted", {
-            src: item.wav,
-            dest,
-            volume: item.line.volume,
-            speed: item.line.speed,
-          });
+          await exportVariantWavsToFolder(
+            folder,
+            p.name,
+            item.line,
+            item.idx,
+            item.wavs,
+            batchFormat,
+          );
+          fileCount += item.wavs.length;
         }
-        setStatus(`一括保存完了: ${resolved.length} ファイル → ${folder}`);
+        setStatus(`一括保存完了: ${fileCount} ファイル → ${folder}`);
       } else {
         const silenceSecs = Math.max(0, Number(batchSilenceSecs) || 0);
-        const dest = joinPath(folder, `${p.name}_concat.wav`);
+        const dest = joinPath(
+          folder,
+          `${p.name}_concat.${exportAudioExt(batchFormat)}`,
+        );
         await invoke("export_wavs_concatenated", {
           segments: resolved.map((r) => ({
-            src: r.wav,
+            src: r.wavs[0],
             volume: r.line.volume,
             speed: r.line.speed,
           })),
           silenceSecs,
           dest,
+          format: batchFormat,
+          bitrateKbps: exportBitrateKbps(batchFormat, settings),
         });
 
         // Sidecar timings: source duration / speed (+ silence between)
@@ -3277,7 +5173,7 @@ export function GenerateView({
           }[] = [];
           for (const r of resolved) {
             const baseDur = await invoke<number>("wav_duration_secs", {
-              path: r.wav,
+              path: r.wavs[0],
             });
             const speed = Math.max(0.5, Math.min(2, r.line.speed || 1));
             items.push({
@@ -3336,20 +5232,34 @@ export function GenerateView({
 
   if (!project) {
     return (
-      <div className="project-start">
-        <ProjectGatePanels
-          newName={projectNameDraft}
-          onNewName={onProjectNameDraft}
-          onCreate={startProject}
-          existingNames={existingProjects}
-          selectedName={loadPickName}
-          onSelectName={setLoadPickName}
-          onLoad={() => void loadProjectByName(loadPickName)}
-          status={status}
-          disabled={gateBusy}
-          openNames={openProjects.map((p) => p.name)}
-        />
-      </div>
+      <>
+        <div className="project-start">
+          <ProjectGatePanels
+            newName={projectNameDraft}
+            onNewName={onProjectNameDraft}
+            onCreate={startProject}
+            existingNames={existingProjects}
+            selectedName={loadPickName}
+            onSelectName={setLoadPickName}
+            onLoad={() => void loadProjectByName(loadPickName)}
+            onDelete={(name) => void deleteProjectByName(name)}
+            status={status}
+            disabled={gateBusy}
+            openNames={openProjects.map((p) => p.name)}
+          />
+        </div>
+        {confirm && (
+          <ConfirmModal
+            message={confirm.message}
+            onYes={() => {
+              const fn = confirm.onYes;
+              setConfirm(null);
+              fn();
+            }}
+            onCancel={() => setConfirm(null)}
+          />
+        )}
+      </>
     );
   }
 
@@ -3357,7 +5267,12 @@ export function GenerateView({
     <div className="gen-layout">
       <main className="script-panel panel">
         <header className="panel-header toolbar">
-          <div className="project-tabs" role="tablist" aria-label="開いているプロジェクト">
+          <div
+            ref={projectTabsRef}
+            className="project-tabs"
+            role="tablist"
+            aria-label="開いているプロジェクト"
+          >
             {openProjects.map((p) => {
               const active = p.name === project.name;
               const renaming = tabRename === p.name;
@@ -3480,7 +5395,7 @@ export function GenerateView({
               className="primary"
               disabled={busy || asrBusy || project.lines.length === 0}
               onClick={() => void generateBatchDirty()}
-              title="未生成・要再生成の行を上から順に生成"
+              title="未生成・要再生成の行を上から順に、各行の生成数で上書き生成"
             >
               生成
             </button>
@@ -3503,7 +5418,7 @@ export function GenerateView({
             <BatchMoreMenu
               disabled={busy || batchSaving || asrBusy}
               canKatakana={project.lines.some((l) => l.text.trim())}
-              onKatakana={() => void openKatakanaReviewBatch()}
+              onKatakana={() => void openAnnotationReviewBatch()}
               onReplace={() => void openReplacePreview()}
               onAsrVerify={() => void runAsrVerifyBatch()}
             />
@@ -3512,27 +5427,96 @@ export function GenerateView({
 
         <div className="panel-body script-body">
           <EmojiPalette open={emojiOpen} onInsert={insertEmoji} />
-          <div className="line-list-wrap">
+          <div
+            className={`line-list-wrap ${lineListDropOver ? "doc-drop-active" : ""}`}
+            onDragEnter={(e) => {
+              acceptFileDrag(e);
+              setLineListDropOver(true);
+            }}
+            onDragOver={(e) => {
+              acceptFileDrag(e);
+              setLineListDropOver(true);
+            }}
+            onDragLeave={(e) => {
+              if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+              setLineListDropOver(false);
+            }}
+            onDrop={(e) => {
+              acceptFileDrag(e);
+              setLineListDropOver(false);
+              const file = filesFromDataTransfer(e.dataTransfer).find(isSupportedDocFile);
+              if (file) {
+                setBulkAddInitialFile(file);
+                setBulkAddOpen(true);
+              }
+            }}
+          >
+            {lineListDropOver && (
+              <div className="line-list-drop-overlay">
+                ドロップしてインポート
+              </div>
+            )}
+            <input
+              ref={docFileInputRef}
+              type="file"
+              accept=".txt,.md,.markdown,.docx,.pdf"
+              style={{ display: "none" }}
+              onChange={(e) => {
+                const file = Array.from(e.target.files ?? []).find(isSupportedDocFile);
+                e.target.value = "";
+                if (file) {
+                  setBulkAddInitialFile(file);
+                  setBulkAddOpen(true);
+                }
+              }}
+            />
             <div
-              className={`line-list ${draggingId ? "is-reordering" : ""}`}
+              className={`line-list ${draggingIds.length ? "is-reordering" : ""}${
+                rangeSelecting ? " is-selecting" : ""
+              }`}
               ref={lineListRef}
             >
-              {displayLines.length === 0 && (
-                <p className="hint empty-hint">
-                  右下の + または「テキスト追加」から行を追加してください
-                </p>
-              )}
               {displayLines.map((line, i) => {
+                const lineVariants = normalizeLineVariants(line);
                 const isPlayingLine = playback?.lineId === line.id;
+                const isLinePlayingNow =
+                  isPlayingLine && !!playback?.playing;
+                const isSelectedLine = selectedId === line.id;
+                const hasKeptAudio =
+                  lineVariants.length > 0 &&
+                  !!line.wavPath &&
+                  wavPathMatchesLine(line);
+                const showLineSeek =
+                  hasKeptAudio &&
+                  (batchPlayActive
+                    ? isPlayingLine && !!playback
+                    : isSelectedLine);
                 const generating = busyLineId === line.id;
+                const keptVariantIds = (variantKeepByLine[line.id] ?? []).filter(
+                  (id) => lineVariants.some((v) => v.id === id),
+                );
+                const canCullOthers =
+                  isSelectedLine &&
+                  lineVariants.length > 1 &&
+                  keptVariantIds.length > 0 &&
+                  keptVariantIds.length < lineVariants.length;
                 return (
                   <div
                     key={line.id}
                     data-line-id={line.id}
-                    className={`line-item ${selectedId === line.id ? "active" : ""} ${
-                      generating ? "generating" : ""
-                    } ${draggingId === line.id ? "dragging" : ""}`}
-                    onClick={() => {
+                    aria-selected={selectedIdSet.has(line.id)}
+                    className={`line-item ${selectedIdSet.has(line.id) ? "selected" : ""} ${
+                      selectedId === line.id ? "active" : ""
+                    } ${generating ? "generating" : ""} ${
+                      draggingIds.includes(line.id) ? "dragging" : ""
+                    }`}
+                    onPointerDown={(e) => onLinePointerDown(e, line.id, i)}
+                      onClick={() => {
+                      if (lineGestureConsumedRef.current) {
+                        lineGestureConsumedRef.current = false;
+                        return;
+                      }
+                      abortSequentialOnLeaveLine(line.id);
                       onSelectedId(line.id);
                       syncPanelFromLine(line);
                     }}
@@ -3541,18 +5525,26 @@ export function GenerateView({
                     <div className="line-meta">
                       <span
                         className="drag-handle"
-                        title="ドラッグで並べ替え"
-                        onPointerDown={(e) => onHandlePointerDown(e, line.id, i)}
-                        onClick={(e) => e.stopPropagation()}
+                        title="ドラッグで並べ替え（複数選択時はまとめて移動）"
+                        onPointerDown={(e) => onHandlePointerDown(e, line.id)}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          lineGestureConsumedRef.current = false;
+                        }}
                       >
                         ⋮⋮
                       </span>
-                      <span className="line-idx">{i + 1}</span>
+                      <span className="line-idx" title="ドラッグで範囲選択">
+                        {i + 1}
+                      </span>
                       <BoundedSelect
                         className="speaker-select"
                         value={line.speakerEmbedPath}
+                        displayLabel={lineSpeakerDisplayLabel(line, speakers)}
                         options={speakerOptions}
                         placeholder="話者を選択…"
+                        searchable
+                        searchPlaceholder="話者を検索…"
                         aria-label={`行 ${i + 1} の話者`}
                         onClick={(e) => e.stopPropagation()}
                         onChange={(v) => {
@@ -3568,7 +5560,31 @@ export function GenerateView({
                         disabled={busy}
                         onApplyAll={() => applySpeakerToAll(line)}
                         onApplyParity={() => applySpeakerToParity(line, i)}
+                        onApplyFromHere={() => applySpeakerFromHere(line, i)}
                       />
+                      {lineVariants.length > 1 &&
+                        (canCullOthers ? (
+                          <button
+                            type="button"
+                            className="badge variant-count variant-keep-action action-aura danger"
+                            title="チェックした音声だけ残し、他を削除"
+                            disabled={busy && busyLineId === line.id}
+                            onPointerDown={(e) => e.stopPropagation()}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void keepOnlyVariants(
+                                line.id,
+                                new Set(keptVariantIds),
+                              );
+                            }}
+                          >
+                            他を削除
+                          </button>
+                        ) : (
+                          <span className="badge variant-count">
+                            {lineVariants.length}本保持中
+                          </span>
+                        ))}
                       {line.wavPath &&
                         wavPathMatchesLine(line) &&
                         !isDirty(line, speakers) && (
@@ -3584,9 +5600,13 @@ export function GenerateView({
                       <div className="line-actions">
                         <button
                           type="button"
-                          className="line-btn"
+                          className={`line-btn${
+                            isSelectedLine && !hasKeptAudio && !generating
+                              ? " action-aura"
+                              : ""
+                          }`}
                           disabled={busy && busyLineId !== line.id}
-                          title="再生/一時停止（右クリックで再生成確認）"
+                          title="再生/一時停止（右クリックで上書き生成・追加生成）"
                           onClick={(e) => {
                             e.stopPropagation();
                             void playSingleLine(line.id);
@@ -3594,26 +5614,30 @@ export function GenerateView({
                           onContextMenu={(e) => {
                             e.preventDefault();
                             e.stopPropagation();
-                            requestRegenerate(line);
+                            setLinePlayContextMenu({
+                              lineId: line.id,
+                              x: e.clientX,
+                              y: e.clientY,
+                            });
                           }}
                         >
                           {generating
                             ? "…"
-                            : isPlayingLine && playback?.playing
+                            : isLinePlayingNow
                               ? "❚❚"
                               : "▶"}
                         </button>
                         <button
                           type="button"
                           className="line-btn"
-                          title="カタカナ提案"
+                          title="読み提案"
                           disabled={busy || asrBusy || !line.text.trim()}
                           onClick={(e) => {
                             e.stopPropagation();
-                            void openKatakanaReview(line);
+                            void openAnnotationReview(line);
                           }}
                         >
-                          ア
+                          読
                         </button>
                         <button
                           type="button"
@@ -3630,7 +5654,7 @@ export function GenerateView({
                         <button
                           type="button"
                           className="line-btn"
-                          title="ファイルに保存"
+                          title="この行の音声を保存（複数本はまとめて出力）"
                           disabled={busy}
                           onClick={(e) => {
                             e.stopPropagation();
@@ -3657,13 +5681,25 @@ export function GenerateView({
                       onChange={(text) => void updateLine(line.id, { text })}
                       onDraftChange={(text) => {
                         lineDraftsRef.current.set(line.id, text);
+                        scheduleAnnotationRefresh();
                       }}
                       onFocusLine={() => {
+                        abortSequentialOnLeaveLine(line.id);
                         onSelectedId(line.id);
                         syncPanelFromLine(line);
                       }}
                       canMergePrev={i > 0}
-                      highlightHits={homoByLine[line.id]}
+                      pendingAnnotations={annotationsByLine[line.id]}
+                      appliedReadings={validateReadings(
+                        lineDraftsRef.current.get(line.id) ?? line.text,
+                        line.readings ?? [],
+                      )}
+                      onApplyAnnotation={(annotation, reading) =>
+                        void applyAnnotationReading(line.id, annotation, reading)
+                      }
+                      onUndoReading={(readingId) =>
+                        void undoReading(line.id, readingId)
+                      }
                       autoReplaceEntries={autoReplaceEntries}
                       focusRequest={
                         lineFocusRequest?.lineId === line.id
@@ -3683,30 +5719,165 @@ export function GenerateView({
                         mergeLineWithPrevious(line.id, text)
                       }
                     />
-                    {isPlayingLine && playback && (
+                    {showLineSeek ? (
                       <div
-                        className="seek-bar"
+                        className="variant-seek-stack"
                         onClick={(e) => e.stopPropagation()}
                       >
-                        <input
-                          type="range"
-                          min={0}
-                          max={playback.duration || 0}
-                          step={0.01}
-                          value={playback.currentTime}
-                          onChange={(e) =>
-                            playerRef.current?.seek(Number(e.target.value))
-                          }
-                        />
-                        <span className="seek-time">
-                          {playback.currentTime.toFixed(1)} /{" "}
-                          {playback.duration.toFixed(1)}s
-                        </span>
+                        {lineVariants.map((variant, vi) => {
+                          const isActive =
+                            isPlayingLine &&
+                            playback?.variantId === variant.id;
+                          const isPlayingVariant =
+                            isActive && !!playback?.playing;
+                          const durationKey = variantDurationKey(
+                            line.id,
+                            variant.id,
+                            line.speed,
+                          );
+                          const duration =
+                            isActive && playback && playback.duration > 0
+                              ? playback.duration
+                              : (variantDurations[durationKey] ?? 0);
+                          const currentTime =
+                            isActive && playback?.playing
+                              ? playback.currentTime
+                              : seekDraft?.lineId === line.id &&
+                                  seekDraft.variantId === variant.id
+                                ? seekDraft.time
+                                : isActive && playback
+                                  ? playback.currentTime
+                                  : 0;
+                          const showKeepCheck = lineVariants.length > 1;
+                          const isKept =
+                            showKeepCheck &&
+                            keptVariantIds.includes(variant.id);
+                          return (
+                            <div
+                              className={`variant-seek-row${
+                                showKeepCheck ? " multi" : ""
+                              }${isKept ? " is-kept" : ""}`}
+                              key={variant.id}
+                            >
+                              {showKeepCheck ? (
+                                <label
+                                  className="variant-keep-check"
+                                  title="残す音声として選択"
+                                  onPointerDown={(e) => e.stopPropagation()}
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={isKept}
+                                    aria-label={`バリアント ${vi + 1} を残す`}
+                                    onChange={() =>
+                                      toggleVariantKeep(line.id, variant.id)
+                                    }
+                                  />
+                                </label>
+                              ) : null}
+                              <button
+                                type="button"
+                                className="line-btn variant-play-btn"
+                                title={`バリアント ${vi + 1} を再生`}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void playVariant(line.id, variant.id);
+                                }}
+                              >
+                                {isPlayingVariant ? "❚❚" : "▶"}
+                              </button>
+                              <input
+                                type="range"
+                                min={0}
+                                max={duration || 0}
+                                step={0.01}
+                                value={Math.min(currentTime, duration || 0)}
+                                disabled={duration <= 0}
+                                onPointerDown={() => {
+                                  userSeekingKeyRef.current = `${line.id}:${variant.id}`;
+                                }}
+                                onChange={(e) => {
+                                  const time = Number(e.target.value);
+                                  setSeekDraft({
+                                    lineId: line.id,
+                                    variantId: variant.id,
+                                    time,
+                                  });
+                                  if (
+                                    userSeekingKeyRef.current !==
+                                    `${line.id}:${variant.id}`
+                                  ) {
+                                    return;
+                                  }
+                                  void seekVariant(line, variant, time);
+                                }}
+                                onPointerUp={() => {
+                                  if (
+                                    userSeekingKeyRef.current ===
+                                    `${line.id}:${variant.id}`
+                                  ) {
+                                    userSeekingKeyRef.current = null;
+                                  }
+                                  window.setTimeout(() => {
+                                    setSeekDraft((d) => {
+                                      if (
+                                        !d ||
+                                        d.lineId !== line.id ||
+                                        d.variantId !== variant.id
+                                      ) {
+                                        return d;
+                                      }
+                                      const p = playerRef.current;
+                                      if (
+                                        p?.isActiveVariant(
+                                          d.lineId,
+                                          d.variantId,
+                                        ) &&
+                                        p.hasBuffer
+                                      ) {
+                                        return null;
+                                      }
+                                      return d;
+                                    });
+                                  }, 0);
+                                }}
+                              />
+                              <span className="seek-time">
+                                {duration > 0
+                                  ? `${currentTime.toFixed(1)} / ${duration.toFixed(1)}s`
+                                  : `seed ${variant.seed}`}
+                              </span>
+                              <button
+                                type="button"
+                                className="line-btn danger variant-delete-btn"
+                                title="この音声を削除"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void deleteVariant(line.id, variant.id);
+                                }}
+                              >
+                                <IconTrash />
+                              </button>
+                            </div>
+                          );
+                        })}
                       </div>
-                    )}
+                    ) : null}
                   </div>
                 );
               })}
+              <div className="line-list-drop-spacer" />
+              <div className="line-list-drop-cue">
+                <span>ファイル（.txt .md .docx .pdf）をここにドロップしてインポート</span>
+                <button
+                  type="button"
+                  className="doc-drop-browse"
+                  onClick={() => docFileInputRef.current?.click()}
+                >
+                  ファイルを選択
+                </button>
+              </div>
             </div>
 
             <button
@@ -3772,7 +5943,11 @@ export function GenerateView({
         <BulkAddDialog
           speakers={speakers}
           onConfirm={(lines) => void addLinesFromTexts(lines)}
-          onCancel={() => setBulkAddOpen(false)}
+          onCancel={() => {
+            setBulkAddOpen(false);
+            setBulkAddInitialFile(undefined);
+          }}
+          initialFile={bulkAddInitialFile}
         />
       )}
 
@@ -3890,52 +6065,85 @@ export function GenerateView({
                   );
                 })}
               </ul>
-              <div className="row">
-                <button
-                  type="button"
-                  className="primary"
-                  disabled={
-                    !replacePreview.changes.some(
-                      (c) => replacePreview.selected[c.lineId],
-                    )
-                  }
-                  onClick={() => void applyReplacePreview()}
-                >
-                  選択行を適用
-                </button>
-                <button type="button" onClick={() => setReplacePreview(null)}>
-                  キャンセル
-                </button>
-              </div>
             </div>
+            <footer className="panel-footer row">
+              <button
+                type="button"
+                className="primary"
+                disabled={
+                  !replacePreview.changes.some(
+                    (c) => replacePreview.selected[c.lineId],
+                  )
+                }
+                onClick={() => void applyReplacePreview()}
+              >
+                選択行を適用
+              </button>
+              <button type="button" onClick={() => setReplacePreview(null)}>
+                キャンセル
+              </button>
+            </footer>
           </div>
         </div>
       )}
 
-      {katakanaReview && (
-        <KatakanaReviewDialog
-          items={katakanaReview.items}
-          onCancel={() => setKatakanaReview(null)}
+      {annotationReview && (
+        <AnnotationReviewDialog
+          items={annotationReview.items}
+          modes={numericModes}
+          onModesChange={setNumericModes}
+          onCancel={() => setAnnotationReview(null)}
           onApply={(updates) => {
-            setKatakanaReview(null);
+            const reviewItems = annotationReview.items;
+            setAnnotationReview(null);
             void (async () => {
-              const map = new Map(updates.map((u) => [u.lineId, u.text]));
+              const map = new Map(updates.map((u) => [u.lineId, u.readings]));
+              const existingIds = new Set<string>();
+              for (const item of reviewItems) {
+                for (const r of item.applied) existingIds.add(r.id);
+              }
+              const novelSpecs: {
+                kind: string;
+                surface: string;
+                reading: string;
+                candidateReadings: string[];
+              }[] = [];
+              for (const u of updates) {
+                const item = reviewItems.find((it) => it.lineId === u.lineId);
+                for (const r of u.readings) {
+                  if (existingIds.has(r.id)) continue;
+                  const ann = item?.annotations.find(
+                    (a) =>
+                      a.start === r.start &&
+                      a.end === r.end &&
+                      a.surface === r.surface,
+                  );
+                  novelSpecs.push({
+                    kind: r.kind,
+                    surface: r.surface,
+                    reading: r.reading,
+                    candidateReadings: (ann?.candidates ?? []).map(
+                      (c) => c.reading,
+                    ),
+                  });
+                }
+              }
+              await persistNovelReadingDict(novelSpecs);
               await persist((prev) => ({
                 ...prev,
                 lines: prev.lines.map((l) => {
-                  const text = map.get(l.id);
-                  if (text === undefined) return l;
-                  lineDraftsRef.current.set(l.id, text);
-                  return { ...l, text };
+                  const readings = map.get(l.id);
+                  if (readings === undefined) return l;
+                  return { ...l, readings };
                 }),
               }));
               invalidateAsrMany([...map.keys()]);
               setStatus(
                 updates.length > 1
-                  ? `カタカナを ${updates.length} 行に適用しました`
-                  : "カタカナを適用しました",
+                  ? `読みを ${updates.length} 行に適用しました`
+                  : "読みを適用しました",
               );
-              void refreshHomographs();
+              void refreshAnnotations();
             })();
           }}
         />
@@ -3985,6 +6193,30 @@ export function GenerateView({
                   aria-label="保存タイプ"
                 />
               </label>
+              {batchMode === "individual" && (
+                <p className="hint">
+                  1行に複数の音声があるときは、番号を 001-1, 001-2 のように枝番付きで保存します。行の保存ボタンでも同じ規則です。
+                </p>
+              )}
+              <label>
+                出力形式
+                <BoundedSelect
+                  value={batchFormat}
+                  options={EXPORT_AUDIO_FORMATS.map((f) => ({
+                    value: f,
+                    label: EXPORT_AUDIO_FORMAT_LABELS[f],
+                  }))}
+                  onChange={(v) => setBatchFormat(v as ExportAudioFormat)}
+                  disabled={batchSaving}
+                  aria-label="出力形式"
+                />
+              </label>
+              {batchFormat !== "wav" && (
+                <p className="hint">
+                  {batchFormat === "mp3" ? "MP3" : "Opus"}{" "}
+                  {exportBitrateKbps(batchFormat, settings)} kbps（設定の再生・保存で変更）
+                </p>
+              )}
               {batchMode === "concat" && (
                 <>
                   <label>
@@ -4030,24 +6262,24 @@ export function GenerateView({
                   </label>
                 </>
               )}
-              <div className="row">
-                <button
-                  type="button"
-                  className="primary"
-                  disabled={batchSaving || !batchFolder.trim()}
-                  onClick={() => void runBatchSave()}
-                >
-                  {batchSaving ? "保存中…" : "保存"}
-                </button>
-                <button
-                  type="button"
-                  disabled={batchSaving}
-                  onClick={() => setBatchSaveOpen(false)}
-                >
-                  キャンセル
-                </button>
-              </div>
             </div>
+            <footer className="panel-footer row">
+              <button
+                type="button"
+                className="primary"
+                disabled={batchSaving || !batchFolder.trim()}
+                onClick={() => void runBatchSave()}
+              >
+                {batchSaving ? "保存中…" : "保存"}
+              </button>
+              <button
+                type="button"
+                disabled={batchSaving}
+                onClick={() => setBatchSaveOpen(false)}
+              >
+                キャンセル
+              </button>
+            </footer>
           </div>
         </div>
       )}
@@ -4083,6 +6315,7 @@ export function GenerateView({
                 selectedName={loadPickName}
                 onSelectName={setLoadPickName}
                 onLoad={() => void loadProjectByName(loadPickName)}
+                onDelete={(name) => void deleteProjectByName(name)}
                 status={status}
                 disabled={gateBusy}
                 openNames={openProjects.map((p) => p.name)}
@@ -4093,33 +6326,77 @@ export function GenerateView({
       )}
 
       {confirm && (
-        <div className="modal-backdrop" onClick={() => setConfirm(null)}>
-          <div className="modal panel" onClick={(e) => e.stopPropagation()}>
-            <header className="panel-header">
-              <h3>確認</h3>
-            </header>
-            <div className="panel-body form-stack">
-              <p>{confirm.message}</p>
-              <div className="row">
-                <button
-                  type="button"
-                  className="primary"
-                  onClick={() => {
-                    const fn = confirm.onYes;
-                    setConfirm(null);
-                    fn();
-                  }}
-                >
-                  OK
-                </button>
-                <button type="button" onClick={() => setConfirm(null)}>
-                  キャンセル
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
+        <ConfirmModal
+          message={confirm.message}
+          onYes={() => {
+            const fn = confirm.onYes;
+            setConfirm(null);
+            fn();
+          }}
+          onCancel={() => setConfirm(null)}
+        />
       )}
+
+      {linePlayContextMenu &&
+        createPortal(
+          <div
+            className="project-tab-context-menu line-play-context-menu"
+            role="menu"
+            style={{
+              left: Math.max(
+                8,
+                Math.min(linePlayContextMenu.x, window.innerWidth - 260),
+              ),
+              top: Math.max(
+                8,
+                Math.min(linePlayContextMenu.y, window.innerHeight - 88),
+              ),
+            }}
+            onContextMenu={(e) => e.preventDefault()}
+          >
+            {(() => {
+              const ctxLine = project.lines.find(
+                (l) => l.id === linePlayContextMenu.lineId,
+              );
+              const n = ctxLine ? candidateCountForLine(ctxLine) : 1;
+              return (
+                <>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={busy || batchSaving || gateBusy}
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onClick={() => {
+                      const line = projectRef.current?.lines.find(
+                        (l) => l.id === linePlayContextMenu.lineId,
+                      );
+                      setLinePlayContextMenu(null);
+                      if (line) requestOverwriteGenerate(line);
+                    }}
+                  >
+                    上書き生成（{n}件）
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={busy || batchSaving || gateBusy}
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onClick={() => {
+                      const line = projectRef.current?.lines.find(
+                        (l) => l.id === linePlayContextMenu.lineId,
+                      );
+                      setLinePlayContextMenu(null);
+                      if (line) requestAppendGenerate(line);
+                    }}
+                  >
+                    追加生成（{n}件）
+                  </button>
+                </>
+              );
+            })()}
+          </div>,
+          document.body,
+        )}
 
       {tabContextMenu &&
         createPortal(

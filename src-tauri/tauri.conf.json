@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Irodori Studio",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "identifier": "com.irodori.studio",
   "build": {
     "beforeDevCommand": "npm run fetch-ffmpeg && npm run dev",
@@ -16,7 +16,8 @@
         "width": 1440,
         "height": 900,
         "minWidth": 1100,
-        "minHeight": 700
+        "minHeight": 700,
+        "dragDropEnabled": false
       }
     ],
     "security": {
@@ -36,6 +37,7 @@
     "resources": {
       "../python": "python/",
       "../data/homographs_ndl_seed.json": "data/homographs_ndl_seed.json",
+      "../data/counter_words.json": "data/counter_words.json",
       "../vendor/ffmpeg": "ffmpeg/"
     }
   }

@@ -111,6 +111,8 @@ pub struct HomographExtra {
     pub surface: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub readings: Vec<String>,
 }
 
 pub fn detect_homographs(
@@ -128,6 +130,51 @@ pub fn detect_homographs(
         .cloned()
         .unwrap_or(serde_json::json!([]));
     serde_json::from_value(hits).map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnotationCandidate {
+    pub reading: String,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectedAnnotation {
+    pub kind: String,
+    pub start: usize,
+    pub end: usize,
+    pub surface: String,
+    pub candidates: Vec<AnnotationCandidate>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadingDictPayload {
+    pub kind: String,
+    pub surface: String,
+    pub reading: String,
+}
+
+pub fn detect_annotations(
+    settings: &AppSettings,
+    text: &str,
+    extra_homographs: &[HomographExtra],
+    reading_dict: &[ReadingDictPayload],
+) -> Result<Vec<DetectedAnnotation>, String> {
+    let payload = serde_json::json!({
+        "text": text,
+        "extraHomographs": extra_homographs,
+        "readingDict": reading_dict,
+    });
+    let v = run_python_json(settings, "annotate_detect.py", &payload)?;
+    let annotations = v
+        .get("annotations")
+        .cloned()
+        .unwrap_or(serde_json::json!([]));
+    serde_json::from_value(annotations).map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { BoundedSelect } from "./BoundedSelect";
@@ -8,9 +8,17 @@ import type {
   InferredPaths,
   IrodoriVersion,
   PathValidation,
+  SliceReviewAspectId,
+  SliceReviewSettings,
   VersionPathSettings,
+  VocalSeparatorModelInfo,
 } from "../types";
-import { activePaths } from "../types";
+import {
+  activePaths,
+  DEFAULT_SLICE_REVIEW,
+  DEFAULT_VOCAL_SEPARATOR_MODEL,
+  sliceReviewSettings,
+} from "../types";
 import {
   DEFAULT_EXPORT_FILENAME_PARTS,
   EXPORT_FILENAME_PART_LABELS,
@@ -18,6 +26,30 @@ import {
   normalizeExportFilenameParts,
   previewExportFileName,
 } from "../lib/exportFileName";
+import {
+  DEFAULT_MP3_BITRATE_KBPS,
+  DEFAULT_OPUS_BITRATE_KBPS,
+  EXPORT_AUDIO_FORMAT_LABELS,
+  EXPORT_AUDIO_FORMATS,
+  MP3_BITRATE_OPTIONS,
+  OPUS_BITRATE_OPTIONS,
+  exportAudioExt,
+  normalizeExportAudioFormat,
+  normalizeMp3BitrateKbps,
+  normalizeOpusBitrateKbps,
+} from "../lib/exportAudio";
+import {
+  DARK_ACCENTS,
+  DEFAULT_ACCENT_DARK,
+  DEFAULT_ACCENT_LIGHT,
+  LIGHT_ACCENTS,
+  applyAppearance,
+  darkAccentOf,
+  lightAccentOf,
+  normalizeAccentDark,
+  normalizeAccentLight,
+  type AccentPalette,
+} from "../lib/accent";
 
 type Props = {
   settings: AppSettings;
@@ -52,6 +84,45 @@ function movePart(
   return next;
 }
 
+function AccentSwatchRow({
+  palettes,
+  selectedId,
+  defaultId,
+  groupLabel,
+  disabled,
+  onSelect,
+}: {
+  palettes: AccentPalette[];
+  selectedId: string;
+  defaultId: string;
+  groupLabel: string;
+  disabled: boolean;
+  onSelect: (id: string) => void;
+}) {
+  return (
+    <div className="accent-swatches" role="radiogroup" aria-label={groupLabel}>
+      {palettes.map((p) => {
+        const selected = selectedId === p.id;
+        const name = p.id === defaultId ? `${p.label}（既定）` : p.label;
+        return (
+          <button
+            key={p.id}
+            type="button"
+            role="radio"
+            aria-checked={selected}
+            aria-label={name}
+            className={`accent-swatch${selected ? " is-selected" : ""}`}
+            style={{ "--swatch": p.accent } as CSSProperties}
+            title={name}
+            disabled={disabled}
+            onClick={() => onSelect(p.id)}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
 export function SettingsView({
   settings,
   validation,
@@ -63,16 +134,59 @@ export function SettingsView({
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
   const [resolvedPython, setResolvedPython] = useState<string | null>(null);
+  const [engineCollapsed, setEngineCollapsed] = useState(false);
+  const [pathsCollapsed, setPathsCollapsed] = useState(false);
+  const [playbackCollapsed, setPlaybackCollapsed] = useState(false);
+  const [uiCollapsed, setUiCollapsed] = useState(false);
+  const [vocalModels, setVocalModels] = useState<VocalSeparatorModelInfo[]>([]);
 
   useEffect(() => {
     setDraft(settings);
   }, [settings]);
 
   useEffect(() => {
+    let cancelled = false;
+    void invoke<VocalSeparatorModelInfo[]>("list_vocal_separator_models")
+      .then((list) => {
+        if (!cancelled && Array.isArray(list) && list.length > 0) {
+          setVocalModels(list);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setVocalModels([
+            {
+              arch: "MDXC",
+              name: "BS-Roformer（推奨・既定）",
+              filename: DEFAULT_VOCAL_SEPARATOR_MODEL,
+            },
+          ]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     invoke<string | null>("resolve_python_path")
       .then(setResolvedPython)
       .catch(() => setResolvedPython(null));
   }, [settings, validation, draft.irodoriVersion]);
+
+  useEffect(() => {
+    applyAppearance(draft.theme, draft.accentLight, draft.accentDark);
+    return () => {
+      applyAppearance(settings.theme, settings.accentLight, settings.accentDark);
+    };
+  }, [
+    draft.theme,
+    draft.accentLight,
+    draft.accentDark,
+    settings.theme,
+    settings.accentLight,
+    settings.accentDark,
+  ]);
 
   useEffect(() => {
     if (!firstSetup) return;
@@ -105,8 +219,32 @@ export function SettingsView({
 
   const version = normalizeVersion(draft.irodoriVersion);
   const editingPaths = version === "v4" ? draft.pathsV4 : draft.pathsV3;
-  const pathsDirty = useMemo(
+  const settingsDirty = useMemo(
     () => JSON.stringify(draft) !== JSON.stringify(settings),
+    [draft, settings],
+  );
+  const engineDirty = useMemo(
+    () =>
+      JSON.stringify({
+        irodoriVersion: draft.irodoriVersion,
+        pathsV3: draft.pathsV3,
+        pathsV4: draft.pathsV4,
+        modelPrecision: draft.modelPrecision,
+        codecPrecision: draft.codecPrecision,
+        modelDevice: draft.modelDevice,
+        codecDevice: draft.codecDevice,
+        projectsRoot: draft.projectsRoot,
+      }) !==
+      JSON.stringify({
+        irodoriVersion: settings.irodoriVersion,
+        pathsV3: settings.pathsV3,
+        pathsV4: settings.pathsV4,
+        modelPrecision: settings.modelPrecision,
+        codecPrecision: settings.codecPrecision,
+        modelDevice: settings.modelDevice,
+        codecDevice: settings.codecDevice,
+        projectsRoot: settings.projectsRoot,
+      }),
     [draft, settings],
   );
 
@@ -122,8 +260,23 @@ export function SettingsView({
     [filenameParts],
   );
   const filenamePreview = useMemo(
-    () => previewExportFileName(filenameParts, draft.utteranceMaxChars),
-    [filenameParts, draft.utteranceMaxChars],
+    () =>
+      previewExportFileName(
+        filenameParts,
+        draft.utteranceMaxChars,
+        exportAudioExt(normalizeExportAudioFormat(draft.exportAudioFormat)),
+      ),
+    [filenameParts, draft.utteranceMaxChars, draft.exportAudioFormat],
+  );
+  const filenamePreviewMulti = useMemo(
+    () =>
+      previewExportFileName(
+        filenameParts,
+        draft.utteranceMaxChars,
+        exportAudioExt(normalizeExportAudioFormat(draft.exportAudioFormat)),
+        { variantIndex: 1, variantCount: 2 },
+      ),
+    [filenameParts, draft.utteranceMaxChars, draft.exportAudioFormat],
   );
 
   const setShared = <K extends keyof AppSettings>(
@@ -149,6 +302,13 @@ export function SettingsView({
           exportFilenameParts: normalizeExportFilenameParts(
             next.exportFilenameParts,
           ),
+          exportAudioFormat: normalizeExportAudioFormat(next.exportAudioFormat),
+          exportMp3BitrateKbps: normalizeMp3BitrateKbps(next.exportMp3BitrateKbps),
+          exportOpusBitrateKbps: normalizeOpusBitrateKbps(
+            next.exportOpusBitrateKbps,
+          ),
+          accentLight: normalizeAccentLight(next.accentLight),
+          accentDark: normalizeAccentDark(next.accentDark),
         },
       });
       setDraft(saved);
@@ -262,10 +422,15 @@ export function SettingsView({
 
   return (
     <div className="settings-layout">
-      <section className="panel">
-        <header className="panel-header">
+      <section className={`panel${engineCollapsed ? " collapsed" : ""}`}>
+        <header
+          className="panel-header"
+          onClick={() => setEngineCollapsed((v) => !v)}
+        >
           <h3>エンジン版</h3>
+          <span className="chevron">{engineCollapsed ? "▸" : "▾"}</span>
         </header>
+        {!engineCollapsed && (
         <div className="panel-body form-stack">
           <div className="profile-kind-tabs" role="tablist">
             <button
@@ -299,18 +464,52 @@ export function SettingsView({
               ? "configs/train_v4_small_speaker_inversion.yaml"
               : "configs/train_500m_v3_speaker_inversion.yaml"}
           </p>
-          {pathsDirty && (
+          <label>
+            ボーカル分離モデル（学習前処理）
+            <span className="hint">
+              学習向けに絞った Vocals 用 Roformer（torch）のみ。ONNX / Instrumental
+              専用 / Karaoke・Denoise などは出していません（環境依存や用途が違うため）。
+              既定は BS-Roformer。
+            </span>
+            <BoundedSelect
+              value={
+                draft.vocalSeparatorModel || DEFAULT_VOCAL_SEPARATOR_MODEL
+              }
+              options={(vocalModels.length > 0
+                ? vocalModels
+                : [
+                    {
+                      arch: "MDXC",
+                      name: "BS-Roformer（推奨・既定）",
+                      filename: DEFAULT_VOCAL_SEPARATOR_MODEL,
+                    },
+                  ]
+              ).map((m) => ({
+                value: m.filename,
+                label: m.name || m.filename,
+              }))}
+              disabled={busy}
+              onChange={(v) => setShared("vocalSeparatorModel", v)}
+            />
+          </label>
+          {engineDirty && (
             <p className="hint warn-text">
               パス等に未保存の変更があります。学習前に「保存」してください。
             </p>
           )}
         </div>
+        )}
       </section>
 
-      <section className="panel">
-        <header className="panel-header">
+      <section className={`panel${pathsCollapsed ? " collapsed" : ""}`}>
+        <header
+          className="panel-header"
+          onClick={() => setPathsCollapsed((v) => !v)}
+        >
           <h3>パス設定（{version.toUpperCase()}）</h3>
+          <span className="chevron">{pathsCollapsed ? "▸" : "▾"}</span>
         </header>
+        {!pathsCollapsed && (
         <div className="panel-body form-stack">
           {firstSetup && (
             <p className="hint warn-text">
@@ -321,12 +520,12 @@ export function SettingsView({
             <label key={`${version}-${key}`}>
               {label}
               {key === "irodoriRoot" ? (
-                <span className="hint" style={{ display: "block", margin: "0 0 6px" }}>
+                <span className="hint">
                   Irodori-TTS 本体のフォルダです。選ぶと他のパスを自動推定します。
                 </span>
               ) : null}
               {key === "checkpointPath" ? (
-                <span className="hint" style={{ display: "block", margin: "0 0 6px" }}>
+                <span className="hint">
                   Hugging Face キャッシュ（.cache/huggingface/hub/models--Aratako--…/snapshots/リビジョン/model.safetensors）を優先します。v4 は v4.1 を先に探します。
                 </span>
               ) : null}
@@ -421,7 +620,7 @@ export function SettingsView({
             <button
               type="button"
               className="primary"
-              disabled={busy || !pathsDirty}
+              disabled={busy || !settingsDirty}
               onClick={() => void save()}
             >
               保存
@@ -478,15 +677,96 @@ export function SettingsView({
             アクティブ: {activePaths(draft).irodoriRoot}
           </p>
         </div>
+        )}
       </section>
 
-      <section className="panel">
-        <header className="panel-header">
-          <h3>再生・保存</h3>
+      <section className={`panel${uiCollapsed ? " collapsed" : ""}`}>
+        <header
+          className="panel-header"
+          onClick={() => setUiCollapsed((v) => !v)}
+        >
+          <h3>UI</h3>
+          <span className="chevron">{uiCollapsed ? "▸" : "▾"}</span>
         </header>
+        {!uiCollapsed && (
+        <div className="panel-body form-stack">
+          <p className="hint">
+            ライト／ダークそれぞれの差し色です。いまのモードに選んだ色はすぐ画面に反映されます。保存で確定します。
+          </p>
+          <div className="accent-field">
+            <div className="accent-field-head">
+              <span className="accent-field-label">ライトモードの差し色</span>
+              {draft.theme !== "dark" ? (
+                <span className="pill">表示中</span>
+              ) : null}
+            </div>
+            <AccentSwatchRow
+              palettes={LIGHT_ACCENTS}
+              selectedId={normalizeAccentLight(draft.accentLight)}
+              defaultId={DEFAULT_ACCENT_LIGHT}
+              groupLabel="ライトモードの差し色"
+              disabled={busy}
+              onSelect={(id) => setShared("accentLight", id)}
+            />
+            <p className="hint">
+              選択中: {lightAccentOf(draft.accentLight).label}
+              {normalizeAccentLight(draft.accentLight) === DEFAULT_ACCENT_LIGHT
+                ? "（既定）"
+                : ""}
+            </p>
+          </div>
+          <div className="accent-field">
+            <div className="accent-field-head">
+              <span className="accent-field-label">ダークモードの差し色</span>
+              {draft.theme === "dark" ? (
+                <span className="pill">表示中</span>
+              ) : null}
+            </div>
+            <AccentSwatchRow
+              palettes={DARK_ACCENTS}
+              selectedId={normalizeAccentDark(draft.accentDark)}
+              defaultId={DEFAULT_ACCENT_DARK}
+              groupLabel="ダークモードの差し色"
+              disabled={busy}
+              onSelect={(id) => setShared("accentDark", id)}
+            />
+            <p className="hint">
+              選択中: {darkAccentOf(draft.accentDark).label}
+              {normalizeAccentDark(draft.accentDark) === DEFAULT_ACCENT_DARK
+                ? "（既定）"
+                : ""}
+            </p>
+          </div>
+          <div className="row">
+            <button
+              type="button"
+              className="primary"
+              disabled={busy || !settingsDirty}
+              onClick={() => void save()}
+            >
+              保存
+            </button>
+            <span className="status-text">{msg}</span>
+          </div>
+        </div>
+        )}
+      </section>
+
+      <section className={`panel${playbackCollapsed ? " collapsed" : ""}`}>
+        <header
+          className="panel-header"
+          onClick={() => setPlaybackCollapsed((v) => !v)}
+        >
+          <h3>再生・保存</h3>
+          <span className="chevron">{playbackCollapsed ? "▸" : "▾"}</span>
+        </header>
+        {!playbackCollapsed && (
         <div className="panel-body form-stack">
           <label>
             チャンク間無音（ms）
+            <span className="hint">
+              一括再生の行間無音、および一括保存（連結）モーダルの初期値に使います。
+            </span>
             <input
               type="number"
               min={0}
@@ -500,11 +780,74 @@ export function SettingsView({
               }
             />
           </label>
-          <p className="hint">
-            一括再生の行間無音、および一括保存（連結）モーダルの初期値に使います。
-          </p>
+          <label>
+            出力形式（既定）
+            <span className="hint">
+              行の個別保存と一括保存の初期形式です。保存時にも WAV / MP3 / Opus を選べます。
+            </span>
+            <BoundedSelect
+              value={normalizeExportAudioFormat(draft.exportAudioFormat)}
+              options={EXPORT_AUDIO_FORMATS.map((f) => ({
+                value: f,
+                label: EXPORT_AUDIO_FORMAT_LABELS[f],
+              }))}
+              onChange={(v) =>
+                setShared(
+                  "exportAudioFormat",
+                  normalizeExportAudioFormat(v),
+                )
+              }
+              aria-label="出力形式"
+            />
+          </label>
+          <div className="blend-row">
+            <label>
+              MP3 ビットレート
+              <span className="hint">
+                MP3 で保存するときのビットレートです。WAV は非圧縮のため対象外です。
+              </span>
+              <BoundedSelect
+                value={String(
+                  normalizeMp3BitrateKbps(draft.exportMp3BitrateKbps),
+                )}
+                options={MP3_BITRATE_OPTIONS.map((b) => ({
+                  value: String(b),
+                  label: `${b} kbps`,
+                }))}
+                onChange={(v) =>
+                  setShared("exportMp3BitrateKbps", Number(v) || DEFAULT_MP3_BITRATE_KBPS)
+                }
+                aria-label="MP3 ビットレート"
+              />
+            </label>
+            <label>
+              Opus ビットレート
+              <span className="hint">
+                Opus で保存するときのビットレートです。WAV は非圧縮のため対象外です。
+              </span>
+              <BoundedSelect
+                value={String(
+                  normalizeOpusBitrateKbps(draft.exportOpusBitrateKbps),
+                )}
+                options={OPUS_BITRATE_OPTIONS.map((b) => ({
+                  value: String(b),
+                  label: `${b} kbps`,
+                }))}
+                onChange={(v) =>
+                  setShared(
+                    "exportOpusBitrateKbps",
+                    Number(v) || DEFAULT_OPUS_BITRATE_KBPS,
+                  )
+                }
+                aria-label="Opus ビットレート"
+              />
+            </label>
+          </div>
           <label>
             セリフ文字数上限（ファイル名）
+            <span className="hint">
+              個別エクスポート時のファイル名に含めるセリフ文字数の上限です。
+            </span>
             <input
               type="number"
               min={1}
@@ -518,12 +861,12 @@ export function SettingsView({
               }
             />
           </label>
-          <p className="hint">
-            個別エクスポート時のファイル名に含めるセリフ文字数の上限です。
-          </p>
 
           <div className="filename-parts-field">
             <span className="filename-parts-label">自動ファイル名の並び</span>
+            <p className="hint">
+              要素の順番を並べ替えできます。使わない要素は外して構いませんが、番号だけは必須です。1行に複数の音声があるときは 001-1, 001-2 のように枝番が付きます。
+            </p>
             <ul className="filename-parts-list">
               {filenameParts.map((part, i) => (
                 <li key={part} className="filename-parts-item">
@@ -599,14 +942,16 @@ export function SettingsView({
             ) : null}
             <p className="hint filename-parts-preview">
               例: <code>{filenamePreview}</code>
-            </p>
-            <p className="hint">
-              要素の順番を並べ替えできます。使わない要素は外して構いませんが、番号だけは必須です。
+              <br />
+              複数本の行: <code>{filenamePreviewMulti}</code>
             </p>
           </div>
 
           <label>
             文字起こし検証の CER 警告閾値（0–1）
+            <span className="hint">
+              この値以上の CER で「ずれあり」警告を表示します（既定 0.15）。
+            </span>
             <input
               type="number"
               min={0}
@@ -621,14 +966,19 @@ export function SettingsView({
               }
             />
           </label>
-          <p className="hint">
-            この値以上の CER で「ずれあり」警告を表示します（既定 0.15）。
-          </p>
+
+          <SliceReviewSettingsEditor
+            value={sliceReviewSettings(draft)}
+            onChange={(next) =>
+              setDraft((d) => ({ ...d, sliceReview: next }))
+            }
+          />
+
           <div className="row">
             <button
               type="button"
               className="primary"
-              disabled={busy || !pathsDirty}
+              disabled={busy || !settingsDirty}
               onClick={() => void save()}
             >
               保存
@@ -636,7 +986,192 @@ export function SettingsView({
             <span className="status-text">{msg}</span>
           </div>
         </div>
+        )}
       </section>
+    </div>
+  );
+}
+
+const ASPECT_META: Array<[SliceReviewAspectId, string]> = [
+  ["A", "長さ"],
+  ["B", "発話速度（台本があるとき）"],
+  ["C", "無音比率"],
+  ["D", "音量"],
+  ["F", "話者一貫（MFCC）"],
+  ["G", "スペクトル"],
+  ["H", "非音声"],
+  ["I", "こもり / 響き"],
+];
+
+function SliceReviewSettingsEditor({
+  value,
+  onChange,
+}: {
+  value: SliceReviewSettings;
+  onChange: (v: SliceReviewSettings) => void;
+}) {
+  const th = value.thresholds;
+  const setTh = (key: keyof typeof th, n: number) => {
+    onChange({
+      ...value,
+      thresholds: { ...th, [key]: n },
+    });
+  };
+  return (
+    <div className="form-stack" style={{ marginTop: "0.75rem" }}>
+      <h4 style={{ margin: 0 }}>スライスレビュー</h4>
+      <p className="hint">
+        学習の slice 後・dataset 前の品質チェック。波形の統計だけで判定し、
+        Whisper / ONNX は使いません。各観点はバッチ内の z スコアと IQR
+        外れ値でフラグします。I はこもり（高域不足）に加え、妙に響く・残る音
+        （共鳴・残響）も同じ観点で検知します。auto は観点ヒットに加え、
+        総合スコア上位から指定％を切り、残件数上限まで落とします（0 は無効、上限 90%）。
+      </p>
+      <div
+        className={`train-review-block${value.mode === "auto" ? " is-review-auto" : ""}`}
+      >
+        <label>
+          既定モード{value.mode === "auto" ? " · 自動除外" : ""}
+          <select
+            value={value.mode}
+            onChange={(e) => {
+              const m = e.target.value;
+              onChange({
+                ...value,
+                mode:
+                  m === "skip" || m === "auto" || m === "manual" ? m : "manual",
+              });
+            }}
+          >
+            <option value="manual">manual（人手確認・既定）</option>
+            <option value="auto">auto（総合スコア＋観点で自動除外）</option>
+            <option value="skip">skip（スキップ）</option>
+          </select>
+        </label>
+        {value.mode === "auto" && (
+          <span className="param-altered-hint">
+            確認画面なしで外れ値スライスを自動除外して学習に進みます。
+          </span>
+        )}
+        <div className="slice-review-settings-grid">
+          <label>
+            auto 除去率（総合スコア上位 %）
+            <input
+              type="number"
+              min={0}
+              max={90}
+              step={1}
+              value={value.autoRemovePercent ?? 0}
+              onChange={(e) => {
+                const n = Number(e.target.value);
+                onChange({
+                  ...value,
+                  autoRemovePercent: Number.isFinite(n)
+                    ? Math.min(90, Math.max(0, Math.round(n)))
+                    : 0,
+                });
+              }}
+            />
+          </label>
+          <label>
+            auto 残件数上限（0=無制限）
+            <input
+              type="number"
+              min={0}
+              step={1}
+              value={value.autoKeepMax ?? 0}
+              onChange={(e) => {
+                const n = Number(e.target.value);
+                onChange({
+                  ...value,
+                  autoKeepMax: Number.isFinite(n)
+                    ? Math.max(0, Math.floor(n))
+                    : 0,
+                });
+              }}
+            />
+          </label>
+        </div>
+      </div>
+      <div className="slice-review-aspect-toggles">
+        {ASPECT_META.map(([id, label]) => (
+          <label key={id} className="train-announce-check">
+            <input
+              type="checkbox"
+              checked={value.aspects[id] !== false}
+              onChange={(e) =>
+                onChange({
+                  ...value,
+                  aspects: { ...value.aspects, [id]: e.target.checked },
+                })
+              }
+            />
+            {id}: {label}
+          </label>
+        ))}
+      </div>
+      <div className="slice-review-settings-grid">
+        <label>
+          外れ値 |z|（C/D/F/H/I）
+          <input
+            type="number"
+            step={0.1}
+            value={th.outlierZ ?? DEFAULT_SLICE_REVIEW.thresholds.outlierZ}
+            onChange={(e) => setTh("outlierZ", Number(e.target.value))}
+          />
+        </label>
+        <label>
+          A 長さ |z|
+          <input
+            type="number"
+            step={0.1}
+            value={th.durationZ ?? DEFAULT_SLICE_REVIEW.thresholds.durationZ}
+            onChange={(e) => setTh("durationZ", Number(e.target.value))}
+          />
+        </label>
+        <label>
+          B 速度 |z|
+          <input
+            type="number"
+            step={0.1}
+            value={th.speedZ ?? DEFAULT_SLICE_REVIEW.thresholds.speedZ}
+            onChange={(e) => setTh("speedZ", Number(e.target.value))}
+          />
+        </label>
+        <label>
+          G スペクトル |z|
+          <input
+            type="number"
+            step={0.1}
+            value={th.centroidZ ?? DEFAULT_SLICE_REVIEW.thresholds.centroidZ}
+            onChange={(e) => setTh("centroidZ", Number(e.target.value))}
+          />
+        </label>
+        <label>
+          IQR 倍率
+          <input
+            type="number"
+            step={0.1}
+            value={
+              th.durationIqrMult ?? DEFAULT_SLICE_REVIEW.thresholds.durationIqrMult
+            }
+            onChange={(e) => setTh("durationIqrMult", Number(e.target.value))}
+          />
+        </label>
+      </div>
+      <button
+        type="button"
+        className="chip"
+        onClick={() =>
+          onChange({
+            ...DEFAULT_SLICE_REVIEW,
+            aspects: { ...DEFAULT_SLICE_REVIEW.aspects },
+            thresholds: { ...DEFAULT_SLICE_REVIEW.thresholds },
+          })
+        }
+      >
+        レビュー設定を既定に戻す
+      </button>
     </div>
   );
 }

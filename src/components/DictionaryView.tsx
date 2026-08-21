@@ -2,21 +2,38 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   emptyDictionaries,
+  emitDictionariesChanged,
   newDictId,
   type Dictionaries,
-  type HomographEntry,
+  type ReadingDictEntry,
 } from "../lib/dictionaries";
+import { ANNOTATION_KIND_LABEL, type AnnotationKind } from "../lib/annotations";
 import type { ReplaceEntry } from "../lib/replaceApply";
+
+const READING_KINDS: AnnotationKind[] = ["english", "heteronym", "numeric"];
 
 export function DictionaryView() {
   const [dicts, setDicts] = useState<Dictionaries>(emptyDictionaries());
   const [status, setStatus] = useState("");
   const [saving, setSaving] = useState(false);
+  const [replaceCollapsed, setReplaceCollapsed] = useState(false);
+  const [readingCollapsed, setReadingCollapsed] = useState(false);
 
   const reload = useCallback(async () => {
     try {
       const d = await invoke<Dictionaries>("get_dictionaries");
-      setDicts(d ?? emptyDictionaries());
+      const incoming = d ?? emptyDictionaries();
+      setDicts({
+        ...incoming,
+        replace: incoming.replace ?? [],
+        reading: (incoming.reading ?? []).map((e) => ({
+          ...e,
+          kind: (READING_KINDS.includes(e.kind as AnnotationKind)
+            ? e.kind
+            : "english") as AnnotationKind,
+          reading: e.reading ?? "",
+        })),
+      });
     } catch (e) {
       setStatus(`読込失敗: ${e}`);
     }
@@ -31,9 +48,10 @@ export function DictionaryView() {
     setSaving(true);
     try {
       const saved = await invoke<Dictionaries>("set_dictionaries", {
-        dicts: next,
+        dicts: { ...next, reading: next.reading ?? [], homograph: [] },
       });
       setDicts(saved);
+      emitDictionariesChanged();
       setStatus("保存しました");
     } catch (e) {
       setStatus(`保存失敗: ${e}`);
@@ -53,14 +71,15 @@ export function DictionaryView() {
     void persist({ ...dicts, replace: [...dicts.replace, entry] });
   };
 
-  const addHomograph = () => {
-    const entry: HomographEntry = {
+  const addReading = () => {
+    const entry: ReadingDictEntry = {
       id: newDictId(),
+      kind: "english",
       surface: "",
-      note: "",
+      reading: "",
       enabled: true,
     };
-    void persist({ ...dicts, homograph: [...dicts.homograph, entry] });
+    void persist({ ...dicts, reading: [...(dicts.reading ?? []), entry] });
   };
 
   return (
@@ -70,13 +89,30 @@ export function DictionaryView() {
         <span className="hint">{status}</span>
       </header>
 
-      <section className="panel dict-section">
-        <div className="panel-header">
+      <section
+        className={`panel dict-section${replaceCollapsed ? " collapsed" : ""}`}
+      >
+        <header
+          className="panel-header"
+          onClick={() => setReplaceCollapsed((v) => !v)}
+        >
           <h3>置換辞書</h3>
-          <button type="button" onClick={addReplace} disabled={saving}>
-            追加
-          </button>
-        </div>
+          <div className="panel-header-end">
+            <button
+              type="button"
+              disabled={saving}
+              onClick={(ev) => {
+                ev.stopPropagation();
+                if (replaceCollapsed) setReplaceCollapsed(false);
+                addReplace();
+              }}
+            >
+              追加
+            </button>
+            <span className="chevron">{replaceCollapsed ? "▸" : "▾"}</span>
+          </div>
+        </header>
+        {!replaceCollapsed && (
         <div className="panel-body">
           <p className="hint">
             左のチェックは一括語句置換の対象。右のチェックは入力時の自動置換（既定 OFF）。長い
@@ -173,53 +209,90 @@ export function DictionaryView() {
             ))}
           </ul>
         </div>
+        )}
       </section>
 
-      <section className="panel dict-section">
-        <div className="panel-header">
-          <h3>同形異音辞書</h3>
-          <button type="button" onClick={addHomograph} disabled={saving}>
-            追加
-          </button>
-        </div>
+      <section
+        className={`panel dict-section${readingCollapsed ? " collapsed" : ""}`}
+      >
+        <header
+          className="panel-header"
+          onClick={() => setReadingCollapsed((v) => !v)}
+        >
+          <h3>読み辞書</h3>
+          <div className="panel-header-end">
+            <button
+              type="button"
+              disabled={saving}
+              onClick={(ev) => {
+                ev.stopPropagation();
+                if (readingCollapsed) setReadingCollapsed(false);
+                addReading();
+              }}
+            >
+              追加
+            </button>
+            <span className="chevron">{readingCollapsed ? "▸" : "▾"}</span>
+          </div>
+        </header>
+        {!readingCollapsed && (
         <div className="panel-body">
           <p className="hint">
-            UniDic（書き言葉・話し言葉）から抽出した同形異音辞書を内蔵しています。形態素解析で表層が一致した語を警告表示します。下の一覧は追加のユーザー辞書で、登録した語句も非編集時に「同形異音警告」ハイライトされます（内蔵辞書と併用）。
+            英単語・同形異音・数字の拡張候補です。警告は出たまま、行ごとに読みを選びます（自動確定しません）。辞書にない読みを指定したときだけここに足されます。同形異音の表層追加もここです（内蔵 UniDic と併用）。複数の読みは / で区切ってください。
           </p>
-          {dicts.homograph.length === 0 && (
+          {(dicts.reading ?? []).length === 0 && (
             <p className="hint">（空）</p>
           )}
           <ul className="dict-list">
-            {dicts.homograph.map((e, i) => (
-              <li key={e.id} className="dict-row dict-row-homo">
+            {(dicts.reading ?? []).map((e, i) => (
+              <li key={e.id} className="dict-row dict-row-reading">
                 <label className="dict-check">
                   <input
                     type="checkbox"
                     checked={e.enabled}
                     onChange={(ev) => {
-                      const homograph = [...dicts.homograph];
-                      homograph[i] = { ...e, enabled: ev.target.checked };
-                      void persist({ ...dicts, homograph });
+                      const reading = [...(dicts.reading ?? [])];
+                      reading[i] = { ...e, enabled: ev.target.checked };
+                      void persist({ ...dicts, reading });
                     }}
                   />
                 </label>
+                <select
+                  value={e.kind}
+                  onChange={(ev) => {
+                    const reading = [...(dicts.reading ?? [])];
+                    reading[i] = {
+                      ...e,
+                      kind: ev.target.value as AnnotationKind,
+                    };
+                    setDicts({ ...dicts, reading });
+                  }}
+                  onBlur={() => void persist(dicts)}
+                >
+                  {READING_KINDS.map((k) => (
+                    <option key={k} value={k}>
+                      {ANNOTATION_KIND_LABEL[k]}
+                    </option>
+                  ))}
+                </select>
                 <input
                   value={e.surface}
-                  placeholder="表層（例: 今日）"
+                  placeholder="表層"
                   onChange={(ev) => {
-                    const homograph = [...dicts.homograph];
-                    homograph[i] = { ...e, surface: ev.target.value };
-                    setDicts({ ...dicts, homograph });
+                    const reading = [...(dicts.reading ?? [])];
+                    reading[i] = { ...e, surface: ev.target.value };
+                    setDicts({ ...dicts, reading });
                   }}
                   onBlur={() => void persist(dicts)}
                 />
+                <span className="dict-arrow">→</span>
                 <input
-                  value={e.note ?? ""}
-                  placeholder="メモ（任意）"
+                  value={e.reading}
+                  placeholder="読み（例: きょう/こんにち）"
                   onChange={(ev) => {
-                    const homograph = [...dicts.homograph];
-                    homograph[i] = { ...e, note: ev.target.value };
-                    setDicts({ ...dicts, homograph });
+                    const reading = [...(dicts.reading ?? [])];
+                    reading[i] = { ...e, reading: ev.target.value };
+                    setDicts({ ...dicts, reading });
                   }}
                   onBlur={() => void persist(dicts)}
                 />
@@ -229,7 +302,7 @@ export function DictionaryView() {
                   onClick={() => {
                     void persist({
                       ...dicts,
-                      homograph: dicts.homograph.filter((x) => x.id !== e.id),
+                      reading: (dicts.reading ?? []).filter((x) => x.id !== e.id),
                     });
                   }}
                 >
@@ -239,6 +312,7 @@ export function DictionaryView() {
             ))}
           </ul>
         </div>
+        )}
       </section>
     </div>
   );

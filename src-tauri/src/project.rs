@@ -2,11 +2,17 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+fn default_multi_generate_mode() -> String {
+    "candidates".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SamplingParams {
     pub num_steps: u32,
     pub num_candidates: u32,
+    #[serde(default = "default_multi_generate_mode")]
+    pub multi_generate_mode: String,
     pub seed: Option<i64>,
     pub seconds: Option<f64>,
     pub duration_scale: f64,
@@ -22,6 +28,7 @@ impl Default for SamplingParams {
         Self {
             num_steps: 40,
             num_candidates: 1,
+            multi_generate_mode: default_multi_generate_mode(),
             seed: None,
             seconds: None,
             duration_scale: 1.0,
@@ -36,13 +43,36 @@ impl Default for SamplingParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct LineVariant {
+    pub id: String,
+    pub seed: i64,
+    pub wav_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppliedReading {
+    pub id: String,
+    pub kind: String,
+    pub start: usize,
+    pub end: usize,
+    pub surface: String,
+    pub reading: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectLine {
     pub id: String,
     pub text: String,
+    #[serde(default)]
+    pub readings: Vec<AppliedReading>,
     pub speaker_name: String,
     pub speaker_embed_path: String,
     pub sampling: SamplingParams,
     pub wav_path: Option<String>,
+    #[serde(default)]
+    pub variants: Vec<LineVariant>,
     #[serde(default)]
     pub generated_text: Option<String>,
     #[serde(default)]
@@ -154,4 +184,31 @@ pub fn list_projects(projects_root: &str) -> Result<Vec<String>, String> {
     }
     names.sort();
     Ok(names)
+}
+
+/// Move the on-disk project folder to the OS recycle bin/trash.
+pub fn delete_project(projects_root: &str, name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("プロジェクト名を入力してください".into());
+    }
+
+    let root = Path::new(projects_root);
+    let dir = project_dir(projects_root, name);
+    if !dir.join("project.json").is_file() {
+        return Err("プロジェクトが見つかりません".into());
+    }
+
+    let root_canon = root
+        .canonicalize()
+        .map_err(|e| format!("プロジェクトフォルダの確認に失敗: {e}"))?;
+    let dir_canon = dir
+        .canonicalize()
+        .map_err(|e| format!("プロジェクトフォルダの確認に失敗: {e}"))?;
+    if dir_canon == root_canon || !dir_canon.starts_with(&root_canon) {
+        return Err("プロジェクトのパスが不正です".into());
+    }
+
+    trash::delete(&dir_canon).map_err(|e| format!("削除失敗: {e}"))?;
+    Ok(())
 }

@@ -2,6 +2,7 @@
 
 export type PlaybackSnapshot = {
   lineId: string;
+  variantId: string | null;
   playing: boolean;
   currentTime: number;
   duration: number;
@@ -17,6 +18,7 @@ export class LineAudioPlayer {
   private gain: GainNode | null = null;
   private buffer: AudioBuffer | null = null;
   private lineId: string | null = null;
+  private variantId: string | null = null;
   private startedAt = 0;
   private offset = 0;
   private playing = false;
@@ -38,6 +40,7 @@ export class LineAudioPlayer {
     }
     this.listeners.onChange({
       lineId: this.lineId,
+      variantId: this.variantId,
       playing: this.playing,
       currentTime: this.getCurrentTime(),
       duration: this.buffer.duration,
@@ -177,6 +180,7 @@ export class LineAudioPlayer {
     this.releaseEndedWaiters();
     if (clearLine) {
       this.lineId = null;
+      this.variantId = null;
       this.buffer = null;
       this.gain = null;
       this.listeners.onChange(null);
@@ -185,8 +189,13 @@ export class LineAudioPlayer {
     }
   }
 
-  /** Play decoded PCM at rate 1 (pitch preserved). Speed must be baked into bytes. */
-  async playFromBytes(lineId: string, bytes: Uint8Array, volume: number) {
+  /** Decode into the player without starting playback (for seek-while-paused). */
+  async loadFromBytes(
+    lineId: string,
+    variantId: string | null,
+    bytes: Uint8Array,
+    volume: number,
+  ) {
     this.stop(true);
     const ctx = this.ensureCtx();
     if (ctx.state === "suspended") await ctx.resume();
@@ -196,9 +205,22 @@ export class LineAudioPlayer {
     const audioBuf = await ctx.decodeAudioData(copy.buffer);
 
     this.lineId = lineId;
+    this.variantId = variantId;
     this.buffer = audioBuf;
     this.volume = volume;
     this.offset = 0;
+    this.playing = false;
+    this.emit();
+  }
+
+  /** Play decoded PCM at rate 1 (pitch preserved). Speed must be baked into bytes. */
+  async playFromBytes(
+    lineId: string,
+    variantId: string | null,
+    bytes: Uint8Array,
+    volume: number,
+  ) {
+    await this.loadFromBytes(lineId, variantId, bytes, volume);
     this.startSource();
   }
 
@@ -281,6 +303,14 @@ export class LineAudioPlayer {
 
   get activeLineId() {
     return this.lineId;
+  }
+
+  get activeVariantId() {
+    return this.variantId;
+  }
+
+  isActiveVariant(lineId: string, variantId: string | null) {
+    return this.lineId === lineId && this.variantId === variantId;
   }
 
   get isPlaying() {

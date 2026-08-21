@@ -6,6 +6,7 @@ type Props = {
   disabled?: boolean;
   onApplyAll: () => void;
   onApplyParity: () => void;
+  onApplyFromHere: () => void;
 };
 
 export function SpeakerApplyMenu({
@@ -13,6 +14,7 @@ export function SpeakerApplyMenu({
   disabled,
   onApplyAll,
   onApplyParity,
+  onApplyFromHere,
 }: Props) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -74,6 +76,17 @@ export function SpeakerApplyMenu({
             }}
           >
             {parityLabel}
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={(e) => {
+              e.stopPropagation();
+              setOpen(false);
+              onApplyFromHere();
+            }}
+          >
+            以降の行に適用
           </button>
         </div>
       )}

@@ -14,7 +14,9 @@ use settings::{
     resolve_ffmpeg, resolve_ffprobe, save_settings, studio_python_dir, validate_settings,
     AppSettings, InferredPaths, PathValidation, MISSING_FFMPEG_MSG,
 };
-use speakers::{SpeakerInfo, UpsertSpeakerProfileArgs};
+use speakers::{
+    RenameSpeakerArgs, SpeakerInfo, UpdateSpeakerMetaArgs, UpsertSpeakerProfileArgs,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::AppHandle;
@@ -43,6 +45,17 @@ fn set_settings(
 ) -> Result<AppSettings, String> {
     settings.export_filename_parts =
         settings::normalize_export_filename_parts(settings.export_filename_parts);
+    settings.export_audio_format =
+        settings::normalize_export_audio_format(&settings.export_audio_format);
+    settings.export_mp3_bitrate_kbps =
+        settings::normalize_mp3_bitrate_kbps(settings.export_mp3_bitrate_kbps);
+    settings.export_opus_bitrate_kbps =
+        settings::normalize_opus_bitrate_kbps(settings.export_opus_bitrate_kbps);
+    settings.accent_light = settings::normalize_accent_light(&settings.accent_light);
+    settings.accent_dark = settings::normalize_accent_dark(&settings.accent_dark);
+    if settings.vocal_separator_model.trim().is_empty() {
+        settings.vocal_separator_model = settings::DEFAULT_VOCAL_SEPARATOR_MODEL.into();
+    }
     let prev = state.settings.lock().clone();
     save_settings(&settings)?;
     if prev.engine_identity_changed(&settings) {
@@ -89,8 +102,31 @@ fn upsert_speaker_profile_cmd(
 }
 
 #[tauri::command]
+fn update_speaker_meta_cmd(
+    state: tauri::State<'_, AppState>,
+    args: UpdateSpeakerMetaArgs,
+) -> Result<SpeakerInfo, String> {
+    let settings = state.settings.lock().clone();
+    speakers::update_speaker_meta(settings.outputs_root(), args)
+}
+
+#[tauri::command]
 fn delete_speaker_profile_cmd(profile_path: String) -> Result<(), String> {
     speakers::delete_speaker_profile(&profile_path)
+}
+
+#[tauri::command]
+fn delete_speaker_cmd(embed_path: String, kind: String) -> Result<(), String> {
+    speakers::delete_speaker(&embed_path, &kind)
+}
+
+#[tauri::command]
+fn rename_speaker_cmd(
+    state: tauri::State<'_, AppState>,
+    args: RenameSpeakerArgs,
+) -> Result<SpeakerInfo, String> {
+    let settings = state.settings.lock().clone();
+    speakers::rename_speaker(settings.outputs_root(), args)
 }
 
 #[tauri::command]
@@ -101,7 +137,10 @@ fn start_training(
     speaker_name: String,
     input_mode: Option<String>,
     speed: Option<f64>,
+    vocal_separate: Option<bool>,
+    vocal_model: Option<String>,
     job_dir: Option<String>,
+    review_mode: Option<String>,
 ) -> Result<(), String> {
     let settings = state.settings.lock().clone();
     start_train_job(
@@ -111,9 +150,40 @@ fn start_training(
         speaker_name,
         input_mode.unwrap_or_else(|| "raw".into()),
         speed.unwrap_or(1.0),
+        vocal_separate.unwrap_or(false),
+        vocal_model,
         job_dir,
+        review_mode,
         state.train.clone(),
     )
+}
+
+#[tauri::command]
+fn load_slice_review_metrics_cmd(job_dir: String) -> Result<serde_json::Value, String> {
+    train::load_slice_review_metrics(&job_dir)
+}
+
+#[tauri::command]
+fn load_slice_review_exclusions_cmd(job_dir: String) -> Result<serde_json::Value, String> {
+    train::load_slice_review_exclusions(&job_dir)
+}
+
+#[tauri::command]
+fn load_slice_review_log_cmd(job_dir: String) -> Result<serde_json::Value, String> {
+    train::load_slice_review_log(&job_dir)
+}
+
+#[tauri::command]
+fn save_slice_review_exclusions_cmd(
+    job_dir: String,
+    exclusions: serde_json::Value,
+) -> Result<(), String> {
+    train::save_slice_review_exclusions(&job_dir, exclusions)
+}
+
+#[tauri::command]
+fn complete_slice_review_cmd(job_dir: String) -> Result<(), String> {
+    train::complete_slice_review(&job_dir)
 }
 
 #[tauri::command]
@@ -136,16 +206,114 @@ fn clear_train_resume(state: tauri::State<'_, AppState>) {
     clear_resume_info(&state.train);
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VocalSeparatorModelInfo {
+    arch: String,
+    name: String,
+    filename: String,
+    #[serde(default)]
+    stems: Vec<String>,
+    #[serde(default)]
+    target_stem: Option<String>,
+}
+
+fn default_vocal_model_fallback() -> Vec<VocalSeparatorModelInfo> {
+    vec![VocalSeparatorModelInfo {
+        arch: "MDXC".into(),
+        name: "BS-Roformer（推奨・既定）".into(),
+        filename: settings::DEFAULT_VOCAL_SEPARATOR_MODEL.into(),
+        stems: vec!["Vocals".into(), "Instrumental".into()],
+        target_stem: Some("Vocals".into()),
+    }]
+}
+
+#[tauri::command]
+fn list_vocal_separator_models(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<VocalSeparatorModelInfo>, String> {
+    let settings = state.settings.lock().clone();
+    let python = match resolve_python_exe_from_settings(&settings) {
+        Some(p) => p,
+        None => return Ok(default_vocal_model_fallback()),
+    };
+    crate::python_env::ensure_audio_separator_best_effort(&python);
+
+    let python_dir = match studio_python_dir() {
+        Ok(d) => d,
+        Err(_) => return Ok(default_vocal_model_fallback()),
+    };
+    let script = python_dir.join("vocal_separator.py");
+    if !script.is_file() {
+        return Ok(default_vocal_model_fallback());
+    }
+
+    let mut cmd = std::process::Command::new(&python);
+    cmd.arg("-u")
+        .arg(&script)
+        .arg("--list-models")
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    apply_ffmpeg_env_for_list(&mut cmd, &settings);
+    crate::python_env::hide_console(&mut cmd);
+
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(_) => return Ok(default_vocal_model_fallback()),
+    };
+    if !output.status.success() {
+        return Ok(default_vocal_model_fallback());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with('['))
+        .unwrap_or("");
+    if line.is_empty() {
+        return Ok(default_vocal_model_fallback());
+    }
+    match serde_json::from_str::<Vec<VocalSeparatorModelInfo>>(line) {
+        Ok(list) if !list.is_empty() => Ok(list),
+        _ => Ok(default_vocal_model_fallback()),
+    }
+}
+
+fn resolve_python_exe_from_settings(settings: &AppSettings) -> Option<PathBuf> {
+    settings::resolve_python_exe(settings)
+}
+
+fn apply_ffmpeg_env_for_list(cmd: &mut std::process::Command, settings: &AppSettings) {
+    settings::apply_ffmpeg_env(cmd, settings);
+}
+
 #[tauri::command]
 fn blend_embeddings(
     state: tauri::State<'_, AppState>,
     embed_a: String,
     embed_b: String,
-    alpha: f64,
     output_name: String,
+    embed_c: Option<String>,
+    weight_a: Option<f64>,
+    weight_b: Option<f64>,
+    weight_c: Option<f64>,
+    alpha: Option<f64>,
 ) -> Result<String, String> {
     let settings = state.settings.lock().clone();
-    run_blend(&settings, &embed_a, &embed_b, alpha, &output_name)
+    let (wa, wb, wc) = if let (Some(a), Some(b)) = (weight_a, weight_b) {
+        (a, b, weight_c.unwrap_or(0.0))
+    } else if let Some(al) = alpha {
+        if !(0.0..=1.0).contains(&al) {
+            return Err("alpha は 0〜1 です".into());
+        }
+        (1.0 - al, al, 0.0)
+    } else {
+        return Err("weightA/weightB または alpha が必要です".into());
+    };
+    let c = embed_c.as_deref().filter(|s| !s.is_empty());
+    run_blend(&settings, &embed_a, &embed_b, c, wa, wb, wc, &output_name)
 }
 
 #[tauri::command]
@@ -242,11 +410,17 @@ struct SynthesizeArgs {
     ref_embed: Option<String>,
     #[serde(default)]
     ref_wav: Option<String>,
+    /// Multiple reference WAV paths (v4.1+). Takes precedence over ref_wav when set.
+    #[serde(default)]
+    ref_wavs: Option<Vec<String>>,
     #[serde(default)]
     caption: Option<String>,
     #[serde(default)]
     no_ref: Option<bool>,
     output_wav: String,
+    /// One path per candidate. When set, length should match num_candidates.
+    #[serde(default)]
+    output_wavs: Option<Vec<String>>,
     num_steps: u32,
     num_candidates: u32,
     seed: Option<i64>,
@@ -283,20 +457,34 @@ fn synthesize_line(
         .as_ref()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let ref_wav = args
-        .ref_wav
-        .as_ref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+
+    // ref_wavs (multiple) takes precedence over single ref_wav.
+    let ref_wavs: Option<Vec<String>> = args.ref_wavs.as_ref().map(|v| {
+        v.iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+    }).filter(|v| !v.is_empty());
+    let ref_wav = if ref_wavs.is_none() {
+        args.ref_wav
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+
     let caption = args
         .caption
         .as_ref()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let no_ref = args.no_ref.unwrap_or(false)
-        || (caption.is_some() && ref_embed.is_none() && ref_wav.is_none());
 
-    if ref_embed.is_none() && ref_wav.is_none() && !no_ref {
+    let has_ref = ref_embed.is_some() || ref_wav.is_some() || ref_wavs.is_some();
+    let no_ref = args.no_ref.unwrap_or(false)
+        || (caption.is_some() && !has_ref);
+
+    if !has_ref && !no_ref {
         return Err("話者の埋め込み・参照音源・キャプションのいずれかを指定してください".into());
     }
 
@@ -318,7 +506,11 @@ fn synthesize_line(
     if let Some(ref embed) = ref_embed {
         payload["ref_embed"] = json!(embed);
     }
-    if let Some(ref wav) = ref_wav {
+    if let Some(ref wavs) = ref_wavs {
+        payload["ref_wavs"] = json!(wavs);
+        // Also set ref_wav to first entry for back-compat with older worker versions.
+        payload["ref_wav"] = json!(wavs[0]);
+    } else if let Some(ref wav) = ref_wav {
         payload["ref_wav"] = json!(wav);
     }
     if let Some(ref cap) = caption {
@@ -329,6 +521,17 @@ fn synthesize_line(
     }
     if let Some(seconds) = args.seconds {
         payload["seconds"] = json!(seconds);
+    }
+    let extra_wavs: Vec<String> = args
+        .output_wavs
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !extra_wavs.is_empty() {
+        payload["output_wavs"] = json!(extra_wavs);
+        payload["num_candidates"] = json!(extra_wavs.len() as u32);
     }
 
     let try_once = |w: &mut OptWorkerSimple, p: Value| -> Result<Value, String> {
@@ -397,6 +600,19 @@ fn list_projects_cmd(state: tauri::State<'_, AppState>) -> Result<Vec<String>, S
 }
 
 #[tauri::command]
+fn delete_project_cmd(state: tauri::State<'_, AppState>, name: String) -> Result<(), String> {
+    let settings = state.settings.lock().clone();
+    project::delete_project(&settings.projects_root, &name)?;
+    let cache = studio_cache_dir()
+        .join("gen_cache")
+        .join(project::sanitize_name(&name));
+    if cache.is_dir() {
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn read_file_bytes(path: String) -> Result<Vec<u8>, String> {
     std::fs::read(&path).map_err(|e| e.to_string())
 }
@@ -412,14 +628,36 @@ fn studio_cache_dir() -> PathBuf {
         .join("irodori-studio")
 }
 
+pub fn studio_data_cache_dir() -> PathBuf {
+    studio_cache_dir()
+}
+
 /// Cache path for a line's trial generation (not a permanent export).
 #[tauri::command]
-fn line_cache_wav_path(project_name: String, line_id: String) -> Result<String, String> {
+fn line_cache_wav_path(
+    project_name: String,
+    line_id: String,
+    variant_id: Option<String>,
+) -> Result<String, String> {
     let dir = studio_cache_dir()
         .join("gen_cache")
         .join(project::sanitize_name(&project_name));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    Ok(dir.join(format!("{line_id}.wav")).display().to_string())
+    if let Some(vid) = variant_id.filter(|s| !s.trim().is_empty()) {
+        let variant_dir = dir.join(&line_id);
+        std::fs::create_dir_all(&variant_dir).map_err(|e| e.to_string())?;
+        Ok(variant_dir
+            .join(format!("{vid}.wav"))
+            .display()
+            .to_string())
+    } else {
+        Ok(dir.join(format!("{line_id}.wav")).display().to_string())
+    }
+}
+
+#[tauri::command]
+fn delete_file(path: String) -> Result<(), String> {
+    std::fs::remove_file(&path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -432,19 +670,118 @@ fn copy_file(src: String, dest: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-fn run_ffmpeg_af(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExportAudioFormat {
+    Wav,
+    Mp3,
+    Opus,
+}
+
+impl ExportAudioFormat {
+    fn from_label(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "mp3" => Self::Mp3,
+            "opus" | "ogg" => Self::Opus,
+            _ => Self::Wav,
+        }
+    }
+
+    fn from_dest(dest: &str) -> Option<Self> {
+        let ext = std::path::Path::new(dest)
+            .extension()
+            .and_then(|e| e.to_str())?
+            .to_ascii_lowercase();
+        match ext.as_str() {
+            "wav" => Some(Self::Wav),
+            "mp3" => Some(Self::Mp3),
+            "opus" | "ogg" => Some(Self::Opus),
+            _ => None,
+        }
+    }
+
+    fn ext(self) -> &'static str {
+        match self {
+            Self::Wav => "wav",
+            Self::Mp3 => "mp3",
+            Self::Opus => "opus",
+        }
+    }
+}
+
+fn resolve_export_format(explicit: Option<&str>, dest: &str) -> ExportAudioFormat {
+    if let Some(from_dest) = ExportAudioFormat::from_dest(dest) {
+        return from_dest;
+    }
+    if let Some(s) = explicit {
+        return ExportAudioFormat::from_label(s);
+    }
+    ExportAudioFormat::Wav
+}
+
+fn ensure_audio_ext(dest: &str, format: ExportAudioFormat) -> String {
+    if ExportAudioFormat::from_dest(dest).is_some() {
+        return dest.to_string();
+    }
+    format!("{}.{}", dest.trim_end_matches('.'), format.ext())
+}
+
+fn ffmpeg_codec_args(
+    format: ExportAudioFormat,
+    bitrate_kbps: Option<u32>,
+    settings: &AppSettings,
+) -> Vec<String> {
+    match format {
+        ExportAudioFormat::Wav => Vec::new(),
+        ExportAudioFormat::Mp3 => {
+            let br = settings::normalize_mp3_bitrate_kbps(
+                bitrate_kbps.unwrap_or(settings.export_mp3_bitrate_kbps),
+            );
+            vec![
+                "-c:a".into(),
+                "libmp3lame".into(),
+                "-b:a".into(),
+                format!("{br}k"),
+            ]
+        }
+        ExportAudioFormat::Opus => {
+            let br = settings::normalize_opus_bitrate_kbps(
+                bitrate_kbps.unwrap_or(settings.export_opus_bitrate_kbps),
+            );
+            vec![
+                "-c:a".into(),
+                "libopus".into(),
+                "-b:a".into(),
+                format!("{br}k"),
+                "-application".into(),
+                "audio".into(),
+            ]
+        }
+    }
+}
+
+fn run_ffmpeg_export(
     settings: &AppSettings,
     src: &str,
     dest: &str,
-    filter: &str,
+    af: Option<&str>,
+    codec_args: &[String],
 ) -> Result<(), String> {
     if let Some(parent) = std::path::Path::new(dest).parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let ffmpeg = resolve_ffmpeg(settings).ok_or_else(|| MISSING_FFMPEG_MSG.to_string())?;
     let mut cmd = std::process::Command::new(ffmpeg);
-    cmd.args(["-y", "-i", src, "-af", filter, dest]);
     crate::python_env::hide_console(&mut cmd);
+    cmd.args(["-y", "-i", src]);
+    if let Some(filter) = af {
+        if !filter.is_empty() {
+            cmd.args(["-af", filter]);
+        }
+    }
+    for a in codec_args {
+        cmd.arg(a);
+    }
+    cmd.arg(dest);
     let status = cmd.status().map_err(|e| e.to_string())?;
     if !status.success() {
         return Err(format!("ffmpeg failed: {status}"));
@@ -452,17 +789,29 @@ fn run_ffmpeg_af(
     Ok(())
 }
 
-/// Export WAV applying volume + speed (atempo, pitch-preserving) via ffmpeg.
+fn run_ffmpeg_af(
+    settings: &AppSettings,
+    src: &str,
+    dest: &str,
+    filter: &str,
+) -> Result<(), String> {
+    run_ffmpeg_export(settings, src, dest, Some(filter), &[])
+}
+
+/// Export audio applying volume + speed (atempo, pitch-preserving) via ffmpeg.
 fn export_wav_adjusted_inner(
     settings: &AppSettings,
     src: String,
     dest: String,
     volume: f64,
     speed: f64,
+    format: ExportAudioFormat,
+    bitrate_kbps: Option<u32>,
 ) -> Result<(), String> {
+    let dest = ensure_audio_ext(&dest, format);
     let vol_ok = (volume - 1.0).abs() < 0.001;
     let spd_ok = (speed - 1.0).abs() < 0.001;
-    if vol_ok && spd_ok {
+    if vol_ok && spd_ok && format == ExportAudioFormat::Wav {
         return copy_file(src, dest);
     }
 
@@ -474,7 +823,18 @@ fn export_wav_adjusted_inner(
     if !spd_ok {
         filters.push(format!("atempo={speed}"));
     }
-    run_ffmpeg_af(settings, &src, &dest, &filters.join(","))
+    let af = if filters.is_empty() {
+        None
+    } else {
+        Some(filters.join(","))
+    };
+    run_ffmpeg_export(
+        settings,
+        &src,
+        &dest,
+        af.as_deref(),
+        &ffmpeg_codec_args(format, bitrate_kbps, settings),
+    )
 }
 
 #[tauri::command]
@@ -484,9 +844,12 @@ fn export_wav_adjusted(
     dest: String,
     volume: f64,
     speed: f64,
+    format: Option<String>,
+    bitrate_kbps: Option<u32>,
 ) -> Result<(), String> {
     let settings = state.settings.lock().clone();
-    export_wav_adjusted_inner(&settings, src, dest, volume, speed)
+    let fmt = resolve_export_format(format.as_deref(), &dest);
+    export_wav_adjusted_inner(&settings, src, dest, volume, speed, fmt, bitrate_kbps)
 }
 
 #[derive(serde::Deserialize)]
@@ -497,19 +860,24 @@ struct WavExportSeg {
     speed: f64,
 }
 
-/// Concatenate adjusted WAVs with optional silence between segments.
+/// Concatenate adjusted audio with optional silence between segments.
 #[tauri::command]
 fn export_wavs_concatenated(
     state: tauri::State<'_, AppState>,
     segments: Vec<WavExportSeg>,
     silence_secs: f64,
     dest: String,
+    format: Option<String>,
+    bitrate_kbps: Option<u32>,
 ) -> Result<(), String> {
     if segments.is_empty() {
         return Err("連結する音声がありません".into());
     }
 
     let settings = state.settings.lock().clone();
+    let fmt = resolve_export_format(format.as_deref(), &dest);
+    let dest = ensure_audio_ext(&dest, fmt);
+    let codec_args = ffmpeg_codec_args(fmt, bitrate_kbps, &settings);
 
     let tmp_dir = studio_cache_dir()
         .join("export_batch")
@@ -529,6 +897,8 @@ fn export_wavs_concatenated(
             path.display().to_string(),
             seg.volume,
             seg.speed,
+            ExportAudioFormat::Wav,
+            None,
         ) {
             cleanup(&tmp_dir);
             return Err(e);
@@ -537,7 +907,12 @@ fn export_wavs_concatenated(
     }
 
     if seg_paths.len() == 1 {
-        let result = copy_file(seg_paths[0].display().to_string(), dest);
+        let src = seg_paths[0].display().to_string();
+        let result = if fmt == ExportAudioFormat::Wav {
+            copy_file(src, dest)
+        } else {
+            run_ffmpeg_export(&settings, &src, &dest, None, &codec_args)
+        };
         cleanup(&tmp_dir);
         return result;
     }
@@ -587,7 +962,11 @@ fn export_wavs_concatenated(
     for p in &seg_paths {
         cmd.arg("-i").arg(p);
     }
-    cmd.args(["-filter_complex", &filter, "-map", "[out]", &dest]);
+    cmd.args(["-filter_complex", &filter, "-map", "[out]"]);
+    for a in &codec_args {
+        cmd.arg(a);
+    }
+    cmd.arg(&dest);
 
     let status = match cmd.status() {
         Ok(s) => s,
@@ -644,6 +1023,51 @@ fn set_dictionaries(dicts: dictionary::Dictionaries) -> Result<dictionary::Dicti
     Ok(dicts)
 }
 
+fn homograph_extras(dicts: &dictionary::Dictionaries) -> Vec<asr::HomographExtra> {
+    let mut out: Vec<asr::HomographExtra> = dicts
+        .reading
+        .iter()
+        .filter(|e| e.enabled && e.kind == "heteronym" && !e.surface.is_empty())
+        .map(|e| asr::HomographExtra {
+            surface: e.surface.clone(),
+            note: None,
+            readings: dictionary::split_readings(&e.reading),
+        })
+        .collect();
+    // Pre-migration leftover user homograph rows
+    for e in &dicts.homograph {
+        if !e.enabled || e.surface.is_empty() {
+            continue;
+        }
+        if out.iter().any(|x| x.surface == e.surface) {
+            continue;
+        }
+        out.push(asr::HomographExtra {
+            surface: e.surface.clone(),
+            note: e
+                .note
+                .as_ref()
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty()),
+            readings: dictionary::split_readings(&e.readings),
+        });
+    }
+    out
+}
+
+fn reading_payloads(dicts: &dictionary::Dictionaries) -> Vec<asr::ReadingDictPayload> {
+    dicts
+        .reading
+        .iter()
+        .filter(|e| e.enabled && !e.surface.is_empty())
+        .map(|e| asr::ReadingDictPayload {
+            kind: e.kind.clone(),
+            surface: e.surface.clone(),
+            reading: e.reading.clone(),
+        })
+        .collect()
+}
+
 #[tauri::command]
 fn detect_homographs_cmd(
     state: tauri::State<'_, AppState>,
@@ -651,20 +1075,22 @@ fn detect_homographs_cmd(
 ) -> Result<Vec<asr::HomographHit>, String> {
     let settings = state.settings.lock().clone();
     let dicts = dictionary::load_dictionaries();
-    let extras: Vec<asr::HomographExtra> = dicts
-        .homograph
-        .iter()
-        .filter(|e| e.enabled && !e.surface.is_empty())
-        .map(|e| asr::HomographExtra {
-            surface: e.surface.clone(),
-            note: e
-                .note
-                .as_ref()
-                .map(|n| n.trim().to_string())
-                .filter(|n| !n.is_empty()),
-        })
-        .collect();
-    asr::detect_homographs(&settings, &text, &extras)
+    asr::detect_homographs(&settings, &text, &homograph_extras(&dicts))
+}
+
+#[tauri::command]
+fn detect_annotations_cmd(
+    state: tauri::State<'_, AppState>,
+    text: String,
+) -> Result<Vec<asr::DetectedAnnotation>, String> {
+    let settings = state.settings.lock().clone();
+    let dicts = dictionary::load_dictionaries();
+    asr::detect_annotations(
+        &settings,
+        &text,
+        &homograph_extras(&dicts),
+        &reading_payloads(&dicts),
+    )
 }
 
 #[tauri::command]
@@ -789,12 +1215,21 @@ pub fn run() {
             needs_first_setup_cmd,
             list_speakers,
             upsert_speaker_profile_cmd,
+            update_speaker_meta_cmd,
             delete_speaker_profile_cmd,
+            delete_speaker_cmd,
+            rename_speaker_cmd,
             start_training,
             cancel_training,
             is_training,
             get_train_resume,
             clear_train_resume,
+            load_slice_review_metrics_cmd,
+            load_slice_review_exclusions_cmd,
+            load_slice_review_log_cmd,
+            save_slice_review_exclusions_cmd,
+            complete_slice_review_cmd,
+            list_vocal_separator_models,
             blend_embeddings,
             suggest_katakana,
             ensure_worker,
@@ -807,9 +1242,11 @@ pub fn run() {
             rename_project_cmd,
             load_project_cmd,
             list_projects_cmd,
+            delete_project_cmd,
             read_file_bytes,
             file_exists,
             line_cache_wav_path,
+            delete_file,
             copy_file,
             export_wav_adjusted,
             export_wavs_concatenated,
@@ -818,6 +1255,7 @@ pub fn run() {
             get_dictionaries,
             set_dictionaries,
             detect_homographs_cmd,
+            detect_annotations_cmd,
             verify_line_asr,
             ensure_asr_model_cmd,
             wav_duration_secs,

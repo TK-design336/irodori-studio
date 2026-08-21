@@ -1,5 +1,5 @@
 import type { SamplingParams } from "../types";
-import { defaultSampling } from "../types";
+import { defaultSampling, clampCandidateCount } from "../types";
 import { BoundedSelect } from "./BoundedSelect";
 
 type Props = {
@@ -59,12 +59,12 @@ function SliderField({
             e.preventDefault();
             const d = defaultSampling();
             const map: Record<string, number> = {
-              "Num Steps": d.numSteps,
-              "Num Candidates": d.numCandidates,
-              "Duration Scale": d.durationScale,
-              "Sway Coeff": d.swayCoeff,
-              "CFG Scale Text": d.cfgScaleText,
-              "CFG Scale Speaker": d.cfgScaleSpeaker,
+              ステップ数: d.numSteps,
+              生成数: d.numCandidates,
+              長さ倍率: d.durationScale,
+              Sway係数: d.swayCoeff,
+              テキスト強度: d.cfgScaleText,
+              話者強度: d.cfgScaleSpeaker,
             };
             if (label in map) onChange(map[label]);
           }}
@@ -98,7 +98,7 @@ export function SamplingPanel({
         <div className="panel-body">
           <div className="param-grid">
             <SliderField
-              label="Num Steps"
+              label="ステップ数"
               min={1}
               max={120}
               step={1}
@@ -106,15 +106,44 @@ export function SamplingPanel({
               onChange={(numSteps) => onChange({ ...value, numSteps })}
             />
             <SliderField
-              label="Num Candidates"
+              label="生成数"
               min={1}
-              max={32}
+              max={10}
               step={1}
-              value={value.numCandidates}
-              onChange={(numCandidates) => onChange({ ...value, numCandidates })}
+              value={clampCandidateCount(value.numCandidates)}
+              onChange={(numCandidates) =>
+                onChange({
+                  ...value,
+                  numCandidates: clampCandidateCount(numCandidates),
+                })
+              }
             />
             <label className="param-field">
-              <span className="param-label">Seed (blank=random)</span>
+              <span className="param-label">複数生成方式</span>
+              <BoundedSelect
+                value={
+                  value.multiGenerateMode === "individual"
+                    ? "individual"
+                    : "candidates"
+                }
+                options={[
+                  { value: "candidates", label: "Num Candidate" },
+                  { value: "individual", label: "個別生成" },
+                ]}
+                onChange={(multiGenerateMode) =>
+                  onChange({
+                    ...value,
+                    multiGenerateMode:
+                      multiGenerateMode === "individual"
+                        ? "individual"
+                        : "candidates",
+                  })
+                }
+                aria-label="複数生成方式"
+              />
+            </label>
+            <label className="param-field">
+              <span className="param-label">シード（空欄でランダム）</span>
               <input
                 type="text"
                 value={value.seed ?? ""}
@@ -129,7 +158,7 @@ export function SamplingPanel({
               />
             </label>
             <label className="param-field">
-              <span className="param-label">Seconds (blank=auto)</span>
+              <span className="param-label">長さ（秒・空欄で自動）</span>
               <input
                 type="text"
                 value={value.seconds ?? ""}
@@ -144,7 +173,7 @@ export function SamplingPanel({
               />
             </label>
             <SliderField
-              label="Duration Scale"
+              label="長さ倍率"
               min={0.5}
               max={1.5}
               step={0.01}
@@ -152,21 +181,21 @@ export function SamplingPanel({
               onChange={(durationScale) => onChange({ ...value, durationScale })}
             />
             <label className="param-field">
-              <span className="param-label">Time Schedule</span>
+              <span className="param-label">時間スケジュール</span>
               <BoundedSelect
                 value={value.tScheduleMode}
                 options={[
-                  { value: "linear", label: "linear" },
-                  { value: "sway", label: "sway" },
+                  { value: "linear", label: "線形" },
+                  { value: "sway", label: "Sway" },
                 ]}
                 onChange={(tScheduleMode) =>
                   onChange({ ...value, tScheduleMode })
                 }
-                aria-label="Time Schedule"
+                aria-label="時間スケジュール"
               />
             </label>
             <SliderField
-              label="Sway Coeff"
+              label="Sway係数"
               min={-1}
               max={1.5}
               step={0.01}
@@ -175,22 +204,22 @@ export function SamplingPanel({
               onChange={(swayCoeff) => onChange({ ...value, swayCoeff })}
             />
             <label className="param-field">
-              <span className="param-label">CFG Guidance Mode</span>
+              <span className="param-label">CFG方式</span>
               <BoundedSelect
                 value={value.cfgGuidanceMode}
                 options={[
-                  { value: "independent", label: "independent" },
-                  { value: "joint", label: "joint" },
-                  { value: "alternating", label: "alternating" },
+                  { value: "independent", label: "独立" },
+                  { value: "joint", label: "一括" },
+                  { value: "alternating", label: "交互" },
                 ]}
                 onChange={(cfgGuidanceMode) =>
                   onChange({ ...value, cfgGuidanceMode })
                 }
-                aria-label="CFG Guidance Mode"
+                aria-label="CFG方式"
               />
             </label>
             <SliderField
-              label="CFG Scale Text"
+              label="テキスト強度"
               min={0}
               max={10}
               step={0.1}
@@ -198,7 +227,7 @@ export function SamplingPanel({
               onChange={(cfgScaleText) => onChange({ ...value, cfgScaleText })}
             />
             <SliderField
-              label="CFG Scale Speaker"
+              label="話者強度"
               min={0}
               max={10}
               step={0.1}

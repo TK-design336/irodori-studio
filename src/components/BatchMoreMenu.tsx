@@ -56,7 +56,7 @@ export function BatchMoreMenu({
               onKatakana();
             }}
           >
-            カタカナ提案
+            読み提案
           </button>
           <button
             type="button"

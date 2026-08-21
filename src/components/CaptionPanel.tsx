@@ -42,7 +42,7 @@ export function CaptionPanel({
           </label>
           <label className="param-field">
             <span className="param-label">
-              CFG Scale Caption ({cfgScaleCaption.toFixed(2)})
+              キャプション強度 ({cfgScaleCaption.toFixed(2)})
             </span>
             <div className="param-controls">
               <input

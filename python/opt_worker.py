@@ -6,7 +6,7 @@ Commands:
   {"cmd":"ping"}
   {"cmd":"load","checkpoint":"...","model_device":"cuda","model_precision":"fp32",
    "codec_device":"cuda","codec_precision":"fp32"}
-  {"cmd":"synthesize","text":"...","ref_embed"|"ref_wav"|caption+no_ref,"output_wav":"...", ...}
+  {"cmd":"synthesize","text":"...","ref_embed"|"ref_wav"|caption+no_ref,"output_wav":"...","output_wavs":["..."], ...}
   {"cmd":"unload"}
   {"cmd":"shutdown"}
 """
@@ -224,24 +224,61 @@ def handle_synthesize(req: dict[str, Any]) -> None:
 
     ref_embed_raw = req.get("ref_embed")
     ref_wav_raw = req.get("ref_wav")
+    ref_wavs_raw = req.get("ref_wavs")  # list[str] | None
     caption_raw = req.get("caption")
     ref_embed = str(ref_embed_raw).strip() if ref_embed_raw not in (None, "", "null") else None
-    ref_wav = str(ref_wav_raw).strip() if ref_wav_raw not in (None, "", "null") else None
     caption = str(caption_raw).strip() if caption_raw not in (None, "", "null") else None
+
+    # Build ref_wavs list; prefer explicit ref_wavs, fall back to single ref_wav.
+    ref_wavs: list[str] | None = None
+    if ref_wavs_raw and isinstance(ref_wavs_raw, list):
+        converted = [str(_ensure_sf_readable(p)) for p in ref_wavs_raw if p and str(p).strip()]
+        ref_wavs = converted if converted else None
+    elif ref_wav_raw not in (None, "", "null"):
+        single = str(ref_wav_raw).strip()
+        if single:
+            ref_wavs = [str(_ensure_sf_readable(single))]
+
+    # For back-compat: keep ref_wav as primary (first) entry.
+    ref_wav = ref_wavs[0] if ref_wavs else None
+
     no_ref = bool(req.get("no_ref", False))
     if caption is not None and not ref_embed and not ref_wav:
         no_ref = True
 
-    if ref_wav:
-        ref_wav = str(_ensure_sf_readable(ref_wav))
+    out_paths: list[Path] = []
+    raw_list = req.get("output_wavs")
+    if isinstance(raw_list, list):
+        out_paths = [Path(str(p)) for p in raw_list if p and str(p).strip()]
+    if not out_paths:
+        out_paths = [Path(str(req["output_wav"]))]
+    requested = max(1, int(req.get("num_candidates", 1) or 1))
+    if requested > len(out_paths) and len(out_paths) == 1:
+        base = out_paths[0]
+        suffix = base.suffix or ".wav"
+        out_paths = [base] + [
+            base.with_name(f"{base.stem}_{i:03d}{suffix}")
+            for i in range(2, requested + 1)
+        ]
+    num_candidates = max(1, len(out_paths))
 
-    sampling = SamplingRequest(
+    # Pass ref_wavs to SamplingRequest if supported (v4.1+); fall back gracefully.
+    sr_kwargs: dict[str, Any] = dict(
         text=str(req["text"]),
         caption=caption,
-        ref_wav=ref_wav,
         ref_embed=ref_embed,
         no_ref=no_ref,
-        num_candidates=int(req.get("num_candidates", 1)),
+    )
+    import inspect as _inspect
+    _sr_params = set(_inspect.signature(SamplingRequest).parameters)
+    if "ref_wavs" in _sr_params and ref_wavs:
+        sr_kwargs["ref_wavs"] = ref_wavs
+    elif ref_wav:
+        sr_kwargs["ref_wav"] = ref_wav
+
+    sampling = SamplingRequest(
+        **sr_kwargs,
+        num_candidates=num_candidates,
         seconds=seconds,
         duration_scale=float(req.get("duration_scale", 1.0)),
         num_steps=int(req.get("num_steps", 40)),
@@ -261,13 +298,21 @@ def handle_synthesize(req: dict[str, Any]) -> None:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    out_path = Path(str(req["output_wav"]))
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    saved = save_wav(out_path, result.audio, result.sample_rate)
+    audios = list(getattr(result, "audios", None) or [result.audio])
+    saved_paths: list[str] = []
+    n_save = min(len(audios), len(out_paths))
+    if n_save <= 0:
+        respond(False, error="synthesize produced no audio")
+        return
+    for audio, out_path in zip(audios[:n_save], out_paths[:n_save]):
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        saved_paths.append(str(save_wav(out_path, audio, result.sample_rate)))
+
     respond(
         True,
         status="synthesized",
-        output_wav=str(saved),
+        output_wav=saved_paths[0],
+        output_wavs=saved_paths,
         sample_rate=int(result.sample_rate),
         used_seed=int(result.used_seed),
     )

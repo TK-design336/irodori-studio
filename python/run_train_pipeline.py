@@ -344,6 +344,94 @@ def apply_speed_step(
     return sliced_dir
 
 
+def apply_review_step(
+    *,
+    py: Path,
+    studio_py: Path,
+    irodori: Path,
+    job_dir: Path,
+    sliced_dir: Path,
+    review_mode: str,
+    review_config_json: str,
+    review_model_cache_dir: str,
+    asr_model_dir: str,
+    step: int,
+    total: int,
+) -> bool:
+    """Run slice review. Returns True if pipeline should pause (manual)."""
+    print(f"STEP {step}/{total} review", flush=True)
+    review_dir = job_dir / "slice_review"
+    review_dir.mkdir(parents=True, exist_ok=True)
+    mode = (review_mode or "manual").strip().lower()
+    if mode not in ("skip", "manual", "auto"):
+        mode = "manual"
+
+    if is_done(job_dir, "review"):
+        print("SKIP review (already done)", flush=True)
+        emit_progress(step=step, total=total, name="review", fraction=1.0)
+        return False
+
+    if mode == "skip":
+        print("SKIP review (mode=skip)", flush=True)
+        # Ensure empty exclusions so dataset sees none
+        excl = review_dir / "exclusions.json"
+        if not excl.is_file():
+            excl.write_text("{}\n", encoding="utf-8")
+        log = {
+            "mode": "skip",
+            "excludedCount": 0,
+            "byAspect": {},
+        }
+        (review_dir / "review_log.json").write_text(
+            json.dumps(log, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        emit_progress(step=step, total=total, name="review", fraction=1.0)
+        mark_done(job_dir, "review")
+        return False
+
+    cache = (
+        Path(review_model_cache_dir).resolve()
+        if review_model_cache_dir.strip()
+        else (job_dir / "models")
+    )
+    cache.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        str(py),
+        str(studio_py / "slice_review_metrics.py"),
+        "--sliced-dir",
+        str(sliced_dir),
+        "--out-dir",
+        str(review_dir),
+        "--model-cache-dir",
+        str(cache),
+    ]
+    if review_config_json.strip():
+        cmd.extend(["--config-json", review_config_json.strip()])
+    if asr_model_dir.strip():
+        cmd.extend(["--asr-model-dir", asr_model_dir.strip()])
+    if mode == "auto":
+        cmd.append("--apply-auto")
+
+    run(
+        cmd,
+        cwd=irodori,
+        step=step,
+        total=total,
+        name="review",
+    )
+
+    if mode == "manual":
+        print(f"REVIEW_READY={job_dir}", flush=True)
+        emit_progress(step=step, total=total, name="review", fraction=1.0)
+        return True
+
+    # auto
+    mark_done(job_dir, "review")
+    emit_progress(step=step, total=total, name="review", fraction=1.0)
+    return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Irodori Studio train pipeline")
     parser.add_argument("--irodori-root", required=True)
@@ -379,6 +467,42 @@ def main() -> int:
         type=float,
         default=1.0,
         help="Pitch-preserving playback speed for sliced clips (1.0 = no change)",
+    )
+    parser.add_argument(
+        "--vocal-separate",
+        action="store_true",
+        help="Run UVR vocal separation before slice / prepare (Vocals-only WAV)",
+    )
+    parser.add_argument(
+        "--vocal-model",
+        default="model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+        help="audio-separator model filename",
+    )
+    parser.add_argument(
+        "--separator-model-dir",
+        default="",
+        help="Directory to cache audio-separator model files",
+    )
+    parser.add_argument(
+        "--review-mode",
+        choices=("skip", "manual", "auto"),
+        default="manual",
+        help="Slice review after speed: skip / manual pause / auto exclude",
+    )
+    parser.add_argument(
+        "--review-config-json",
+        default="",
+        help="JSON file with sliceReview aspects + thresholds",
+    )
+    parser.add_argument(
+        "--review-model-cache-dir",
+        default="",
+        help="Cache dir for DNSMOS / silero-vad / WeSpeaker ONNX",
+    )
+    parser.add_argument(
+        "--asr-model-dir",
+        default="",
+        help="faster-whisper model download root",
     )
     args = parser.parse_args()
 
@@ -418,6 +542,7 @@ def main() -> int:
         job_dir.mkdir(parents=True, exist_ok=True)
 
     wav_dir = job_dir / "wav"
+    vocals_dir = job_dir / "vocals"
     sliced_dir = job_dir / "sliced"
     dataset_jsonl = job_dir / "local_dataset.jsonl"
     manifest = job_dir / "train_manifest.jsonl"
@@ -428,36 +553,89 @@ def main() -> int:
         else (irodori / "outputs")
     )
     output_dir = outputs_root / speaker
+    vocal_separate = bool(args.vocal_separate)
+    vocal_model = (args.vocal_model or "").strip() or (
+        "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+    )
+    separator_model_dir = (
+        Path(strip_path_quotes(args.separator_model_dir)).resolve()
+        if args.separator_model_dir.strip()
+        else None
+    )
 
     outputs_root.mkdir(parents=True, exist_ok=True)
     print(f"JOB_DIR={job_dir}", flush=True)
     print(f"OUTPUTS_ROOT={outputs_root}", flush=True)
+    print(f"VOCAL_SEPARATE={'1' if vocal_separate else '0'}", flush=True)
+    if vocal_separate:
+        print(f"VOCAL_MODEL={vocal_model}", flush=True)
+        if separator_model_dir is None:
+            print(
+                "ERROR: --separator-model-dir is required when --vocal-separate",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"SEPARATOR_MODEL_DIR={separator_model_dir}", flush=True)
+
+    def run_separate_vocals(*, step: int, total: int, name: str = "separate_vocals") -> Path:
+        """Separate vocals from input_dir into job vocals/; return that dir."""
+        print(f"STEP {step}/{total} {name}", flush=True)
+        if is_done(job_dir, "separate_vocals") and vocals_dir.is_dir() and any(
+            vocals_dir.glob("*.wav")
+        ):
+            print("SKIP separate_vocals (already done)", flush=True)
+            emit_progress(step=step, total=total, name=name, fraction=1.0)
+            return vocals_dir
+        assert separator_model_dir is not None
+        run(
+            [
+                str(py),
+                str(studio_py / "preprocess_separate_vocals.py"),
+                "--input-dir",
+                str(input_dir),
+                "--output-dir",
+                str(vocals_dir),
+                "--model-name",
+                vocal_model,
+                "--model-file-dir",
+                str(separator_model_dir),
+            ],
+            cwd=irodori,
+            step=step,
+            total=total,
+            name=name,
+        )
+        mark_done(job_dir, "separate_vocals")
+        return vocals_dir
 
     if args.input_mode == "sliced":
-        # prepare → speed → dataset → prepare_manifest → train
-        total = 5
-        # --- 1 prepare sliced ---
-        print("STEP 1/5 prepare sliced audio", flush=True)
-        if is_done(job_dir, "prepare_sliced"):
-            print("SKIP prepare sliced audio (already done)", flush=True)
-            emit_progress(
-                step=1, total=total, name="prepare sliced audio", fraction=1.0
-            )
-            if sliced_dir.is_dir() and any(sliced_dir.glob("*.wav")):
-                pass
-            else:
-                sliced_dir = input_dir
+        # prepare (or separate) → speed → review → dataset → prepare_manifest → train
+        total = 6
+        # --- 1 prepare sliced / separate ---
+        if vocal_separate:
+            sliced_dir = run_separate_vocals(step=1, total=total, name="separate_vocals")
         else:
-            sliced_dir = ensure_sliced_wavs(
-                py=py,
-                studio_py=studio_py,
-                irodori=irodori,
-                input_dir=input_dir,
-                sliced_dir=sliced_dir,
-                step=1,
-                total=total,
-            )
-            mark_done(job_dir, "prepare_sliced")
+            print("STEP 1/6 prepare sliced audio", flush=True)
+            if is_done(job_dir, "prepare_sliced"):
+                print("SKIP prepare sliced audio (already done)", flush=True)
+                emit_progress(
+                    step=1, total=total, name="prepare sliced audio", fraction=1.0
+                )
+                if sliced_dir.is_dir() and any(sliced_dir.glob("*.wav")):
+                    pass
+                else:
+                    sliced_dir = input_dir
+            else:
+                sliced_dir = ensure_sliced_wavs(
+                    py=py,
+                    studio_py=studio_py,
+                    irodori=irodori,
+                    input_dir=input_dir,
+                    sliced_dir=sliced_dir,
+                    step=1,
+                    total=total,
+                )
+                mark_done(job_dir, "prepare_sliced")
 
         # --- 2 speed ---
         sliced_dir = apply_speed_step(
@@ -471,145 +649,22 @@ def main() -> int:
             total=total,
         )
 
-        # --- 3 dataset ---
-        print("STEP 3/5 dataset", flush=True)
-        if is_done(job_dir, "dataset") and dataset_jsonl.is_file():
-            print("SKIP dataset (already done)", flush=True)
-            emit_progress(step=3, total=total, name="dataset", fraction=1.0)
-        else:
-            run(
-                [
-                    str(py),
-                    str(studio_py / "preprocess_dataset.py"),
-                    "--sliced-dir",
-                    str(sliced_dir),
-                    "--output-jsonl",
-                    str(dataset_jsonl),
-                ],
-                cwd=irodori,
-                step=3,
-                total=total,
-                name="dataset",
-            )
-            mark_done(job_dir, "dataset")
-
-        # --- 4 prepare_manifest ---
-        run_prepare_manifest(
-            py=py,
-            studio_py=studio_py,
-            irodori=irodori,
-            job_dir=job_dir,
-            dataset_jsonl=dataset_jsonl,
-            manifest=manifest,
-            latent_dir=latent_dir,
-            device=args.device,
-            step=4,
-            total=total,
-        )
-
-        # --- 5 train ---
-        print("STEP 5/5 train", flush=True)
-        run(
-            [
-                str(py),
-                str(irodori / "train.py"),
-                "--config",
-                args.config,
-                "--init-checkpoint",
-                str(Path(args.init_checkpoint).resolve()),
-                "--manifest",
-                str(manifest),
-                "--output-dir",
-                str(output_dir),
-            ],
-            cwd=irodori,
-            step=5,
-            total=total,
-            name="train",
-        )
-        mark_done(job_dir, "train")
-    else:
-        # to_wav → slice → speed → dataset → prepare_manifest → train
-        total = 6
-        audio_files = list_audio_files(input_dir)
-        all_wav = bool(audio_files) and all(
-            p.suffix.lower() == ".wav" for p in audio_files
-        )
-
-        # --- 1 to_wav ---
-        print("STEP 1/6 to_wav", flush=True)
-        if is_done(job_dir, "to_wav"):
-            print("SKIP to_wav (already done)", flush=True)
-            emit_progress(step=1, total=total, name="to_wav", fraction=1.0)
-            if all_wav or not (wav_dir.is_dir() and any(wav_dir.glob("*.wav"))):
-                if all_wav:
-                    wav_dir = input_dir
-        elif all_wav:
-            wav_dir = input_dir
-            print(
-                f"SKIP to_wav: {len(audio_files)} file(s) already wav → using {wav_dir}",
-                flush=True,
-            )
-            emit_progress(
-                step=1,
-                total=total,
-                name="to_wav",
-                fraction=1.0,
-                detail=f"{len(audio_files)} wav(s)",
-            )
-            mark_done(job_dir, "to_wav")
-        else:
-            run(
-                [
-                    str(py),
-                    str(studio_py / "preprocess_to_wav.py"),
-                    "--input-dir",
-                    str(input_dir),
-                    "--output-dir",
-                    str(wav_dir),
-                ],
-                cwd=irodori,
-                step=1,
-                total=total,
-                name="to_wav",
-            )
-            mark_done(job_dir, "to_wav")
-
-        # --- 2 slice ---
-        print("STEP 2/6 slice", flush=True)
-        if is_done(job_dir, "slice") and sliced_dir.is_dir() and any(
-            sliced_dir.glob("*.wav")
-        ):
-            print("SKIP slice (already done)", flush=True)
-            emit_progress(step=2, total=total, name="slice", fraction=1.0)
-        else:
-            run(
-                [
-                    str(py),
-                    str(studio_py / "preprocess_slice.py"),
-                    "--input-dir",
-                    str(wav_dir),
-                    "--output-dir",
-                    str(sliced_dir),
-                ],
-                cwd=irodori,
-                step=2,
-                total=total,
-                name="slice",
-            )
-            mark_done(job_dir, "slice")
-
-        # --- 3 speed ---
-        sliced_dir = apply_speed_step(
+        # --- 3 review ---
+        pause = apply_review_step(
             py=py,
             studio_py=studio_py,
             irodori=irodori,
             job_dir=job_dir,
             sliced_dir=sliced_dir,
-            speed=speed,
+            review_mode=args.review_mode,
+            review_config_json=args.review_config_json,
+            review_model_cache_dir=args.review_model_cache_dir,
+            asr_model_dir=args.asr_model_dir,
             step=3,
             total=total,
         )
+        if pause:
+            return 0
 
         # --- 4 dataset ---
         print("STEP 4/6 dataset", flush=True)
@@ -617,15 +672,19 @@ def main() -> int:
             print("SKIP dataset (already done)", flush=True)
             emit_progress(step=4, total=total, name="dataset", fraction=1.0)
         else:
+            excl = job_dir / "slice_review" / "exclusions.json"
+            cmd_ds = [
+                str(py),
+                str(studio_py / "preprocess_dataset.py"),
+                "--sliced-dir",
+                str(sliced_dir),
+                "--output-jsonl",
+                str(dataset_jsonl),
+            ]
+            if excl.is_file():
+                cmd_ds.extend(["--exclusions-json", str(excl)])
             run(
-                [
-                    str(py),
-                    str(studio_py / "preprocess_dataset.py"),
-                    "--sliced-dir",
-                    str(sliced_dir),
-                    "--output-jsonl",
-                    str(dataset_jsonl),
-                ],
+                cmd_ds,
                 cwd=irodori,
                 step=4,
                 total=total,
@@ -664,6 +723,170 @@ def main() -> int:
             ],
             cwd=irodori,
             step=6,
+            total=total,
+            name="train",
+        )
+        mark_done(job_dir, "train")
+    else:
+        # (separate | to_wav) → slice → speed → review → dataset → prepare_manifest → train
+        total = 7
+        audio_files = list_audio_files(input_dir)
+        all_wav = bool(audio_files) and all(
+            p.suffix.lower() == ".wav" for p in audio_files
+        )
+
+        # --- 1 separate_vocals or to_wav ---
+        if vocal_separate:
+            wav_dir = run_separate_vocals(step=1, total=total, name="separate_vocals")
+        else:
+            print("STEP 1/7 to_wav", flush=True)
+            if is_done(job_dir, "to_wav"):
+                print("SKIP to_wav (already done)", flush=True)
+                emit_progress(step=1, total=total, name="to_wav", fraction=1.0)
+                if all_wav or not (wav_dir.is_dir() and any(wav_dir.glob("*.wav"))):
+                    if all_wav:
+                        wav_dir = input_dir
+            elif all_wav:
+                wav_dir = input_dir
+                print(
+                    f"SKIP to_wav: {len(audio_files)} file(s) already wav → using {wav_dir}",
+                    flush=True,
+                )
+                emit_progress(
+                    step=1,
+                    total=total,
+                    name="to_wav",
+                    fraction=1.0,
+                    detail=f"{len(audio_files)} wav(s)",
+                )
+                mark_done(job_dir, "to_wav")
+            else:
+                run(
+                    [
+                        str(py),
+                        str(studio_py / "preprocess_to_wav.py"),
+                        "--input-dir",
+                        str(input_dir),
+                        "--output-dir",
+                        str(wav_dir),
+                    ],
+                    cwd=irodori,
+                    step=1,
+                    total=total,
+                    name="to_wav",
+                )
+                mark_done(job_dir, "to_wav")
+
+        # --- 2 slice ---
+        print("STEP 2/7 slice", flush=True)
+        if is_done(job_dir, "slice") and sliced_dir.is_dir() and any(
+            sliced_dir.glob("*.wav")
+        ):
+            print("SKIP slice (already done)", flush=True)
+            emit_progress(step=2, total=total, name="slice", fraction=1.0)
+        else:
+            run(
+                [
+                    str(py),
+                    str(studio_py / "preprocess_slice.py"),
+                    "--input-dir",
+                    str(wav_dir),
+                    "--output-dir",
+                    str(sliced_dir),
+                ],
+                cwd=irodori,
+                step=2,
+                total=total,
+                name="slice",
+            )
+            mark_done(job_dir, "slice")
+
+        # --- 3 speed ---
+        sliced_dir = apply_speed_step(
+            py=py,
+            studio_py=studio_py,
+            irodori=irodori,
+            job_dir=job_dir,
+            sliced_dir=sliced_dir,
+            speed=speed,
+            step=3,
+            total=total,
+        )
+
+        # --- 4 review ---
+        pause = apply_review_step(
+            py=py,
+            studio_py=studio_py,
+            irodori=irodori,
+            job_dir=job_dir,
+            sliced_dir=sliced_dir,
+            review_mode=args.review_mode,
+            review_config_json=args.review_config_json,
+            review_model_cache_dir=args.review_model_cache_dir,
+            asr_model_dir=args.asr_model_dir,
+            step=4,
+            total=total,
+        )
+        if pause:
+            return 0
+
+        # --- 5 dataset ---
+        print("STEP 5/7 dataset", flush=True)
+        if is_done(job_dir, "dataset") and dataset_jsonl.is_file():
+            print("SKIP dataset (already done)", flush=True)
+            emit_progress(step=5, total=total, name="dataset", fraction=1.0)
+        else:
+            excl = job_dir / "slice_review" / "exclusions.json"
+            cmd_ds = [
+                str(py),
+                str(studio_py / "preprocess_dataset.py"),
+                "--sliced-dir",
+                str(sliced_dir),
+                "--output-jsonl",
+                str(dataset_jsonl),
+            ]
+            if excl.is_file():
+                cmd_ds.extend(["--exclusions-json", str(excl)])
+            run(
+                cmd_ds,
+                cwd=irodori,
+                step=5,
+                total=total,
+                name="dataset",
+            )
+            mark_done(job_dir, "dataset")
+
+        # --- 6 prepare_manifest ---
+        run_prepare_manifest(
+            py=py,
+            studio_py=studio_py,
+            irodori=irodori,
+            job_dir=job_dir,
+            dataset_jsonl=dataset_jsonl,
+            manifest=manifest,
+            latent_dir=latent_dir,
+            device=args.device,
+            step=6,
+            total=total,
+        )
+
+        # --- 7 train ---
+        print("STEP 7/7 train", flush=True)
+        run(
+            [
+                str(py),
+                str(irodori / "train.py"),
+                "--config",
+                args.config,
+                "--init-checkpoint",
+                str(Path(args.init_checkpoint).resolve()),
+                "--manifest",
+                str(manifest),
+                "--output-dir",
+                str(output_dir),
+            ],
+            cwd=irodori,
+            step=7,
             total=total,
             name="train",
         )

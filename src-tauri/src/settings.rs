@@ -44,6 +44,12 @@ pub struct AppSettings {
     pub ffmpeg_path: String,
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Light-mode accent palette id (`purple` / `pink` / …).
+    #[serde(default = "default_accent_light")]
+    pub accent_light: String,
+    /// Dark-mode accent palette id (`teal` / `orange` / …).
+    #[serde(default = "default_accent_dark")]
+    pub accent_dark: String,
     /// Silence between chunks on batch play / default for concat export (ms).
     #[serde(default = "default_chunk_silence_ms")]
     pub chunk_silence_ms: u32,
@@ -57,14 +63,238 @@ pub struct AppSettings {
     /// CER above this → ASR warning badge (0–1).
     #[serde(default = "default_asr_cer_warn_threshold")]
     pub asr_cer_warn_threshold: f64,
+    /// Gacha batch size per row (3–9).
+    #[serde(default = "default_gacha_count")]
+    pub gacha_count: u32,
+    /// Default audio format for line / batch export (`wav` / `mp3` / `opus`).
+    #[serde(default = "default_export_audio_format")]
+    pub export_audio_format: String,
+    /// CBR kbps for MP3 export.
+    #[serde(default = "default_export_mp3_bitrate_kbps")]
+    pub export_mp3_bitrate_kbps: u32,
+    /// Target kbps for Opus export.
+    #[serde(default = "default_export_opus_bitrate_kbps")]
+    pub export_opus_bitrate_kbps: u32,
+    /// audio-separator model filename for optional vocal separation preprocess.
+    #[serde(default = "default_vocal_separator_model")]
+    pub vocal_separator_model: String,
+    /// Slice review after speed, before dataset (skip / manual / auto).
+    #[serde(default = "default_slice_review")]
+    pub slice_review: SliceReviewSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SliceReviewSettings {
+    #[serde(default = "default_slice_review_mode")]
+    pub mode: String,
+    #[serde(default = "default_slice_review_aspects")]
+    pub aspects: SliceReviewAspects,
+    #[serde(default = "default_slice_review_thresholds")]
+    pub thresholds: SliceReviewThresholds,
+    /// auto: exclude at least this percent by outlier score (0..=90, 0 = off).
+    #[serde(default)]
+    pub auto_remove_percent: f64,
+    /// auto: keep at most this many slices (0 = no cap).
+    #[serde(default)]
+    pub auto_keep_max: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SliceReviewAspects {
+    #[serde(default = "default_true", rename = "A")]
+    pub a: bool,
+    #[serde(default = "default_true", rename = "B")]
+    pub b: bool,
+    #[serde(default = "default_true", rename = "C")]
+    pub c: bool,
+    #[serde(default = "default_true", rename = "D")]
+    pub d: bool,
+    #[serde(default = "default_false", rename = "E")]
+    pub e: bool,
+    #[serde(default = "default_true", rename = "F")]
+    pub f: bool,
+    #[serde(default = "default_true", rename = "G")]
+    pub g: bool,
+    #[serde(default = "default_true", rename = "H")]
+    pub h: bool,
+    #[serde(default = "default_true", rename = "I")]
+    pub i: bool,
+    #[serde(default = "default_false", rename = "J")]
+    pub j: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default = "default_slice_review_thresholds")]
+pub struct SliceReviewThresholds {
+    #[serde(default = "default_outlier_z")]
+    pub outlier_z: f64,
+    #[serde(default = "default_duration_z")]
+    pub duration_z: f64,
+    #[serde(default = "default_duration_iqr_mult")]
+    pub duration_iqr_mult: f64,
+    #[serde(default = "default_speed_z")]
+    pub speed_z: f64,
+    #[serde(default = "default_centroid_z")]
+    pub centroid_z: f64,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_false() -> bool {
+    false
+}
+fn default_slice_review_mode() -> String {
+    "manual".into()
+}
+fn default_outlier_z() -> f64 {
+    3.0
+}
+fn default_duration_z() -> f64 {
+    3.0
+}
+fn default_duration_iqr_mult() -> f64 {
+    1.5
+}
+fn default_speed_z() -> f64 {
+    3.0
+}
+fn default_centroid_z() -> f64 {
+    3.0
+}
+
+fn default_slice_review_aspects() -> SliceReviewAspects {
+    SliceReviewAspects {
+        a: true,
+        b: true,
+        c: true,
+        d: true,
+        e: false,
+        f: true,
+        g: true,
+        h: true,
+        i: true,
+        j: false,
+    }
+}
+
+fn default_slice_review_thresholds() -> SliceReviewThresholds {
+    SliceReviewThresholds {
+        outlier_z: default_outlier_z(),
+        duration_z: default_duration_z(),
+        duration_iqr_mult: default_duration_iqr_mult(),
+        speed_z: default_speed_z(),
+        centroid_z: default_centroid_z(),
+    }
+}
+
+pub fn default_slice_review() -> SliceReviewSettings {
+    SliceReviewSettings {
+        mode: default_slice_review_mode(),
+        aspects: default_slice_review_aspects(),
+        thresholds: default_slice_review_thresholds(),
+        auto_remove_percent: 0.0,
+        auto_keep_max: 0,
+    }
+}
+
+pub fn normalize_slice_review_mode(v: &str) -> String {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "skip" => "skip".into(),
+        "auto" => "auto".into(),
+        _ => "manual".into(),
+    }
+}
+
+pub const DEFAULT_VOCAL_SEPARATOR_MODEL: &str =
+    "model_bs_roformer_ep_317_sdr_12.9755.ckpt";
+
+fn default_vocal_separator_model() -> String {
+    DEFAULT_VOCAL_SEPARATOR_MODEL.into()
 }
 
 fn default_theme() -> String {
     "light".into()
 }
 
+fn default_accent_light() -> String {
+    "purple".into()
+}
+
+fn default_accent_dark() -> String {
+    "teal".into()
+}
+
+const ACCENT_LIGHT_IDS: &[&str] = &[
+    "purple", "pink", "indigo", "crimson", "teal", "amber", "sky", "forest",
+];
+const ACCENT_DARK_IDS: &[&str] = &[
+    "teal", "orange", "lavender", "gold", "rose", "lime", "sky", "coral",
+];
+
+pub fn normalize_accent_light(v: &str) -> String {
+    if ACCENT_LIGHT_IDS.contains(&v) {
+        v.into()
+    } else {
+        default_accent_light()
+    }
+}
+
+pub fn normalize_accent_dark(v: &str) -> String {
+    if ACCENT_DARK_IDS.contains(&v) {
+        v.into()
+    } else {
+        default_accent_dark()
+    }
+}
+
 fn default_chunk_silence_ms() -> u32 {
     300
+}
+
+fn default_gacha_count() -> u32 {
+    3
+}
+
+fn default_export_audio_format() -> String {
+    "wav".into()
+}
+
+fn default_export_mp3_bitrate_kbps() -> u32 {
+    192
+}
+
+fn default_export_opus_bitrate_kbps() -> u32 {
+    64
+}
+
+const MP3_BITRATES: [u32; 5] = [128, 160, 192, 256, 320];
+const OPUS_BITRATES: [u32; 5] = [32, 48, 64, 96, 128];
+
+fn snap_bitrate(value: u32, allowed: &[u32], fallback: u32) -> u32 {
+    allowed
+        .iter()
+        .copied()
+        .min_by_key(|a| a.abs_diff(value))
+        .unwrap_or(fallback)
+}
+
+pub fn normalize_export_audio_format(v: &str) -> String {
+    match v.to_ascii_lowercase().as_str() {
+        "mp3" => "mp3".into(),
+        "opus" => "opus".into(),
+        _ => "wav".into(),
+    }
+}
+
+pub fn normalize_mp3_bitrate_kbps(v: u32) -> u32 {
+    snap_bitrate(v, &MP3_BITRATES, default_export_mp3_bitrate_kbps())
+}
+
+pub fn normalize_opus_bitrate_kbps(v: u32) -> u32 {
+    snap_bitrate(v, &OPUS_BITRATES, default_export_opus_bitrate_kbps())
 }
 
 fn default_utterance_max_chars() -> u32 {
@@ -430,10 +660,18 @@ impl Default for AppSettings {
                 .to_string(),
             ffmpeg_path: String::new(),
             theme: default_theme(),
+            accent_light: default_accent_light(),
+            accent_dark: default_accent_dark(),
             chunk_silence_ms: default_chunk_silence_ms(),
             utterance_max_chars: default_utterance_max_chars(),
             export_filename_parts: default_export_filename_parts(),
             asr_cer_warn_threshold: default_asr_cer_warn_threshold(),
+            gacha_count: default_gacha_count(),
+            export_audio_format: default_export_audio_format(),
+            export_mp3_bitrate_kbps: default_export_mp3_bitrate_kbps(),
+            export_opus_bitrate_kbps: default_export_opus_bitrate_kbps(),
+            vocal_separator_model: default_vocal_separator_model(),
+            slice_review: default_slice_review(),
         }
     }
 }
@@ -609,6 +847,16 @@ pub fn load_settings() -> AppSettings {
                 if let Some(mut s) = migrate_from_value(value) {
                     s.export_filename_parts =
                         normalize_export_filename_parts(s.export_filename_parts);
+                    s.export_audio_format =
+                        normalize_export_audio_format(&s.export_audio_format);
+                    s.export_mp3_bitrate_kbps =
+                        normalize_mp3_bitrate_kbps(s.export_mp3_bitrate_kbps);
+                    s.export_opus_bitrate_kbps =
+                        normalize_opus_bitrate_kbps(s.export_opus_bitrate_kbps);
+                    s.accent_light = normalize_accent_light(&s.accent_light);
+                    s.accent_dark = normalize_accent_dark(&s.accent_dark);
+                    s.slice_review.mode =
+                        normalize_slice_review_mode(&s.slice_review.mode);
                     if needs_rewrite {
                         let _ = save_settings(&s);
                     }
@@ -931,10 +1179,26 @@ pub fn resolve_ffprobe(settings: &AppSettings) -> Option<PathBuf> {
     None
 }
 
-/// Inject `FFMPEG_BINARY` (absolute bundled path). Does not modify PATH.
+/// Inject `FFMPEG_BINARY` (absolute bundled path) and prepend its parent to PATH
+/// so libraries that look up `ffmpeg` by name (audio-separator / librosa / pydub)
+/// resolve the bundled binary instead of a user PATH install.
 pub fn apply_ffmpeg_env(cmd: &mut std::process::Command, settings: &AppSettings) {
     let Some(ff) = resolve_ffmpeg(settings) else {
         return;
     };
     cmd.env("FFMPEG_BINARY", &ff);
+    let Some(parent) = ff.parent() else {
+        return;
+    };
+    let parent_buf = parent.to_path_buf();
+    let old = std::env::var_os("PATH").unwrap_or_default();
+    let mut entries = vec![parent_buf.clone()];
+    for part in std::env::split_paths(&old) {
+        if part != parent_buf {
+            entries.push(part);
+        }
+    }
+    if let Ok(combined) = std::env::join_paths(entries) {
+        cmd.env("PATH", combined);
+    }
 }

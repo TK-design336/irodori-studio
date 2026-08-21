@@ -1,24 +1,29 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { BoundedSelect } from "./BoundedSelect";
-import type { AppSettings, SpeakerInfo } from "../types";
+import { SliceReviewView } from "./SliceReviewView";
+import type {
+  AppSettings,
+  SliceReviewMode,
+  SliceReviewSettings,
+  VocalSeparatorModelInfo,
+} from "../types";
 import {
   activePaths,
   defaultSampling,
+  DEFAULT_VOCAL_SEPARATOR_MODEL,
   isIrodoriV4,
-  speakerOptionLabel,
+  sliceReviewSettings,
 } from "../types";
 
 type Props = {
-  speakers: SpeakerInfo[];
   settings: AppSettings;
   onSpeakersChanged: () => void;
   onRunningChange?: (running: boolean) => void;
+  onSettingsChange?: (s: AppSettings) => void;
 };
-
-type ProfileKind = "ref" | "caption";
 
 type TrainInputMode = "raw" | "sliced";
 
@@ -36,9 +41,67 @@ type TrainResumeInfo = {
   inputMode: string;
   jobDir: string;
   speed?: number;
+  vocalSeparate?: boolean;
+  vocalModel?: string;
+  reviewMode?: string;
+  pausedForReview?: boolean;
 };
 
 const ANNOUNCE_STORAGE_KEY = "irodori.trainAnnounceDone";
+const VOCAL_SEP_STORAGE_KEY = "irodori.trainVocalSeparate";
+
+function playReviewReadyChime() {
+  try {
+    const Ctx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext })
+        .webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    const now = ctx.currentTime;
+    const master = ctx.createGain();
+    master.gain.setValueAtTime(0.9, now);
+    master.connect(ctx.destination);
+
+    const tone = (
+      freq: number,
+      start: number,
+      dur: number,
+      peak: number,
+      type: OscillatorType = "triangle",
+    ) => {
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, start);
+      g.gain.setValueAtTime(0.0001, start);
+      g.gain.exponentialRampToValueAtTime(peak, start + 0.012);
+      g.gain.exponentialRampToValueAtTime(peak * 0.72, start + dur * 0.4);
+      g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+      osc.connect(g);
+      g.connect(master);
+      osc.start(start);
+      osc.stop(start + dur + 0.04);
+    };
+
+    const ding = (start: number) => {
+      tone(880, start, 0.18, 0.42, "square");
+      tone(1760, start, 0.18, 0.16, "sine");
+      tone(880, start + 0.22, 0.18, 0.42, "square");
+      tone(1760, start + 0.22, 0.18, 0.16, "sine");
+      tone(1319, start + 0.46, 0.38, 0.5, "square");
+      tone(2638, start + 0.46, 0.38, 0.18, "sine");
+    };
+    ding(now);
+    ding(now + 1.05);
+
+    window.setTimeout(() => {
+      void ctx.close();
+    }, 2800);
+  } catch {
+    /* ignore */
+  }
+}
 const DONE_ANNOUNCE_TEXT = "学習終了しました。この音声で問題ないですか？";
 
 function formatEta(seconds: number): string {
@@ -241,11 +304,72 @@ function TrainProgressBars({
   );
 }
 
+function folderBaseName(path: string): string {
+  const s = path.replace(/[\\/]+$/, "").trim();
+  if (!s) return "";
+  const i = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+  return (i >= 0 ? s.slice(i + 1) : s).trim();
+}
+
+function TrainInputModeTabs({
+  inputMode,
+  disabled,
+  onChange,
+}: {
+  inputMode: TrainInputMode;
+  disabled?: boolean;
+  onChange: (mode: TrainInputMode) => void;
+}) {
+  return (
+    <div className="train-input-mode" role="tablist" aria-label="学習の入力元">
+      <span className="train-input-mode-heading">入力元</span>
+      <div className="train-input-mode-row">
+        <button
+          type="button"
+          role="tab"
+          className={`train-input-mode-btn${inputMode === "raw" ? " active" : ""}`}
+          aria-selected={inputMode === "raw"}
+          disabled={disabled}
+          onClick={() => onChange("raw")}
+        >
+          <span className="train-input-mode-title">
+            元音声・動画から
+            {inputMode === "raw" ? (
+              <span className="train-input-mode-badge">選択中</span>
+            ) : null}
+          </span>
+          <span className="train-input-mode-desc">
+            未分割の mp3 / mp4 / wav を自動で切ってから学習
+          </span>
+        </button>
+        <button
+          type="button"
+          role="tab"
+          className={`train-input-mode-btn${inputMode === "sliced" ? " active" : ""}`}
+          aria-selected={inputMode === "sliced"}
+          disabled={disabled}
+          onClick={() => onChange("sliced")}
+        >
+          <span className="train-input-mode-title">
+            スライス済みから
+            {inputMode === "sliced" ? (
+              <span className="train-input-mode-badge">選択中</span>
+            ) : null}
+          </span>
+          <span className="train-input-mode-desc">
+            すでに分割した wav クリップをそのまま学習
+          </span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function TrainView({
-  speakers,
   settings,
   onSpeakersChanged,
   onRunningChange,
+  onSettingsChange,
 }: Props) {
   const engineLabel = isIrodoriV4(settings) ? "v4" : "v3";
   const paths = activePaths(settings);
@@ -266,8 +390,26 @@ export function TrainView({
       return true;
     }
   });
+  const [vocalSeparate, setVocalSeparate] = useState(() => {
+    try {
+      return localStorage.getItem(VOCAL_SEP_STORAGE_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const [vocalModel, setVocalModel] = useState(
+    () => settings.vocalSeparatorModel || DEFAULT_VOCAL_SEPARATOR_MODEL,
+  );
+  const [vocalModels, setVocalModels] = useState<VocalSeparatorModelInfo[]>([]);
+  const [confirmOpen, setConfirmOpen] = useState(false);
   const [announcing, setAnnouncing] = useState(false);
+  const [reviewMode, setReviewMode] = useState<SliceReviewMode>(() =>
+    sliceReviewSettings(settings).mode,
+  );
+  const [reviewJobDir, setReviewJobDir] = useState<string | null>(null);
+  const [reviewReadOnly, setReviewReadOnly] = useState(false);
   const logRef = useRef<HTMLPreElement>(null);
+  const layoutRef = useRef<HTMLDivElement>(null);
   const announceDoneRef = useRef(announceDone);
   announceDoneRef.current = announceDone;
   const announceAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -275,31 +417,53 @@ export function TrainView({
     ((embedPath: string) => Promise<void>) | null
   >(null);
 
-  // Blend state
-  const [embedA, setEmbedA] = useState("");
-  const [embedB, setEmbedB] = useState("");
-  const [alpha, setAlpha] = useState(0.5);
-  const [blendName, setBlendName] = useState("");
-  const [blendMsg, setBlendMsg] = useState("");
+  useEffect(() => {
+    setVocalModel(
+      settings.vocalSeparatorModel || DEFAULT_VOCAL_SEPARATOR_MODEL,
+    );
+  }, [settings.vocalSeparatorModel]);
 
-  // Ref / caption profile editor
-  const [profileEditPath, setProfileEditPath] = useState<string | null>(null);
-  const [profileKind, setProfileKind] = useState<ProfileKind>("ref");
-  const [profileName, setProfileName] = useState("");
-  const [profileRefWav, setProfileRefWav] = useState("");
-  const [profileCaption, setProfileCaption] = useState("");
-  const [profileMsg, setProfileMsg] = useState("");
-  const [profileBusy, setProfileBusy] = useState(false);
+  useEffect(() => {
+    setReviewMode(sliceReviewSettings(settings).mode);
+  }, [settings.sliceReview]);
 
-  const profileSpeakers = useMemo(
-    () => speakers.filter((s) => s.kind === "ref" || s.kind === "caption"),
-    [speakers],
-  );
+  useEffect(() => {
+    if (!reviewJobDir || reviewReadOnly) return;
+    playReviewReadyChime();
+    const scrollTop = () => {
+      layoutRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+      document
+        .getElementById("slice-review-panel")
+        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+    };
+    scrollTop();
+    const t = window.setTimeout(scrollTop, 50);
+    return () => window.clearTimeout(t);
+  }, [reviewJobDir, reviewReadOnly]);
 
-  const embedSpeakers = useMemo(
-    () => speakers.filter((s) => s.kind === "trained" || s.kind === "blend"),
-    [speakers],
-  );
+  useEffect(() => {
+    let cancelled = false;
+    void invoke<VocalSeparatorModelInfo[]>("list_vocal_separator_models")
+      .then((list) => {
+        if (!cancelled && Array.isArray(list) && list.length > 0) {
+          setVocalModels(list);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+                      setVocalModels([
+                        {
+                          arch: "MDXC",
+                          name: "BS-Roformer（推奨・既定）",
+                          filename: DEFAULT_VOCAL_SEPARATOR_MODEL,
+                        },
+                      ]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     onRunningChange?.(running);
@@ -333,6 +497,8 @@ export function TrainView({
         message: string;
         embedPath?: string;
         cancelled?: boolean;
+        pausedForReview?: boolean;
+        jobDir?: string | null;
       }>("train-done", (e) => {
         setRunning(false);
         setCancelling(false);
@@ -341,18 +507,39 @@ export function TrainView({
           void invoke<TrainResumeInfo | null>("get_train_resume")
             .then((info) => setResumeInfo(info))
             .catch(() => setResumeInfo(null));
+        } else if (e.payload.pausedForReview) {
+          const jd = e.payload.jobDir || "";
+          setStatus("スライスレビュー待ち");
+          setReviewReadOnly(false);
+          setReviewJobDir(jd);
+          void invoke<TrainResumeInfo | null>("get_train_resume")
+            .then((info) => setResumeInfo(info))
+            .catch(() =>
+              setResumeInfo(
+                jd
+                  ? {
+                      inputDir: "",
+                      speakerName: "",
+                      inputMode: "raw",
+                      jobDir: jd,
+                      pausedForReview: true,
+                    }
+                  : null,
+              ),
+            );
         } else if (e.payload.ok) {
           setStatus(`完了: ${e.payload.embedPath ?? e.payload.message}`);
           setProgress((prev) =>
             prev ? { ...prev, fraction: 1, detail: "完了" } : prev,
           );
           setResumeInfo(null);
+          setReviewJobDir(null);
           onSpeakersChanged();
           if (announceDoneRef.current && e.payload.embedPath) {
             void playDoneAnnounceRef.current?.(e.payload.embedPath);
           }
         } else {
-          setStatus(`失敗: ${e.payload.message}`);
+          setStatus(e.payload.message);
           void invoke<TrainResumeInfo | null>("get_train_resume")
             .then((info) => setResumeInfo(info))
             .catch(() => setResumeInfo(null));
@@ -378,7 +565,13 @@ export function TrainView({
 
     invoke<TrainResumeInfo | null>("get_train_resume")
       .then((info) => {
-        if (info) setResumeInfo(info);
+        if (info) {
+          setResumeInfo(info);
+          if (info.pausedForReview && info.jobDir) {
+            setReviewReadOnly(false);
+            setReviewJobDir(info.jobDir);
+          }
+        }
       })
       .catch(() => {});
 
@@ -394,24 +587,6 @@ export function TrainView({
     }
   }, [logs]);
 
-  const pickFolder = async () => {
-    const selected = await open({ directory: true, multiple: false });
-    if (typeof selected === "string") setInputDir(selected);
-  };
-
-  const pickRefWav = async () => {
-    const selected = await open({
-      multiple: false,
-      filters: [
-        {
-          name: "Audio",
-          extensions: ["wav", "mp3", "flac", "ogg", "m4a", "aac"],
-        },
-      ],
-    });
-    if (typeof selected === "string") setProfileRefWav(selected);
-  };
-
   /** コピー＆ペーストで付く前後の " / ' を除去 */
   const stripPathQuotes = (raw: string): string => {
     let s = raw.trim();
@@ -423,6 +598,23 @@ export function TrainView({
       if (s.endsWith("'")) s = s.slice(0, -1);
     }
     return s.trim();
+  };
+
+  const applyInputDir = (nextRaw: string) => {
+    const next = stripPathQuotes(nextRaw);
+    const prevBase = folderBaseName(inputDir);
+    const nextBase = folderBaseName(next);
+    setInputDir(next);
+    setSpeakerName((cur) => {
+      const t = cur.trim();
+      if (!t || t === prevBase) return nextBase || t;
+      return cur;
+    });
+  };
+
+  const pickFolder = async () => {
+    const selected = await open({ directory: true, multiple: false });
+    if (typeof selected === "string") applyInputDir(selected);
   };
 
   const playDoneAnnounce = useCallback(
@@ -501,6 +693,45 @@ export function TrainView({
     }
   };
 
+  const setVocalSeparatePersist = (on: boolean) => {
+    setVocalSeparate(on);
+    try {
+      localStorage.setItem(VOCAL_SEP_STORAGE_KEY, on ? "1" : "0");
+    } catch {
+      /* */
+    }
+  };
+
+  const persistVocalModel = async (filename: string) => {
+    setVocalModel(filename);
+    if (filename === (settings.vocalSeparatorModel || DEFAULT_VOCAL_SEPARATOR_MODEL)) {
+      return;
+    }
+    try {
+      const next = await invoke<AppSettings>("set_settings", {
+        settings: { ...settings, vocalSeparatorModel: filename },
+      });
+      onSettingsChange?.(next);
+    } catch {
+      /* keep local selection */
+    }
+  };
+
+  const persistSliceReview = async (patch: Partial<SliceReviewSettings>) => {
+    const cur = sliceReviewSettings(settings);
+    try {
+      const next = await invoke<AppSettings>("set_settings", {
+        settings: {
+          ...settings,
+          sliceReview: { ...cur, ...patch },
+        },
+      });
+      onSettingsChange?.(next);
+    } catch {
+      /* */
+    }
+  };
+
   const startJob = async (opts?: { resume?: TrainResumeInfo }) => {
     const resume = opts?.resume;
     const folder = stripPathQuotes(resume?.inputDir ?? inputDir);
@@ -514,6 +745,12 @@ export function TrainView({
       2,
       Math.max(0.5, Number.isFinite(speedRaw) ? speedRaw : 1),
     );
+    const doVocal = resume
+      ? Boolean(resume.vocalSeparate)
+      : vocalSeparate;
+    const model =
+      (resume?.vocalModel || vocalModel || DEFAULT_VOCAL_SEPARATOR_MODEL).trim() ||
+      DEFAULT_VOCAL_SEPARATOR_MODEL;
     if (!resume) {
       if (folder !== inputDir) setInputDir(folder);
     } else {
@@ -521,6 +758,8 @@ export function TrainView({
       setSpeakerName(name);
       setInputMode(mode);
       setTrainSpeed(speed);
+      setVocalSeparatePersist(doVocal);
+      setVocalModel(model);
     }
     if (!folder || !name) {
       setStatus("音声フォルダと話者名を入力してください");
@@ -532,6 +771,7 @@ export function TrainView({
     setRunning(true);
     setCancelling(false);
     setResumeInfo(null);
+    setConfirmOpen(false);
     setStatus(
       resume ? "学習パイプラインを再開中…" : "学習パイプライン実行中…",
     );
@@ -541,7 +781,10 @@ export function TrainView({
         speakerName: name,
         inputMode: mode,
         speed,
+        vocalSeparate: doVocal,
+        vocalModel: model,
         jobDir: resume?.jobDir || null,
+        reviewMode: (resume?.reviewMode as SliceReviewMode) || reviewMode,
       });
     } catch (e) {
       setRunning(false);
@@ -550,7 +793,14 @@ export function TrainView({
   };
 
   const start = () => {
-    void startJob();
+    const folder = stripPathQuotes(inputDir);
+    const name = speakerName.trim();
+    if (!folder || !name) {
+      setStatus("音声フォルダと話者名を入力してください");
+      return;
+    }
+    if (folder !== inputDir) setInputDir(folder);
+    setConfirmOpen(true);
   };
 
   const cancel = async () => {
@@ -583,111 +833,65 @@ export function TrainView({
     setResumeInfo(null);
   };
 
-  const nameA = embedSpeakers.find((s) => s.embedPath === embedA)?.name ?? "A";
-  const nameB = embedSpeakers.find((s) => s.embedPath === embedB)?.name ?? "B";
-
-  const speakerOptions = useMemo(
-    () => [
-      { value: "", label: "選択…" },
-      ...embedSpeakers.map((s) => ({
-        value: s.embedPath,
-        label: speakerOptionLabel(s),
-      })),
-    ],
-    [embedSpeakers],
-  );
-
-  const doBlend = async () => {
-    if (!embedA || !embedB) {
-      setBlendMsg("2つの埋め込みを選択してください");
-      return;
+  const modelOptions = (() => {
+    const base = (
+      vocalModels.length > 0
+        ? vocalModels
+        : [
+            {
+              arch: "MDXC",
+              name: "BS-Roformer（推奨・既定）",
+              filename: DEFAULT_VOCAL_SEPARATOR_MODEL,
+            },
+          ]
+    ).map((m) => ({
+      value: m.filename,
+      label: m.name || m.filename,
+    }));
+    if (!base.some((o) => o.value === vocalModel)) {
+      return [{ value: vocalModel, label: `${vocalModel}（非推奨・旧設定）` }, ...base];
     }
-    const name =
-      blendName.trim() || `${nameA}_${nameB}_${Math.round(alpha * 100)}`;
-    try {
-      const out = await invoke<string>("blend_embeddings", {
-        embedA,
-        embedB,
-        alpha,
-        outputName: name,
-      });
-      setBlendMsg(`保存: ${out}`);
-      onSpeakersChanged();
-    } catch (e) {
-      setBlendMsg(String(e));
-    }
-  };
+    return base;
+  })();
 
-  const resetProfileForm = () => {
-    setProfileEditPath(null);
-    setProfileKind("ref");
-    setProfileName("");
-    setProfileRefWav("");
-    setProfileCaption("");
-    setProfileMsg("");
-  };
-
-  const beginEditProfile = (sp: SpeakerInfo) => {
-    setProfileEditPath(sp.embedPath);
-    setProfileKind(sp.kind === "caption" ? "caption" : "ref");
-    setProfileName(sp.name);
-    setProfileRefWav(sp.refWav ?? "");
-    setProfileCaption(sp.caption ?? "");
-    setProfileMsg(`編集中: ${sp.name}`);
-  };
-
-  const saveProfile = async () => {
-    const name = profileName.trim();
-    if (!name) {
-      setProfileMsg("話者名を入力してください");
-      return;
-    }
-    setProfileBusy(true);
-    setProfileMsg("");
-    try {
-      const saved = await invoke<SpeakerInfo>("upsert_speaker_profile_cmd", {
-        args: {
-          profilePath: profileEditPath,
-          name,
-          kind: profileKind,
-          refWav:
-            profileKind === "ref" ? stripPathQuotes(profileRefWav) : null,
-          caption: profileKind === "caption" ? profileCaption.trim() : null,
-        },
-      });
-      setProfileMsg(
-        profileEditPath
-          ? `更新しました: ${saved.name}`
-          : `作成しました: ${saved.name}`,
-      );
-      setProfileEditPath(saved.embedPath);
-      onSpeakersChanged();
-    } catch (e) {
-      setProfileMsg(String(e));
-    } finally {
-      setProfileBusy(false);
-    }
-  };
-
-  const deleteProfile = async (sp: SpeakerInfo) => {
-    if (!window.confirm(`話者「${sp.name}」を削除しますか？`)) return;
-    setProfileBusy(true);
-    try {
-      await invoke("delete_speaker_profile_cmd", {
-        profilePath: sp.embedPath,
-      });
-      if (profileEditPath === sp.embedPath) resetProfileForm();
-      setProfileMsg(`削除しました: ${sp.name}`);
-      onSpeakersChanged();
-    } catch (e) {
-      setProfileMsg(String(e));
-    } finally {
-      setProfileBusy(false);
-    }
-  };
+  const speedAltered = Math.abs(trainSpeed - 1) >= 0.001;
 
   return (
-    <div className="train-layout">
+    <div className="train-layout" ref={layoutRef}>
+      {reviewJobDir ? (
+        <SliceReviewView
+          jobDir={reviewJobDir}
+          readOnly={reviewReadOnly}
+          onCancel={() => setReviewJobDir(null)}
+          onContinue={() => {
+            const jd = reviewJobDir;
+            setReviewJobDir(null);
+            if (!resumeInfo && jd) {
+              void startJob({
+                resume: {
+                  inputDir,
+                  speakerName,
+                  inputMode,
+                  jobDir: jd,
+                  speed: trainSpeed,
+                  vocalSeparate,
+                  vocalModel,
+                  reviewMode,
+                },
+              });
+            } else if (resumeInfo) {
+              void startJob({
+                resume: {
+                  ...resumeInfo,
+                  jobDir: jd || resumeInfo.jobDir,
+                  reviewMode: resumeInfo.reviewMode || reviewMode,
+                  pausedForReview: false,
+                },
+              });
+            }
+          }}
+        />
+      ) : null}
       <section className="panel">
         <header className="panel-header">
           <h3>Speaker Embedding 学習</h3>
@@ -698,28 +902,11 @@ export function TrainView({
             {" — "}
             <span title={paths.checkpointPath}>{paths.irodoriRoot}</span>
           </p>
-          <div className="profile-kind-tabs" role="tablist">
-            <button
-              type="button"
-              role="tab"
-              className={inputMode === "raw" ? "active" : ""}
-              aria-selected={inputMode === "raw"}
-              disabled={running}
-              onClick={() => setInputMode("raw")}
-            >
-              元音声・動画から
-            </button>
-            <button
-              type="button"
-              role="tab"
-              className={inputMode === "sliced" ? "active" : ""}
-              aria-selected={inputMode === "sliced"}
-              disabled={running}
-              onClick={() => setInputMode("sliced")}
-            >
-              スライス済みから
-            </button>
-          </div>
+          <TrainInputModeTabs
+            inputMode={inputMode}
+            disabled={running}
+            onChange={setInputMode}
+          />
           <label>
             {inputMode === "sliced"
               ? "スライス済み音声フォルダ"
@@ -727,7 +914,7 @@ export function TrainView({
             <div className="row">
               <input
                 value={inputDir}
-                onChange={(e) => setInputDir(e.target.value)}
+                onChange={(e) => applyInputDir(e.target.value)}
                 placeholder={
                   inputMode === "sliced"
                     ? "slice_000.wav などが入ったフォルダ"
@@ -749,10 +936,10 @@ export function TrainView({
               disabled={running}
             />
           </label>
-          <label className="param-field">
+          <label className={`param-field${speedAltered ? " is-speed-altered" : ""}`}>
             <span className="param-label">
               音源速度 ({trainSpeed.toFixed(2)}
-              {Math.abs(trainSpeed - 1) < 0.001 ? " · 変更なし" : ""})
+              {speedAltered ? " · 変更あり" : " · 変更なし"})
             </span>
             <div className="param-controls">
               <input
@@ -787,7 +974,106 @@ export function TrainView({
                 ↺
               </button>
             </div>
+            {speedAltered && (
+              <span className="param-altered-hint">
+                既定の 1.00 から変更されています。スライス後にピッチ維持の速度調整をかけます。
+              </span>
+            )}
           </label>
+          <div className={`train-vocal-block${vocalSeparate ? " is-vocal-altered" : ""}`}>
+            <label className="train-announce-check" title="学習前に UVR 系モデルでボーカルのみ抽出します（Instrumental は出力しません）">
+              <input
+                type="checkbox"
+                checked={vocalSeparate}
+                disabled={running}
+                onChange={(e) => setVocalSeparatePersist(e.target.checked)}
+              />
+              学習前にボーカル分離を行う{vocalSeparate ? " · 有効" : ""}
+            </label>
+            {vocalSeparate && (
+              <label>
+                分離モデル
+                <BoundedSelect
+                  value={vocalModel}
+                  options={modelOptions}
+                  disabled={running}
+                  onChange={(v) => void persistVocalModel(v)}
+                />
+              </label>
+            )}
+            {vocalSeparate && (
+              <span className="param-altered-hint">
+                学習前にボーカルのみ抽出します（元フォルダは書き換えません）。
+              </span>
+            )}
+          </div>
+          <div
+            className={`train-review-block${reviewMode === "auto" ? " is-review-auto" : ""}`}
+          >
+            <label>
+              スライスレビュー{reviewMode === "auto" ? " · 自動除外" : ""}
+              <BoundedSelect
+                value={reviewMode}
+                disabled={running}
+                options={[
+                  { value: "manual", label: "manual（指標表示・人手確認）" },
+                  { value: "auto", label: "auto（総合スコア＋観点で自動除外）" },
+                  { value: "skip", label: "skip（レビューなし）" },
+                ]}
+                onChange={(v) =>
+                  setReviewMode(
+                    v === "skip" || v === "auto" || v === "manual" ? v : "manual",
+                  )
+                }
+              />
+            </label>
+            {reviewMode === "auto" && (
+              <>
+                <div className="slice-review-settings-grid">
+                  <label>
+                    auto 除去率（総合スコア上位 %）
+                    <input
+                      type="number"
+                      min={0}
+                      max={90}
+                      step={1}
+                      disabled={running}
+                      value={sliceReviewSettings(settings).autoRemovePercent ?? 0}
+                      onChange={(e) => {
+                        const n = Number(e.target.value);
+                        void persistSliceReview({
+                          autoRemovePercent: Number.isFinite(n)
+                            ? Math.min(90, Math.max(0, Math.round(n)))
+                            : 0,
+                        });
+                      }}
+                    />
+                  </label>
+                  <label>
+                    auto 残件数上限（0=無制限）
+                    <input
+                      type="number"
+                      min={0}
+                      step={1}
+                      disabled={running}
+                      value={sliceReviewSettings(settings).autoKeepMax ?? 0}
+                      onChange={(e) => {
+                        const n = Number(e.target.value);
+                        void persistSliceReview({
+                          autoKeepMax: Number.isFinite(n)
+                            ? Math.max(0, Math.floor(n))
+                            : 0,
+                        });
+                      }}
+                    />
+                  </label>
+                </div>
+                <span className="param-altered-hint">
+                  確認画面なしで外れ値スライスを自動除外して学習に進みます。
+                </span>
+              </>
+            )}
+          </div>
           <div className="row">
             <button
               type="button"
@@ -807,10 +1093,32 @@ export function TrainView({
                 {cancelling ? "中断中…" : "中断"}
               </button>
             )}
-            {!running && resumeInfo && (
+            {!running && resumeInfo && !reviewJobDir && (
               <>
                 <button type="button" className="primary" onClick={resume}>
                   再開
+                </button>
+                {resumeInfo.pausedForReview && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setReviewReadOnly(false);
+                      setReviewJobDir(resumeInfo.jobDir);
+                    }}
+                  >
+                    レビューを開く
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (resumeInfo.jobDir) {
+                      setReviewReadOnly(true);
+                      setReviewJobDir(resumeInfo.jobDir);
+                    }
+                  }}
+                >
+                  除外を確認
                 </button>
                 <button type="button" onClick={() => void discardResume()}>
                   破棄
@@ -841,6 +1149,11 @@ export function TrainView({
             {inputMode === "sliced"
               ? "すでに分割済みのクリップ（推奨: 1秒以上の wav）をそのまま使い、データ準備 → 話者埋め込み学習を実行します。非 wav は自動で wav 化します（再スライスはしません）。"
               : "音声の形式変換（すでに wav なら省略）→ 分割 → データ準備 → 話者埋め込みの学習、までを自動で順に実行します。"}
+            {vocalSeparate
+              ? inputMode === "raw"
+                ? " ボーカル分離はスライスより前に実行し、Vocals のみの WAV を後段に渡します（to_wav は省略）。"
+                : " ボーカル分離を各クリップに適用してから学習します。4秒未満は無音パディングして分離し、元の長さに戻します。"
+              : ""}
             音源速度が 1.00 以外のときは、スライス後に各クリップへピッチ維持の速度調整をかけてから学習します（元フォルダは書き換えません）。
             学習中は生成・設定画面へは移動できません。設定のエンジン版（v3/v4）に応じた
             YAML / Checkpoint が使われます。
@@ -851,205 +1164,164 @@ export function TrainView({
         </div>
       </section>
 
-      <section className="panel">
-        <header className="panel-header">
-          <h3>参照音源 / VoiceDesign 話者</h3>
-        </header>
-        <div className="panel-body form-stack">
-          <p className="hint">
-            Embedding 学習なしで使えます。参照音源はゼロショットクローン、キャプションは
-            No-Ref（声デザイン）です。v4 は統合モデルのため同一 Checkpoint
-            で両方使えます。v3 の caption は VoiceDesign 系 Checkpoint が必要です。
-            mp3 / aac などは保存時に WAV へ変換します。
-          </p>
-
-          <div className="profile-kind-tabs" role="tablist">
-            <button
-              type="button"
-              role="tab"
-              className={profileKind === "ref" ? "active" : ""}
-              aria-selected={profileKind === "ref"}
-              onClick={() => setProfileKind("ref")}
-            >
-              参照音源
-            </button>
-            <button
-              type="button"
-              role="tab"
-              className={profileKind === "caption" ? "active" : ""}
-              aria-selected={profileKind === "caption"}
-              onClick={() => setProfileKind("caption")}
-            >
-              キャプション
-            </button>
-          </div>
-
-          <label>
-            話者名
-            <input
-              value={profileName}
-              onChange={(e) => setProfileName(e.target.value)}
-              placeholder="例: Ref_Hanako / SoftVoice"
-            />
-          </label>
-
-          {profileKind === "ref" ? (
-            <label>
-              参照音源
-              <div className="row">
+      {confirmOpen && (
+        <div
+          className="modal-backdrop"
+          onClick={() => setConfirmOpen(false)}
+        >
+          <div
+            className="modal panel train-confirm-modal"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <header className="panel-header">
+              <h3>学習設定の確認</h3>
+            </header>
+            <div className="panel-body form-stack">
+              <p className="hint">
+                内容を確認・変更してから開始できます。
+              </p>
+              <TrainInputModeTabs
+                inputMode={inputMode}
+                onChange={setInputMode}
+              />
+              <label>
+                {inputMode === "sliced"
+                  ? "スライス済み音声フォルダ"
+                  : "音声フォルダ"}
+                <div className="row">
+                  <input
+                    value={inputDir}
+                    onChange={(e) => applyInputDir(e.target.value)}
+                  />
+                  <button type="button" onClick={() => void pickFolder()}>
+                    参照
+                  </button>
+                </div>
+              </label>
+              <label>
+                話者名
                 <input
-                  value={profileRefWav}
-                  onChange={(e) => setProfileRefWav(e.target.value)}
-                  placeholder="wav / mp3 など"
+                  value={speakerName}
+                  onChange={(e) => setSpeakerName(e.target.value)}
                 />
-                <button type="button" onClick={() => void pickRefWav()}>
-                  参照
+              </label>
+              <label className={`param-field${speedAltered ? " is-speed-altered" : ""}`}>
+                <span className="param-label">
+                  音源速度 ({trainSpeed.toFixed(2)}
+                  {speedAltered ? " · 変更あり" : " · 変更なし"})
+                </span>
+                <div className="param-controls">
+                  <input
+                    type="range"
+                    min={0.5}
+                    max={2}
+                    step={0.01}
+                    value={trainSpeed}
+                    onChange={(e) => setTrainSpeed(Number(e.target.value))}
+                  />
+                  <input
+                    type="number"
+                    min={0.5}
+                    max={2}
+                    step={0.01}
+                    value={trainSpeed}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      if (!Number.isFinite(v)) return;
+                      setTrainSpeed(Math.min(2, Math.max(0.5, v)));
+                    }}
+                  />
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    title="1.00 に戻す"
+                    onClick={() => setTrainSpeed(1)}
+                  >
+                    ↺
+                  </button>
+                </div>
+                {speedAltered && (
+                  <span className="param-altered-hint">
+                    既定の 1.00 から変更されています。スライス後にピッチ維持の速度調整をかけます。
+                  </span>
+                )}
+              </label>
+              <div className={`train-vocal-block${vocalSeparate ? " is-vocal-altered" : ""}`}>
+                <label className="train-announce-check">
+                  <input
+                    type="checkbox"
+                    checked={vocalSeparate}
+                    onChange={(e) => setVocalSeparatePersist(e.target.checked)}
+                  />
+                  学習前にボーカル分離を行う{vocalSeparate ? " · 有効" : ""}
+                </label>
+                {vocalSeparate && (
+                  <label>
+                    分離モデル
+                    <BoundedSelect
+                      value={vocalModel}
+                      options={modelOptions}
+                      onChange={(v) => void persistVocalModel(v)}
+                    />
+                  </label>
+                )}
+                {vocalSeparate && (
+                  <span className="param-altered-hint">
+                    学習前にボーカルのみ抽出します（元フォルダは書き換えません）。
+                  </span>
+                )}
+              </div>
+              <div
+                className={`train-review-block${reviewMode === "auto" ? " is-review-auto" : ""}`}
+              >
+                <label>
+                  スライスレビュー{reviewMode === "auto" ? " · 自動除外" : ""}
+                  <select
+                    value={reviewMode}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setReviewMode(
+                        v === "skip" || v === "auto" || v === "manual"
+                          ? v
+                          : "manual",
+                      );
+                    }}
+                  >
+                    <option value="manual">manual（人手確認）</option>
+                    <option value="auto">auto（総合スコア＋観点で自動除外）</option>
+                    <option value="skip">skip</option>
+                  </select>
+                </label>
+                {reviewMode === "auto" && (
+                  <span className="param-altered-hint">
+                    確認画面なしで外れ値スライスを自動除外して学習に進みます。
+                  </span>
+                )}
+              </div>
+              <label className="train-announce-check">
+                <input
+                  type="checkbox"
+                  checked={announceDone}
+                  onChange={(e) => setAnnounceDonePersist(e.target.checked)}
+                />
+                終了通知
+              </label>
+              <div className="row">
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={() => void startJob()}
+                >
+                  この内容で開始
+                </button>
+                <button type="button" onClick={() => setConfirmOpen(false)}>
+                  キャンセル
                 </button>
               </div>
-            </label>
-          ) : (
-            <label>
-              キャプション（声のデザイン）
-              <textarea
-                className="profile-caption"
-                rows={3}
-                value={profileCaption}
-                onChange={(e) => setProfileCaption(e.target.value)}
-                placeholder="例: 落ち着いた若い女性の声、少し息多め"
-              />
-            </label>
-          )}
-
-          <div className="row">
-            <button
-              type="button"
-              className="primary"
-              disabled={profileBusy}
-              onClick={() => void saveProfile()}
-            >
-              {profileEditPath ? "更新" : "追加"}
-            </button>
-            {profileEditPath && (
-              <button
-                type="button"
-                disabled={profileBusy}
-                onClick={resetProfileForm}
-              >
-                新規作成に切替
-              </button>
-            )}
-            <span className="status-text">{profileMsg}</span>
-          </div>
-
-          <div className="profile-list">
-            {profileSpeakers.length === 0 ? (
-              <p className="hint">まだ登録された話者はありません</p>
-            ) : (
-              profileSpeakers.map((sp) => (
-                <div
-                  key={sp.embedPath}
-                  className={`profile-list-item ${
-                    profileEditPath === sp.embedPath ? "active" : ""
-                  }`}
-                >
-                  <div className="profile-list-main">
-                    <strong>{sp.name}</strong>
-                    <span className="profile-kind-badge">
-                      {sp.kind === "ref" ? "参照" : "caption"}
-                    </span>
-                    <span
-                      className="profile-list-detail"
-                      title={
-                        sp.kind === "ref"
-                          ? (sp.refWav ?? "")
-                          : (sp.caption ?? "")
-                      }
-                    >
-                      {sp.kind === "ref" ? (sp.refWav ?? "") : (sp.caption ?? "")}
-                    </span>
-                  </div>
-                  <div className="row profile-list-actions">
-                    <button
-                      type="button"
-                      disabled={profileBusy}
-                      onClick={() => beginEditProfile(sp)}
-                    >
-                      編集
-                    </button>
-                    <button
-                      type="button"
-                      className="danger"
-                      disabled={profileBusy}
-                      onClick={() => void deleteProfile(sp)}
-                    >
-                      削除
-                    </button>
-                  </div>
-                </div>
-              ))
-            )}
+            </div>
           </div>
         </div>
-      </section>
-
-      <section className="panel">
-        <header className="panel-header">
-          <h3>埋め込みブレンド</h3>
-        </header>
-        <div className="panel-body form-stack">
-          <div className="blend-row">
-            <label>
-              話者 A
-              <BoundedSelect
-                value={embedA}
-                options={speakerOptions}
-                onChange={setEmbedA}
-                placeholder="選択…"
-                aria-label="話者 A"
-              />
-            </label>
-            <label>
-              話者 B
-              <BoundedSelect
-                value={embedB}
-                options={speakerOptions}
-                onChange={setEmbedB}
-                placeholder="選択…"
-                aria-label="話者 B"
-              />
-            </label>
-          </div>
-
-          <div className="blend-slider">
-            <span className="blend-name">{nameA}</span>
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.01}
-              value={alpha}
-              onChange={(e) => setAlpha(Number(e.target.value))}
-            />
-            <span className="blend-name">{nameB}</span>
-            <span className="blend-alpha">{alpha.toFixed(2)}</span>
-          </div>
-
-          <label>
-            出力名
-            <input
-              value={blendName}
-              onChange={(e) => setBlendName(e.target.value)}
-              placeholder="空欄なら自動命名"
-            />
-          </label>
-          <div className="row">
-            <button type="button" className="primary" onClick={doBlend}>
-              ブレンド保存
-            </button>
-            <span className="status-text">{blendMsg}</span>
-          </div>
-        </div>
-      </section>
+      )}
     </div>
   );
 }

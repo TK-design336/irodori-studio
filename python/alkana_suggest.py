@@ -11,7 +11,11 @@ import json
 import re
 import sys
 
-from alkana import get_kana
+try:
+    from alkana import get_kana
+except ImportError:
+    def get_kana(_word: str) -> str | None:
+        return None
 
 WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
 

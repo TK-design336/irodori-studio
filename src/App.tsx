@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { GenerateView } from "./components/GenerateView";
 import { SettingsView } from "./components/SettingsView";
 import { TrainView } from "./components/TrainView";
+import { SpeakerView } from "./components/SpeakerView";
 import { DictionaryView } from "./components/DictionaryView";
 import { IconMoon, IconSun } from "./components/icons";
 import type {
@@ -12,9 +13,10 @@ import type {
   SpeakerInfo,
 } from "./types";
 import { isIrodoriV4 } from "./types";
+import { applyAppearance } from "./lib/accent";
 import "./App.css";
 
-type Tab = "train" | "generate" | "dictionary" | "settings";
+type Tab = "generate" | "speaker" | "train" | "dictionary" | "settings";
 
 function App() {
   const [tab, setTab] = useState<Tab>("generate");
@@ -55,9 +57,11 @@ function App() {
   const refreshSpeakers = useCallback(async () => {
     try {
       const list = await invoke<SpeakerInfo[]>("list_speakers");
-      setSpeakers(list);
+      setSpeakers((prev) =>
+        JSON.stringify(prev) === JSON.stringify(list) ? prev : list,
+      );
     } catch {
-      setSpeakers([]);
+      setSpeakers((prev) => (prev.length === 0 ? prev : []));
     }
   }, []);
 
@@ -67,8 +71,7 @@ function App() {
       const s = await invoke<AppSettings>("get_settings");
       if (!s.theme) s.theme = "light";
       setSettings(s);
-      document.documentElement.dataset.theme =
-        s.theme === "dark" ? "dark" : "light";
+      applyAppearance(s.theme, s.accentLight, s.accentDark);
       setSetupIncomplete(first);
       if (first) setTab("settings");
       await refreshValidation();
@@ -78,9 +81,18 @@ function App() {
 
   useEffect(() => {
     if (!settings) return;
-    document.documentElement.dataset.theme =
-      settings.theme === "dark" ? "dark" : "light";
-  }, [settings?.theme]);
+    applyAppearance(settings.theme, settings.accentLight, settings.accentDark);
+  }, [settings?.theme, settings?.accentLight, settings?.accentDark]);
+
+  useEffect(() => {
+    const onFocus = () => void refreshSpeakers();
+    window.addEventListener("focus", onFocus);
+    const id = window.setInterval(() => void refreshSpeakers(), 2500);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      window.clearInterval(id);
+    };
+  }, [refreshSpeakers]);
 
   const handleProjectChange = useCallback(
     (p: Project | null) => {
@@ -115,7 +127,7 @@ function App() {
   const toggleTheme = useCallback(async () => {
     if (!settings) return;
     const next = settings.theme === "dark" ? "light" : "dark";
-    document.documentElement.dataset.theme = next;
+    applyAppearance(next, settings.accentLight, settings.accentDark);
     const updated = { ...settings, theme: next };
     setSettings(updated);
     try {
@@ -153,6 +165,21 @@ function App() {
             onClick={() => selectTab("generate")}
           >
             生成
+          </button>
+          <button
+            type="button"
+            className={tab === "speaker" ? "active" : ""}
+            disabled={training || setupIncomplete}
+            title={
+              setupIncomplete
+                ? "先に Irodori ルートを設定してください"
+                : training
+                  ? "学習中は話者画面へ移動できません"
+                  : undefined
+            }
+            onClick={() => selectTab("speaker")}
+          >
+            話者
           </button>
           <button
             type="button"
@@ -242,14 +269,25 @@ function App() {
         {/* Keep views mounted so in-flight work (esp. training) survives layout changes */}
         <div
           className="tab-panel"
+          hidden={tab !== "speaker"}
+          aria-hidden={tab !== "speaker"}
+        >
+          <SpeakerView
+            speakers={speakers}
+            onSpeakersChanged={refreshSpeakers}
+            isV4={isIrodoriV4(settings)}
+          />
+        </div>
+        <div
+          className="tab-panel"
           hidden={tab !== "train"}
           aria-hidden={tab !== "train"}
         >
           <TrainView
-            speakers={speakers}
             settings={settings}
             onSpeakersChanged={refreshSpeakers}
             onRunningChange={handleTrainingChange}
+            onSettingsChange={setSettings}
           />
         </div>
         <div

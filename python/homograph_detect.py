@@ -121,6 +121,29 @@ def _load_bundled() -> dict[str, dict]:
     return by_surface
 
 
+def _readings_candidates(readings: list[str], chosen: str | None = None) -> list[dict]:
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for r in readings:
+        if r and r not in seen:
+            seen.add(r)
+            uniq.append(r)
+    if chosen:
+        c = chosen.strip()
+        if c and c not in seen:
+            uniq.insert(0, c)
+    return [{"reading": r} for r in uniq]
+
+
+def _entry_readings(e: dict) -> list[str]:
+    raw = e.get("readings")
+    if isinstance(raw, str):
+        return [p.strip() for p in re.split(r"[/／]", raw) if p.strip()]
+    if isinstance(raw, list):
+        return [str(r).strip() for r in raw if str(r).strip()]
+    return []
+
+
 def _readings_note(readings: list[str], chosen: str | None = None) -> str:
     uniq: list[str] = []
     seen: set[str] = set()
@@ -180,17 +203,17 @@ def _tokenize(text: str) -> list[tuple[int, int, str, str]]:
 
 def _mark_spans_multi(
     text: str,
-    surfaces: list[tuple[str, str]],
+    surfaces: list[tuple[str, str, list[dict]]],
     used: list[bool],
 ) -> list[dict]:
     """Longest-first substring match for surfaces with len >= 2 only."""
     hits: list[dict] = []
     ordered = sorted(
-        [(s, n) for s, n in surfaces if len(s) >= 2],
+        [(s, n, c) for s, n, c in surfaces if len(s) >= 2],
         key=lambda x: len(x[0]),
         reverse=True,
     )
-    for surface, note in ordered:
+    for surface, note, candidates in ordered:
         start = 0
         while True:
             idx = text.find(surface, start)
@@ -206,6 +229,7 @@ def _mark_spans_multi(
                         "start": idx,
                         "end": end,
                         "note": note,
+                        "candidates": candidates,
                     }
                 )
             start = idx + 1
@@ -216,18 +240,30 @@ def detect(text: str, entries: list[dict]) -> list[dict]:
     used = [False] * len(text)
     hits: list[dict] = []
 
-    # User dict: surface -> note
-    user_lookup: dict[str, str] = {}
+    bundled = _load_bundled()
+
+    # User dict: surface -> {note, candidates}
+    # Extra readings are merged with bundled candidates (never replace them).
+    user_lookup: dict[str, dict] = {}
     for e in entries:
         surface = str(e.get("surface") or "").strip()
         if not surface or surface in user_lookup:
             continue
         memo = e.get("note")
-        user_lookup[surface] = _dict_note(str(memo).strip() if memo else None)
+        memo_s = str(memo).strip() if memo else ""
+        extra_readings = _entry_readings(e)
+        bundled_readings = list((bundled.get(surface) or {}).get("readings") or [])
+        all_readings = bundled_readings + extra_readings
+        user_lookup[surface] = {
+            "note": _dict_note(memo_s) if memo_s else _readings_note(all_readings),
+            "candidates": _readings_candidates(all_readings),
+        }
 
-    bundled = _load_bundled()
     bundled_lookup = {
-        s: _readings_note(list(info.get("readings") or []))
+        s: {
+            "note": _readings_note(list(info.get("readings") or [])),
+            "candidates": _readings_candidates(list(info.get("readings") or [])),
+        }
         for s, info in bundled.items()
     }
 
@@ -239,13 +275,19 @@ def detect(text: str, entries: list[dict]) -> list[dict]:
                 continue
             if not KANJI_RE.search(surface):
                 continue
-            note = user_lookup.get(surface)
-            if note is None:
+            info = user_lookup.get(surface)
+            if info is None:
                 continue
             for i in range(start, end):
                 used[i] = True
             hits.append(
-                {"surface": surface, "start": start, "end": end, "note": note}
+                {
+                    "surface": surface,
+                    "start": start,
+                    "end": end,
+                    "note": info["note"],
+                    "candidates": info["candidates"],
+                }
             )
 
         # 2) Bundled dict exact token match
@@ -254,23 +296,39 @@ def detect(text: str, entries: list[dict]) -> list[dict]:
                 continue
             if not KANJI_RE.search(surface):
                 continue
-            note = bundled_lookup.get(surface)
-            if note is None:
+            info = bundled_lookup.get(surface)
+            if info is None:
                 continue
             for i in range(start, end):
                 used[i] = True
             hits.append(
-                {"surface": surface, "start": start, "end": end, "note": note}
+                {
+                    "surface": surface,
+                    "start": start,
+                    "end": end,
+                    "note": info["note"],
+                    "candidates": info["candidates"],
+                }
             )
 
         # 3) Multi-char user entries that MeCab may have split / missed
-        #    (e.g. custom compounds) — never for single-char
-        user_multi = [(s, n) for s, n in user_lookup.items() if len(s) >= 2]
+        user_multi = [
+            (s, n["note"], n["candidates"])
+            for s, n in user_lookup.items()
+            if len(s) >= 2
+        ]
         hits.extend(_mark_spans_multi(text, user_multi, used))
     else:
-        # No MeCab: substring fallback, multi-char only
-        user_multi = [(s, n) for s, n in user_lookup.items() if len(s) >= 2]
-        bundled_multi = [(s, n) for s, n in bundled_lookup.items() if len(s) >= 2]
+        user_multi = [
+            (s, n["note"], n["candidates"])
+            for s, n in user_lookup.items()
+            if len(s) >= 2
+        ]
+        bundled_multi = [
+            (s, n["note"], n["candidates"])
+            for s, n in bundled_lookup.items()
+            if len(s) >= 2
+        ]
         hits.extend(_mark_spans_multi(text, user_multi, used))
         hits.extend(_mark_spans_multi(text, bundled_multi, used))
 
