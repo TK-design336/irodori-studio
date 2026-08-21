@@ -155,6 +155,26 @@ export type AppSettings = {
   vocalSeparatorModel?: string;
   /** Slice review after speed, before dataset. */
   sliceReview?: SliceReviewSettings;
+  /** Local HTTP API server (Chrome extension / external clients). */
+  httpServerEnabled?: boolean;
+  /** Bind address — do not hardcode; use this setting. */
+  httpBindAddress?: string;
+  /** Preferred listen port (tries next if busy). */
+  httpPort?: number;
+  /** Bearer token for all HTTP API requests. */
+  httpToken?: string;
+  /** Extra CORS allowlist origins. */
+  httpCorsOrigins?: string[];
+  /** Allow any chrome-extension:// Origin. */
+  httpAllowChromeExtensions?: boolean;
+};
+
+/** Runtime status of the local HTTP API server. */
+export type HttpServerStatus = {
+  running: boolean;
+  bindAddress: string;
+  port: number | null;
+  preferredPort: number;
 };
 
 export const DEFAULT_VOCAL_SEPARATOR_MODEL =

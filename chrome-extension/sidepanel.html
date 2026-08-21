@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Irodori Reader</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div>
+        <h1>Irodori Reader</h1>
+        <p class="sub">ページ読み上げ</p>
+      </div>
+      <button id="btnOpenSettings" type="button" class="icon-btn" title="設定" aria-label="設定">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path
+            fill="currentColor"
+            d="M19.14 12.94c.04-.31.06-.63.06-.94s-.02-.63-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.65l-1.92-3.32a.5.5 0 0 0-.61-.22l-2.39.96a7.2 7.2 0 0 0-1.63-.94l-.36-2.54A.5.5 0 0 0 13.9 2h-3.8a.5.5 0 0 0-.49.42l-.36 2.54c-.59.24-1.13.55-1.63.94l-2.39-.96a.5.5 0 0 0-.61.22L2.7 8.83a.5.5 0 0 0 .12.65l2.03 1.58c-.04.31-.06.63-.06-.94s.02.63.06.94L2.82 14.52a.5.5 0 0 0-.12.65l1.92 3.32a.5.5 0 0 0 .61.22l2.39-.96c.5.39 1.04.7 1.63.94l.36 2.54a.5.5 0 0 0 .49.42h3.8a.5.5 0 0 0 .49-.42l.36-2.54c.59-.24 1.13-.55 1.63-.94l2.39.96a.5.5 0 0 0 .61-.22l1.92-3.32a.5.5 0 0 0-.12-.65l-2.03-1.58zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"
+          />
+        </svg>
+      </button>
+    </header>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>話者</h2>
+        <button id="btnRefreshSpeakers" type="button" class="linkish">再取得</button>
+      </div>
+      <select id="speaker" aria-label="話者"></select>
+    </section>
+
+    <section class="card" id="readCard">
+      <h2>読み上げ</h2>
+
+      <div class="transport-bar">
+        <div class="transport-wrap">
+          <button id="btnReadPage" type="button" class="primary read-overlay">
+            このページを読み上げ
+          </button>
+          <div class="transport row" id="transportRow">
+            <button id="btnPrev" type="button" title="前へ">⏮</button>
+            <button id="btnPlayPause" type="button" title="再生">▶</button>
+            <button id="btnNext" type="button" title="次へ">⏭</button>
+            <button id="btnStop" type="button" title="停止">■</button>
+          </div>
+        </div>
+        <button id="btnReadLater" type="button" class="btn-read-later">
+          後で読むに追加
+        </button>
+      </div>
+
+      <label class="inline-metric">
+        <span class="metric-label">速度 <span id="rateLabel">1.00x</span></span>
+        <input id="rate" type="range" min="0.5" max="2" step="0.05" value="1" />
+      </label>
+      <label class="inline-metric">
+        <span class="metric-label">音量 <span id="volLabel">80%</span></span>
+        <input id="volume" type="range" min="0" max="1" step="0.05" value="0.8" />
+      </label>
+
+      <label class="checkbox-inline">
+        <input id="autoNextEpisode" type="checkbox" checked />
+        次話へ自動継続（なろう・カクヨム・ハーメルンなど）
+      </label>
+
+      <div class="now-playing">
+        <div id="npTitle" class="np-title">読み上げ中: —</div>
+        <div id="npCurrent" class="np-line">▸ 現在: —</div>
+        <div id="npNext" class="np-line">▸ 次: —</div>
+        <div id="npEpisodes" class="np-meta"></div>
+      </div>
+      <div id="npMeta" class="np-meta below-box">0:00 / 約 0:00　チャンク 0 / 0</div>
+
+      <p id="playStatus" class="status" aria-live="polite"></p>
+
+      <div class="row concat-row">
+        <button id="btnConcat" type="button">全体を連結して保存</button>
+        <select id="concatFormat" aria-label="連結形式">
+          <option value="wav">wav</option>
+          <option value="mp3">mp3</option>
+          <option value="m4b">M4B</option>
+        </select>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>後で読む</h2>
+      <ul id="readLaterList" class="queue-list"></ul>
+      <button id="btnPlayQueue" type="button">キューを再生</button>
+    </section>
+
+    <!-- Settings drawer -->
+    <div id="settingsOverlay" class="settings-overlay hidden" hidden>
+      <div class="settings-panel">
+        <div class="card-head">
+          <h2>設定</h2>
+          <button id="btnCloseSettings" type="button" class="linkish">閉じる</button>
+        </div>
+
+        <h3 class="settings-h">Studio 接続</h3>
+        <p class="hint">初回だけ設定すれば十分です。普段は閉じたまま使えます。</p>
+        <label>
+          ベース URL
+          <input id="baseUrl" type="url" placeholder="http://127.0.0.1:18790" />
+        </label>
+        <label>
+          トークン
+          <input id="token" type="password" placeholder="Studio 設定の API トークン" autocomplete="off" />
+        </label>
+        <div class="row">
+          <button id="btnSave" type="button">保存</button>
+          <button id="btnTest" type="button" class="primary">接続テスト</button>
+        </div>
+        <p id="connStatus" class="status" aria-live="polite"></p>
+        <div class="row">
+          <button id="btnTestSpeak" type="button">テスト再生</button>
+        </div>
+
+        <h3 class="settings-h">読み上げ分割</h3>
+        <p class="hint">
+          句点などで切ったあと、短い文をまとめる目安です。これを超える一文はそのまま残します。
+        </p>
+        <label>
+          チャンク文字数（既定 60）
+          <input id="chunkChars" type="number" min="16" max="120" step="1" value="60" />
+        </label>
+
+        <h3 class="settings-h">表示</h3>
+        <label class="color-field">
+          <span>読み上げ中のハイライト色</span>
+          <span class="color-row">
+            <input id="hlColor" type="color" value="#facc15" aria-label="ハイライト色を選ぶ" />
+            <span id="hlColorPreview" class="color-preview">あいうえお</span>
+          </span>
+          <span class="hint">左の色マスをクリックして変更できます。</span>
+        </label>
+
+        <h3 class="settings-h">音声キャッシュ</h3>
+        <p class="hint">
+          同じ文章・話者で再読み上げするとき、再合成せずに使う一時保存です。容量を空けたいときだけ消してください。
+        </p>
+        <div class="row">
+          <button id="btnClearCache" type="button">キャッシュをクリア</button>
+          <button id="btnCopyText" type="button">本文をコピー（Studio 用）</button>
+        </div>
+        <p id="cacheStatus" class="status"></p>
+
+        <h3 class="settings-h">サイト別の本文抽出ルール</h3>
+        <p class="hint">
+          なろう・青空文庫など向けの抽出設定（JSON）です。通常は同梱のまま不要です。上級者向けに上書きできます。
+        </p>
+        <label>
+          ユーザ上書き（JSON 配列）
+          <textarea id="profilesJson" rows="5" placeholder="[]"></textarea>
+        </label>
+        <button id="btnSaveProfiles" type="button">プロファイルを保存</button>
+      </div>
+    </div>
+
+    <script src="sidepanel.js" type="module"></script>
+  </body>
+</html>

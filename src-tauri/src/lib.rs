@@ -1,25 +1,28 @@
 mod asr;
 mod dictionary;
+mod http_server;
 mod project;
 mod python_env;
 mod settings;
 mod speakers;
+mod synth;
 mod train;
 mod worker;
 
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use settings::{
-    infer_paths_from_root, init_studio_resource_paths, load_settings, needs_first_setup,
-    resolve_ffmpeg, resolve_ffprobe, save_settings, studio_python_dir, validate_settings,
-    AppSettings, InferredPaths, PathValidation, MISSING_FFMPEG_MSG,
+    generate_http_token, infer_paths_from_root, init_studio_resource_paths, load_settings,
+    needs_first_setup, normalize_http_bind_address, normalize_http_cors_origins, resolve_ffmpeg,
+    resolve_ffprobe, save_settings, studio_python_dir, validate_settings, AppSettings,
+    InferredPaths, PathValidation, MISSING_FFMPEG_MSG,
 };
 use speakers::{
     RenameSpeakerArgs, SpeakerInfo, UpdateSpeakerMetaArgs, UpsertSpeakerProfileArgs,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use train::{
     cancel_train_job, clear_resume_info, get_resume_info, run_alkana_suggest, run_blend,
     start_train_job, TrainResumeInfo, TrainState,
@@ -31,6 +34,22 @@ pub struct AppState {
     pub worker: Mutex<OptWorkerSimple>,
     pub asr_worker: Mutex<asr::AsrWorker>,
     pub train: Arc<TrainState>,
+    pub http: Mutex<http_server::HttpServerHandle>,
+}
+
+/// Run `f` on Tokio's blocking pool so sync Python/mutex work never stalls
+/// the WebView2 UI thread (Tauri sync commands run inline on that thread).
+async fn with_state_blocking<T, F>(app: AppHandle, f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&AppState) -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        f(&state)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -39,8 +58,8 @@ fn get_settings(state: tauri::State<'_, AppState>) -> AppSettings {
 }
 
 #[tauri::command]
-fn set_settings(
-    state: tauri::State<'_, AppState>,
+async fn set_settings(
+    app: AppHandle,
     mut settings: AppSettings,
 ) -> Result<AppSettings, String> {
     settings.export_filename_parts =
@@ -53,16 +72,42 @@ fn set_settings(
         settings::normalize_opus_bitrate_kbps(settings.export_opus_bitrate_kbps);
     settings.accent_light = settings::normalize_accent_light(&settings.accent_light);
     settings.accent_dark = settings::normalize_accent_dark(&settings.accent_dark);
+    settings.http_bind_address = normalize_http_bind_address(&settings.http_bind_address);
+    settings.http_cors_origins = normalize_http_cors_origins(settings.http_cors_origins);
+    if settings.http_token.trim().is_empty() {
+        settings.http_token = generate_http_token();
+    }
     if settings.vocal_separator_model.trim().is_empty() {
         settings.vocal_separator_model = settings::DEFAULT_VOCAL_SEPARATOR_MODEL.into();
     }
-    let prev = state.settings.lock().clone();
+    with_state_blocking(app.clone(), move |state| {
+        let prev = state.settings.lock().clone();
+        save_settings(&settings)?;
+        if prev.engine_identity_changed(&settings) {
+            // Version / root / checkpoint change → drop loaded OPT runtime.
+            let _ = state.worker.lock().shutdown();
+        }
+        *state.settings.lock() = settings.clone();
+        state.http.lock().apply_settings(&app, &settings);
+        Ok(settings)
+    })
+    .await
+}
+
+#[tauri::command]
+fn http_server_status(state: tauri::State<'_, AppState>) -> http_server::HttpServerStatus {
+    state.http.lock().status()
+}
+
+#[tauri::command]
+fn regenerate_http_token(
+    state: tauri::State<'_, AppState>,
+) -> Result<AppSettings, String> {
+    let mut settings = state.settings.lock().clone();
+    settings.http_token = generate_http_token();
     save_settings(&settings)?;
-    if prev.engine_identity_changed(&settings) {
-        // Version / root / checkpoint change → drop loaded OPT runtime.
-        let _ = state.worker.lock().shutdown();
-    }
     *state.settings.lock() = settings.clone();
+    state.http.lock().update_auth_config(&settings);
     Ok(settings)
 }
 
@@ -326,80 +371,115 @@ fn suggest_katakana(
 }
 
 #[tauri::command]
-fn ensure_worker(state: tauri::State<'_, AppState>) -> Result<Value, String> {
-    let settings = state.settings.lock().clone();
-    let python_dir = studio_python_dir()?;
-    let mut worker = state.worker.lock();
-    // Health-check existing process; dead/hung → restart.
-    let _ = worker.ensure_alive();
-    worker.start(&settings, &python_dir)?;
-    if !worker.is_loaded() {
-        let resp = worker.load(&settings)?;
-        if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            return Err(format!("load failed: {resp}"));
-        }
-        return Ok(resp);
-    }
-    Ok(json!({"ok": true, "status": "already_loaded"}))
-}
-
-#[tauri::command]
-fn ping_worker(state: tauri::State<'_, AppState>) -> Result<Value, String> {
-    let settings = state.settings.lock().clone();
-    let python_dir = studio_python_dir()?;
-    let mut worker = state.worker.lock();
-    if !worker.is_running() {
-        return Ok(json!({"ok": false, "status": "not_running", "recovered": false}));
-    }
-    match worker.ensure_alive() {
-        Ok(true) => Ok(json!({
-            "ok": true,
-            "status": "pong",
-            "loaded": worker.is_loaded(),
-            "recovered": false,
-        })),
-        Ok(false) => {
-            // Auto-restart + reload.
-            worker.start(&settings, &python_dir)?;
+async fn ensure_worker(app: AppHandle) -> Result<Value, String> {
+    with_state_blocking(app, |state| {
+        let settings = state.settings.lock().clone();
+        let python_dir = studio_python_dir()?;
+        let mut worker = state.worker.lock();
+        // Health-check existing process; dead/hung → restart.
+        let _ = worker.ensure_alive();
+        worker.start(&settings, &python_dir)?;
+        if !worker.is_loaded() {
             let resp = worker.load(&settings)?;
             if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-                return Err(format!("worker restart load failed: {resp}"));
+                return Err(format!("load failed: {resp}"));
             }
-            Ok(json!({
-                "ok": true,
-                "status": "restarted",
-                "loaded": true,
-                "recovered": true,
-            }))
+            return Ok(resp);
         }
-        Err(e) => Err(e),
-    }
-}
-
-#[tauri::command]
-fn worker_status(state: tauri::State<'_, AppState>) -> Value {
-    let mut worker = state.worker.lock();
-    worker.reap_if_dead();
-    json!({
-        "running": worker.is_running(),
-        "loaded": worker.is_loaded(),
+        Ok(json!({"ok": true, "status": "already_loaded"}))
     })
+    .await
 }
 
 #[tauri::command]
-fn unload_worker(state: tauri::State<'_, AppState>) -> Result<Value, String> {
-    let mut worker = state.worker.lock();
-    if worker.is_running() {
-        worker.unload()
-    } else {
-        Ok(json!({"ok": true, "status": "not_running"}))
-    }
+async fn ping_worker(app: AppHandle) -> Result<Value, String> {
+    with_state_blocking(app, |state| {
+        let settings = state.settings.lock().clone();
+        let python_dir = studio_python_dir()?;
+        // Skip if HTTP/UI synth holds the mutex — never wait on the periodic ping path.
+        let mut worker = match state.worker.try_lock() {
+            Some(w) => w,
+            None => {
+                return Ok(json!({
+                    "ok": true,
+                    "status": "busy",
+                    "loaded": true,
+                    "recovered": false,
+                }));
+            }
+        };
+        if !worker.is_running() {
+            return Ok(json!({"ok": false, "status": "not_running", "recovered": false}));
+        }
+        match worker.ensure_alive() {
+            Ok(true) => Ok(json!({
+                "ok": true,
+                "status": "pong",
+                "loaded": worker.is_loaded(),
+                "recovered": false,
+            })),
+            Ok(false) => {
+                // Auto-restart + reload only when nobody else is using the worker.
+                worker.start(&settings, &python_dir)?;
+                let resp = worker.load(&settings)?;
+                if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                    return Err(format!("worker restart load failed: {resp}"));
+                }
+                Ok(json!({
+                    "ok": true,
+                    "status": "restarted",
+                    "loaded": true,
+                    "recovered": true,
+                }))
+            }
+            Err(e) => Err(e),
+        }
+    })
+    .await
 }
 
 #[tauri::command]
-fn shutdown_worker(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let mut worker = state.worker.lock();
-    worker.shutdown()
+async fn worker_status(app: AppHandle) -> Result<Value, String> {
+    with_state_blocking(app, |state| {
+        Ok(match state.worker.try_lock() {
+            Some(mut w) => {
+                w.reap_if_dead();
+                json!({
+                    "running": w.is_running(),
+                    "loaded": w.is_loaded(),
+                    "busy": false,
+                })
+            }
+            None => json!({
+                "running": true,
+                "loaded": true,
+                "busy": true,
+            }),
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+async fn unload_worker(app: AppHandle) -> Result<Value, String> {
+    with_state_blocking(app, |state| {
+        let mut worker = state.worker.lock();
+        if worker.is_running() {
+            worker.unload()
+        } else {
+            Ok(json!({"ok": true, "status": "not_running"}))
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn shutdown_worker(app: AppHandle) -> Result<(), String> {
+    with_state_blocking(app, |state| {
+        let mut worker = state.worker.lock();
+        worker.shutdown()
+    })
+    .await
 }
 
 #[derive(serde::Deserialize)]
@@ -436,133 +516,36 @@ struct SynthesizeArgs {
 }
 
 #[tauri::command]
-fn synthesize_line(
-    state: tauri::State<'_, AppState>,
-    args: SynthesizeArgs,
-) -> Result<Value, String> {
-    let settings = state.settings.lock().clone();
-    let python_dir = studio_python_dir()?;
-    let mut worker = state.worker.lock();
-    let _ = worker.ensure_alive();
-    worker.start(&settings, &python_dir)?;
-    if !worker.is_loaded() {
-        let resp = worker.load(&settings)?;
-        if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            return Err(format!("load failed: {resp}"));
-        }
-    }
-
-    let ref_embed = args
-        .ref_embed
-        .as_ref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    // ref_wavs (multiple) takes precedence over single ref_wav.
-    let ref_wavs: Option<Vec<String>> = args.ref_wavs.as_ref().map(|v| {
-        v.iter()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-    }).filter(|v| !v.is_empty());
-    let ref_wav = if ref_wavs.is_none() {
-        args.ref_wav
-            .as_ref()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    } else {
-        None
-    };
-
-    let caption = args
-        .caption
-        .as_ref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    let has_ref = ref_embed.is_some() || ref_wav.is_some() || ref_wavs.is_some();
-    let no_ref = args.no_ref.unwrap_or(false)
-        || (caption.is_some() && !has_ref);
-
-    if !has_ref && !no_ref {
-        return Err("話者の埋め込み・参照音源・キャプションのいずれかを指定してください".into());
-    }
-
-    let mut payload = json!({
-        "text": args.text,
-        "output_wav": args.output_wav,
-        "num_steps": args.num_steps,
-        "num_candidates": args.num_candidates,
-        "duration_scale": args.duration_scale,
-        "t_schedule_mode": args.t_schedule_mode,
-        "sway_coeff": args.sway_coeff,
-        "cfg_guidance_mode": args.cfg_guidance_mode,
-        "cfg_scale_text": args.cfg_scale_text,
-        "cfg_scale_caption": args.cfg_scale_caption.unwrap_or(3.0),
-        "cfg_scale_speaker": args.cfg_scale_speaker,
-        "no_ref": no_ref,
-        "context_kv_cache": true,
-    });
-    if let Some(ref embed) = ref_embed {
-        payload["ref_embed"] = json!(embed);
-    }
-    if let Some(ref wavs) = ref_wavs {
-        payload["ref_wavs"] = json!(wavs);
-        // Also set ref_wav to first entry for back-compat with older worker versions.
-        payload["ref_wav"] = json!(wavs[0]);
-    } else if let Some(ref wav) = ref_wav {
-        payload["ref_wav"] = json!(wav);
-    }
-    if let Some(ref cap) = caption {
-        payload["caption"] = json!(cap);
-    }
-    if let Some(seed) = args.seed {
-        payload["seed"] = json!(seed);
-    }
-    if let Some(seconds) = args.seconds {
-        payload["seconds"] = json!(seconds);
-    }
-    let extra_wavs: Vec<String> = args
-        .output_wavs
-        .unwrap_or_default()
-        .into_iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if !extra_wavs.is_empty() {
-        payload["output_wavs"] = json!(extra_wavs);
-        payload["num_candidates"] = json!(extra_wavs.len() as u32);
-    }
-
-    let try_once = |w: &mut OptWorkerSimple, p: Value| -> Result<Value, String> {
-        let resp = w.synthesize(p)?;
-        if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            return Err(resp
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("synthesize failed")
-                .to_string());
-        }
-        Ok(resp)
-    };
-
-    match try_once(&mut worker, payload.clone()) {
-        Ok(resp) => Ok(resp),
-        Err(first_err) => {
-            // One automatic restart + retry (worker may have died mid-request).
-            let _ = worker.shutdown();
-            worker.start(&settings, &python_dir)?;
-            let load_resp = worker.load(&settings)?;
-            if load_resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-                return Err(format!(
-                    "再起動後のロードに失敗: {load_resp}（初回エラー: {first_err}）"
-                ));
-            }
-            try_once(&mut worker, payload).map_err(|e| {
-                format!("再試行も失敗: {e}（初回エラー: {first_err}）")
-            })
-        }
-    }
+async fn synthesize_line(app: AppHandle, args: SynthesizeArgs) -> Result<Value, String> {
+    with_state_blocking(app, move |state| {
+        let settings = state.settings.lock().clone();
+        synth::synthesize_with_worker(
+            &settings,
+            &state.worker,
+            synth::SynthesizeArgs {
+                text: args.text,
+                ref_embed: args.ref_embed,
+                ref_wav: args.ref_wav,
+                ref_wavs: args.ref_wavs,
+                caption: args.caption,
+                no_ref: args.no_ref,
+                output_wav: args.output_wav,
+                output_wavs: args.output_wavs,
+                num_steps: args.num_steps,
+                num_candidates: args.num_candidates,
+                seed: args.seed,
+                seconds: args.seconds,
+                duration_scale: args.duration_scale,
+                t_schedule_mode: args.t_schedule_mode,
+                sway_coeff: args.sway_coeff,
+                cfg_guidance_mode: args.cfg_guidance_mode,
+                cfg_scale_text: args.cfg_scale_text,
+                cfg_scale_caption: args.cfg_scale_caption,
+                cfg_scale_speaker: args.cfg_scale_speaker,
+            },
+        )
+    })
+    .await
 }
 
 #[tauri::command]
@@ -622,7 +605,7 @@ fn file_exists(path: String) -> bool {
     std::path::Path::new(&path).is_file()
 }
 
-fn studio_cache_dir() -> PathBuf {
+pub(crate) fn studio_cache_dir() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(|| std::env::temp_dir())
         .join("irodori-studio")
@@ -671,10 +654,12 @@ fn copy_file(src: String, dest: String) -> Result<(), String> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ExportAudioFormat {
+pub(crate) enum ExportAudioFormat {
     Wav,
     Mp3,
     Opus,
+    Flac,
+    M4b,
 }
 
 impl ExportAudioFormat {
@@ -682,6 +667,8 @@ impl ExportAudioFormat {
         match s.to_ascii_lowercase().as_str() {
             "mp3" => Self::Mp3,
             "opus" | "ogg" => Self::Opus,
+            "flac" => Self::Flac,
+            "m4b" | "m4a" => Self::M4b,
             _ => Self::Wav,
         }
     }
@@ -695,6 +682,8 @@ impl ExportAudioFormat {
             "wav" => Some(Self::Wav),
             "mp3" => Some(Self::Mp3),
             "opus" | "ogg" => Some(Self::Opus),
+            "flac" => Some(Self::Flac),
+            "m4b" | "m4a" => Some(Self::M4b),
             _ => None,
         }
     }
@@ -704,6 +693,8 @@ impl ExportAudioFormat {
             Self::Wav => "wav",
             Self::Mp3 => "mp3",
             Self::Opus => "opus",
+            Self::Flac => "flac",
+            Self::M4b => "m4b",
         }
     }
 }
@@ -718,7 +709,7 @@ fn resolve_export_format(explicit: Option<&str>, dest: &str) -> ExportAudioForma
     ExportAudioFormat::Wav
 }
 
-fn ensure_audio_ext(dest: &str, format: ExportAudioFormat) -> String {
+pub(crate) fn ensure_audio_ext(dest: &str, format: ExportAudioFormat) -> String {
     if ExportAudioFormat::from_dest(dest).is_some() {
         return dest.to_string();
     }
@@ -754,6 +745,22 @@ fn ffmpeg_codec_args(
                 format!("{br}k"),
                 "-application".into(),
                 "audio".into(),
+            ]
+        }
+        ExportAudioFormat::Flac => {
+            vec!["-c:a".into(), "flac".into()]
+        }
+        ExportAudioFormat::M4b => {
+            let br = settings::normalize_mp3_bitrate_kbps(
+                bitrate_kbps.unwrap_or(settings.export_mp3_bitrate_kbps),
+            );
+            vec![
+                "-c:a".into(),
+                "aac".into(),
+                "-b:a".into(),
+                format!("{br}k"),
+                "-f".into(),
+                "mp4".into(),
             ]
         }
     }
@@ -799,7 +806,7 @@ fn run_ffmpeg_af(
 }
 
 /// Export audio applying volume + speed (atempo, pitch-preserving) via ffmpeg.
-fn export_wav_adjusted_inner(
+pub(crate) fn export_wav_adjusted_inner(
     settings: &AppSettings,
     src: String,
     dest: String,
@@ -854,10 +861,10 @@ fn export_wav_adjusted(
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct WavExportSeg {
-    src: String,
-    volume: f64,
-    speed: f64,
+pub(crate) struct WavExportSeg {
+    pub src: String,
+    pub volume: f64,
+    pub speed: f64,
 }
 
 /// Concatenate adjusted audio with optional silence between segments.
@@ -870,14 +877,32 @@ fn export_wavs_concatenated(
     format: Option<String>,
     bitrate_kbps: Option<u32>,
 ) -> Result<(), String> {
+    let settings = state.settings.lock().clone();
+    export_wavs_concatenated_inner(
+        &settings,
+        segments,
+        silence_secs,
+        dest,
+        format,
+        bitrate_kbps,
+    )
+}
+
+pub(crate) fn export_wavs_concatenated_inner(
+    settings: &AppSettings,
+    segments: Vec<WavExportSeg>,
+    silence_secs: f64,
+    dest: String,
+    format: Option<String>,
+    bitrate_kbps: Option<u32>,
+) -> Result<(), String> {
     if segments.is_empty() {
         return Err("連結する音声がありません".into());
     }
 
-    let settings = state.settings.lock().clone();
     let fmt = resolve_export_format(format.as_deref(), &dest);
     let dest = ensure_audio_ext(&dest, fmt);
-    let codec_args = ffmpeg_codec_args(fmt, bitrate_kbps, &settings);
+    let codec_args = ffmpeg_codec_args(fmt, bitrate_kbps, settings);
 
     let tmp_dir = studio_cache_dir()
         .join("export_batch")
@@ -892,7 +917,7 @@ fn export_wavs_concatenated(
     for (i, seg) in segments.iter().enumerate() {
         let path = tmp_dir.join(format!("seg_{i:04}.wav"));
         if let Err(e) = export_wav_adjusted_inner(
-            &settings,
+            settings,
             seg.src.clone(),
             path.display().to_string(),
             seg.volume,
@@ -911,7 +936,7 @@ fn export_wavs_concatenated(
         let result = if fmt == ExportAudioFormat::Wav {
             copy_file(src, dest)
         } else {
-            run_ffmpeg_export(&settings, &src, &dest, None, &codec_args)
+            run_ffmpeg_export(settings, &src, &dest, None, &codec_args)
         };
         cleanup(&tmp_dir);
         return result;
@@ -948,7 +973,7 @@ fn export_wavs_concatenated(
         }
     }
 
-    let ffmpeg = match resolve_ffmpeg(&settings) {
+    let ffmpeg = match resolve_ffmpeg(settings) {
         Some(p) => p,
         None => {
             cleanup(&tmp_dir);
@@ -1094,22 +1119,28 @@ fn detect_annotations_cmd(
 }
 
 #[tauri::command]
-fn verify_line_asr(
-    state: tauri::State<'_, AppState>,
+async fn verify_line_asr(
+    app: AppHandle,
     wav_path: String,
     expected_text: String,
 ) -> Result<asr::AsrVerifyResult, String> {
-    let settings = state.settings.lock().clone();
-    let mut asr = state.asr_worker.lock();
-    asr::verify_wav_asr(&settings, &mut asr, &wav_path, &expected_text)
+    with_state_blocking(app, move |state| {
+        let settings = state.settings.lock().clone();
+        let mut asr = state.asr_worker.lock();
+        asr::verify_wav_asr(&settings, &mut asr, &wav_path, &expected_text)
+    })
+    .await
 }
 
 #[tauri::command]
-fn ensure_asr_model_cmd(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    let settings = state.settings.lock().clone();
-    let mut asr = state.asr_worker.lock();
-    let dir = asr.ensure_loaded(&settings)?;
-    Ok(dir.display().to_string())
+async fn ensure_asr_model_cmd(app: AppHandle) -> Result<String, String> {
+    with_state_blocking(app, |state| {
+        let settings = state.settings.lock().clone();
+        let mut asr = state.asr_worker.lock();
+        let dir = asr.ensure_loaded(&settings)?;
+        Ok(dir.display().to_string())
+    })
+    .await
 }
 
 /// Return WAV duration in seconds (via ffprobe or WAV header).
@@ -1119,8 +1150,12 @@ fn wav_duration_secs(
     path: String,
 ) -> Result<f64, String> {
     let settings = state.settings.lock().clone();
+    probe_wav_duration(&settings, &path)
+}
+
+pub(crate) fn probe_wav_duration(settings: &AppSettings, path: &str) -> Result<f64, String> {
     // Prefer bundled ffprobe (beside bundled ffmpeg)
-    if let Some(ffprobe) = resolve_ffprobe(&settings) {
+    if let Some(ffprobe) = resolve_ffprobe(settings) {
         let mut cmd = std::process::Command::new(ffprobe);
         crate::python_env::hide_console(&mut cmd);
         let output = cmd
@@ -1131,7 +1166,7 @@ fn wav_duration_secs(
                 "format=duration",
                 "-of",
                 "default=noprint_wrappers=1:nokey=1",
-                &path,
+                path,
             ])
             .output()
             .map_err(|e| e.to_string())?;
@@ -1143,7 +1178,7 @@ fn wav_duration_secs(
         }
     }
     // Fallback: parse WAV header
-    let data = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let data = std::fs::read(path).map_err(|e| e.to_string())?;
     if data.len() < 44 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
         return Err("WAV の長さを取得できません".into());
     }
@@ -1186,6 +1221,7 @@ pub fn run() {
         worker: Mutex::new(OptWorkerSimple::default()),
         asr_worker: Mutex::new(asr::AsrWorker::default()),
         train: Arc::new(TrainState::default()),
+        http: Mutex::new(http_server::HttpServerHandle::default()),
     };
 
     tauri::Builder::default()
@@ -1205,11 +1241,24 @@ pub fn run() {
                     eprintln!("[irodori-studio] WARNING: {e}");
                 }
             }
+            let settings = app.state::<AppState>().settings.lock().clone();
+            if settings.http_server_enabled {
+                if let Err(e) = app
+                    .state::<AppState>()
+                    .http
+                    .lock()
+                    .start(app.handle(), &settings)
+                {
+                    eprintln!("[irodori-studio] HTTP server start failed: {e}");
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_settings,
             set_settings,
+            http_server_status,
+            regenerate_http_token,
             validate_paths,
             infer_engine_paths,
             needs_first_setup_cmd,

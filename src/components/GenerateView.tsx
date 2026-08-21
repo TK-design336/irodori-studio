@@ -1802,6 +1802,7 @@ export function GenerateView({
           loaded?: boolean;
         }>("ping_worker");
         if (cancelled) return;
+        if (resp.status === "busy") return;
         if (resp.recovered) {
           setWorkerInfo("OPT を再起動しました");
           setStatus("ワーカーが応答しなかったため再起動しました");

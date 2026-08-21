@@ -5,6 +5,7 @@ import { BoundedSelect } from "./BoundedSelect";
 import type {
   AppSettings,
   ExportFilenamePart,
+  HttpServerStatus,
   InferredPaths,
   IrodoriVersion,
   PathValidation,
@@ -138,11 +139,34 @@ export function SettingsView({
   const [pathsCollapsed, setPathsCollapsed] = useState(false);
   const [playbackCollapsed, setPlaybackCollapsed] = useState(false);
   const [uiCollapsed, setUiCollapsed] = useState(false);
+  const [httpCollapsed, setHttpCollapsed] = useState(false);
   const [vocalModels, setVocalModels] = useState<VocalSeparatorModelInfo[]>([]);
+  const [httpStatus, setHttpStatus] = useState<HttpServerStatus | null>(null);
+  const [corsDraft, setCorsDraft] = useState("");
+  const [tokenCopied, setTokenCopied] = useState(false);
 
   useEffect(() => {
     setDraft(settings);
   }, [settings]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = () => {
+      void invoke<HttpServerStatus>("http_server_status")
+        .then((s) => {
+          if (!cancelled) setHttpStatus(s);
+        })
+        .catch(() => {
+          if (!cancelled) setHttpStatus(null);
+        });
+    };
+    refresh();
+    const id = window.setInterval(refresh, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [settings.httpServerEnabled, settings.httpBindAddress, settings.httpPort]);
 
   useEffect(() => {
     let cancelled = false;
@@ -986,6 +1010,209 @@ export function SettingsView({
             <span className="status-text">{msg}</span>
           </div>
         </div>
+        )}
+      </section>
+
+      <section className={`panel${httpCollapsed ? " collapsed" : ""}`}>
+        <header
+          className="panel-header"
+          onClick={() => setHttpCollapsed((v) => !v)}
+        >
+          <h3>ローカル HTTP サーバー</h3>
+          <span className="chevron">{httpCollapsed ? "▸" : "▾"}</span>
+        </header>
+        {!httpCollapsed && (
+          <div className="panel-body form-stack">
+            <p className="hint">
+              Chrome 拡張や外部ツールから音声合成を呼び出す API です。既定では
+              127.0.0.1 のみで待ち受けます。すべてのリクエストにトークンが必要です。
+            </p>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={draft.httpServerEnabled !== false}
+                onChange={(e) =>
+                  setShared("httpServerEnabled", e.target.checked)
+                }
+              />
+              HTTP サーバーを有効にする
+            </label>
+            <div className="blend-row">
+              <label>
+                バインドアドレス
+                <span className="hint">
+                  将来のリモート対応のため設定項目です。今は 127.0.0.1 のまま推奨します。
+                </span>
+                <input
+                  type="text"
+                  value={draft.httpBindAddress ?? "127.0.0.1"}
+                  onChange={(e) => setShared("httpBindAddress", e.target.value)}
+                  placeholder="127.0.0.1"
+                />
+              </label>
+              <label>
+                ポート（希望）
+                <span className="hint">
+                  使用中なら次の空きポートを試します（最大 20）。
+                </span>
+                <input
+                  type="number"
+                  min={1}
+                  max={65535}
+                  value={draft.httpPort ?? 18790}
+                  onChange={(e) =>
+                    setShared(
+                      "httpPort",
+                      Math.min(
+                        65535,
+                        Math.max(1, Math.floor(Number(e.target.value) || 18790)),
+                      ),
+                    )
+                  }
+                />
+              </label>
+            </div>
+            <div className="http-status-box">
+              <strong>状態: </strong>
+              {httpStatus?.running
+                ? `起動中 — http://${httpStatus.bindAddress}:${httpStatus.port}`
+                : "停止中"}
+              {httpStatus?.running &&
+                httpStatus.port != null &&
+                httpStatus.port !== httpStatus.preferredPort && (
+                  <span className="hint">
+                    （希望ポート {httpStatus.preferredPort} は使用中だったため{" "}
+                    {httpStatus.port} で起動）
+                  </span>
+                )}
+            </div>
+            <label>
+              API トークン
+              <span className="hint">
+                Authorization: Bearer … として送信します。拡張の設定にコピーしてください。
+              </span>
+              <div className="row http-token-row">
+                <input
+                  type="text"
+                  readOnly
+                  value={draft.httpToken ?? ""}
+                  className="http-token-input"
+                />
+                <button
+                  type="button"
+                  className="chip"
+                  disabled={!draft.httpToken}
+                  onClick={() => {
+                    const t = draft.httpToken ?? "";
+                    if (!t) return;
+                    void navigator.clipboard.writeText(t).then(() => {
+                      setTokenCopied(true);
+                      window.setTimeout(() => setTokenCopied(false), 1500);
+                    });
+                  }}
+                >
+                  {tokenCopied ? "コピー済み" : "コピー"}
+                </button>
+                <button
+                  type="button"
+                  className="chip"
+                  disabled={busy}
+                  onClick={() => {
+                    void (async () => {
+                      setBusy(true);
+                      try {
+                        const saved = await invoke<AppSettings>(
+                          "regenerate_http_token",
+                        );
+                        setDraft(saved);
+                        onSaved(saved);
+                        setMsg("トークンを再生成しました");
+                      } catch (e) {
+                        setMsg(String(e));
+                      } finally {
+                        setBusy(false);
+                      }
+                    })();
+                  }}
+                >
+                  再生成
+                </button>
+              </div>
+            </label>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={draft.httpAllowChromeExtensions !== false}
+                onChange={(e) =>
+                  setShared("httpAllowChromeExtensions", e.target.checked)
+                }
+              />
+              Chrome 拡張（chrome-extension://）からの CORS を許可
+            </label>
+            <div className="filename-parts-field">
+              <span className="filename-parts-label">追加の CORS オリジン</span>
+              <p className="hint">
+                完全一致で許可するオリジンを追加できます（例: http://localhost:3000）。
+              </p>
+              <ul className="filename-parts-list">
+                {(draft.httpCorsOrigins ?? []).map((origin) => (
+                  <li key={origin} className="filename-parts-item">
+                    <code>{origin}</code>
+                    <button
+                      type="button"
+                      className="chip"
+                      onClick={() =>
+                        setShared(
+                          "httpCorsOrigins",
+                          (draft.httpCorsOrigins ?? []).filter(
+                            (o) => o !== origin,
+                          ),
+                        )
+                      }
+                    >
+                      削除
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              <div className="row">
+                <input
+                  type="text"
+                  value={corsDraft}
+                  placeholder="https://example.com"
+                  onChange={(e) => setCorsDraft(e.target.value)}
+                />
+                <button
+                  type="button"
+                  className="chip"
+                  onClick={() => {
+                    const o = corsDraft.trim();
+                    if (!o) return;
+                    const cur = draft.httpCorsOrigins ?? [];
+                    if (cur.includes(o)) {
+                      setCorsDraft("");
+                      return;
+                    }
+                    setShared("httpCorsOrigins", [...cur, o]);
+                    setCorsDraft("");
+                  }}
+                >
+                  追加
+                </button>
+              </div>
+            </div>
+            <div className="row">
+              <button
+                type="button"
+                className="primary"
+                disabled={busy || !settingsDirty}
+                onClick={() => void save()}
+              >
+                保存
+              </button>
+              <span className="status-text">{msg}</span>
+            </div>
+          </div>
         )}
       </section>
     </div>

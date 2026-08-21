@@ -1,0 +1,267 @@
+[
+  {
+    "id": "ncode",
+    "name": "小説家になろう",
+    "family": "novel",
+    "match": ["*://ncode.syosetu.com/*", "*://novelcom.syosetu.com/*"],
+    "title": ".p-novel__title, .novel_subtitle, .novel_title, h1.p-novel__title",
+    "content": ".p-novel__body, #novel_honbun, .js-novel-text",
+    "exclude": [".c-announce", ".p-novel__notice", "rt", "rp"],
+    "rubyMode": "ignore",
+    "nextEpisode": "a.p-novel__navlink--next, a.c-pager__item--next, .c-pager__item--next a, a.novelview_pager-next"
+  },
+  {
+    "id": "moonlight",
+    "name": "ムーンライトノベルズ",
+    "family": "novel",
+    "match": [
+      "*://novel18.syosetu.com/*",
+      "*://mnlt.syosetu.com/*",
+      "*://noc.syosetu.com/*",
+      "*://mid.syosetu.com/*"
+    ],
+    "title": ".p-novel__title, .novel_subtitle, .novel_title, h1.p-novel__title",
+    "content": ".p-novel__body, #novel_honbun, .js-novel-text",
+    "exclude": [".c-announce", ".p-novel__notice", "rt", "rp"],
+    "rubyMode": "ignore",
+    "nextEpisode": "a.p-novel__navlink--next, a.c-pager__item--next, .c-pager__item--next a, a.novelview_pager-next"
+  },
+  {
+    "id": "kakuyomu",
+    "name": "カクヨム",
+    "family": "novel",
+    "match": ["*://kakuyomu.jp/works/*/episodes/*"],
+    "title": "p.widget-episodeTitle, h1.widget-episodeTitle, .widget-episodeTitle",
+    "content": ".widget-episodeBody, div.widget-episode",
+    "exclude": ["rt", "rp"],
+    "rubyMode": "ignore",
+    "nextEpisode": "a#contentMain-readNextEpisode, a[data-link-click-action-name='EpisodeNext'], a[rel='next']"
+  },
+  {
+    "id": "hameln",
+    "name": "ハーメルン",
+    "family": "novel",
+    "match": ["*://syosetu.org/novel/*", "*://h.syosetu.org/novel/*"],
+    "title": "#maind span[itemprop='name'], h1",
+    "content": "#honbun, #maind > div.ss, #maind .ss",
+    "exclude": [".novelnavi", "#maegaki_open", "#atogaki_open", "rt", "rp"],
+    "rubyMode": "ignore",
+    "nextEpisode": ".novelnavi a, a[rel='next']"
+  },
+  {
+    "id": "alphapolis",
+    "name": "アルファポリス",
+    "family": "novel",
+    "match": ["*://www.alphapolis.co.jp/novel/*", "*://alphapolis.co.jp/novel/*"],
+    "title": "h2.episode-title, .episode-title, h1",
+    "content": "#novelBody, .novel-body, #novel_body",
+    "exclude": [".episode-navigation", "rt", "rp"],
+    "rubyMode": "ignore",
+    "nextEpisode": ".episode-navigation a.next, a.next-episode, .pager .next a"
+  },
+  {
+    "id": "aozora",
+    "name": "青空文庫",
+    "family": "aozora",
+    "match": ["*://www.aozora.gr.jp/cards/*", "*://aozora.gr.jp/cards/*"],
+    "title": ".title, h1.title, h1",
+    "content": ".main_text",
+    "exclude": [".bibliographical_information", ".notation_notes", "#contents", "rp"],
+    "rubyMode": "reading",
+    "nextEpisode": null
+  },
+  {
+    "id": "yahoo-news",
+    "name": "Yahoo!ニュース",
+    "family": "news",
+    "match": ["*://news.yahoo.co.jp/articles/*", "*://news.yahoo.co.jp/pickup/*"],
+    "title": "h1",
+    "content": ".article_body, .highLightSearchTarget, [itemprop='articleBody']",
+    "exclude": [".sns", ".related", ".recommend", ".comment"],
+    "rubyMode": "ignore",
+    "nextEpisode": null
+  },
+  {
+    "id": "nhk",
+    "name": "NHK",
+    "family": "news",
+    "match": [
+      "*://www3.nhk.or.jp/news/*",
+      "*://www.nhk.or.jp/news/*",
+      "*://news.web.nhk/*",
+      "*://news.web.nhk.or.jp/*"
+    ],
+    "title": "h1.content--title, h1",
+    "content": "#news_textbody, #news_textmore, .content--detail-more, article, main",
+    "exclude": [".content--related", "aside"],
+    "rubyMode": "ignore",
+    "nextEpisode": null
+  },
+  {
+    "id": "bunshun",
+    "name": "文春オンライン",
+    "family": "longform",
+    "match": ["*://bunshun.jp/articles/*", "*://bunshun.jp/article/*"],
+    "title": "h1",
+    "content": "#article-body, .article-body, .c-article-body, [itemprop='articleBody']",
+    "exclude": [".sns", ".related", ".pager", "aside"],
+    "rubyMode": "ignore",
+    "nextEpisode": null
+  },
+  {
+    "id": "toyokeizai",
+    "name": "東洋経済オンライン",
+    "family": "longform",
+    "match": ["*://toyokeizai.net/*"],
+    "title": "h1",
+    "content": "#article-body, #article-body-inner, .article-body, [itemprop='articleBody']",
+    "exclude": [".sns", ".related", ".pager", "aside"],
+    "rubyMode": "ignore",
+    "nextEpisode": null
+  },
+  {
+    "id": "diamond",
+    "name": "ダイヤモンド・オンライン",
+    "family": "longform",
+    "match": ["*://diamond.jp/articles/*", "*://www.diamond.jp/articles/*"],
+    "title": "h1",
+    "content": "#articleBody, .c-article-body, .article-body, [itemprop='articleBody']",
+    "exclude": [".sns", ".related", ".pager", "aside"],
+    "rubyMode": "ignore",
+    "nextEpisode": null
+  },
+  {
+    "id": "gendai",
+    "name": "現代ビジネス",
+    "family": "longform",
+    "match": ["*://gendai.media/articles/*"],
+    "title": "h1",
+    "content": ".article-body, #article-body, [itemprop='articleBody']",
+    "exclude": [".sns", ".related", ".pager", "aside"],
+    "rubyMode": "ignore",
+    "nextEpisode": null
+  },
+  {
+    "id": "president",
+    "name": "PRESIDENT Online",
+    "family": "longform",
+    "match": ["*://president.jp/articles/*", "*://www.president.jp/articles/*"],
+    "title": "h1",
+    "content": ".article-body, #article-body, [itemprop='articleBody']",
+    "exclude": [".sns", ".related", ".pager", "aside"],
+    "rubyMode": "ignore",
+    "nextEpisode": null
+  },
+  {
+    "id": "note",
+    "name": "note",
+    "family": "ugc",
+    "match": ["*://note.com/*/n/*", "*://note.com/n/*", "*://note.mu/*/n/*"],
+    "title": "h1",
+    "content": "[class*='note-common-styles__textnote-body'], section[data-name='body'], [itemprop='articleBody'], article",
+    "exclude": ["pre", "code", "rt", "[class*='comment']", "[class*='tableOfContents']"],
+    "rubyMode": "ignore",
+    "nextEpisode": null
+  },
+  {
+    "id": "hatena",
+    "name": "はてなダイアリー / はてなブログ",
+    "family": "ugc",
+    "match": [
+      "*://d.hatena.ne.jp/*",
+      "*://blog.hatena.ne.jp/*",
+      "*://*.hatenablog.com/entry/*",
+      "*://*.hatenablog.jp/entry/*",
+      "*://*.hateblo.jp/entry/*",
+      "*://*.hatenadiary.com/entry/*",
+      "*://*.hatenadiary.jp/entry/*",
+      "*://*.hatenadiary.org/entry/*"
+    ],
+    "title": ".entry-title, h1.entry-title, h1",
+    "content": ".entry-content, #entry-content",
+    "exclude": [".comment", "#comment", ".entry-footer", "aside", ".hatena-module"],
+    "rubyMode": "ignore",
+    "nextEpisode": null
+  },
+  {
+    "id": "anond",
+    "name": "はてな匿名ダイアリー",
+    "family": "ugc",
+    "match": ["*://anond.hatelabo.jp/*"],
+    "title": "h1, h2",
+    "content": ".body .section, #body .section, .body",
+    "exclude": [".sectionfooter", ".sanchor", ".afc", ".ad-in-entry-block", ".pager-section"],
+    "rubyMode": "ignore",
+    "nextEpisode": null
+  },
+  {
+    "id": "pixiv-novel",
+    "name": "Pixiv 小説",
+    "match": ["*://www.pixiv.net/novel/show.php*", "*://www.pixiv.net/*/novel/show.php*"],
+    "title": "h1",
+    "content": ".gtm-novel-viewer-novel-text, main article",
+    "exclude": ["rt", "rp"],
+    "rubyMode": "ignore",
+    "nextEpisode": null
+  },
+  {
+    "id": "wikipedia",
+    "name": "Wikipedia",
+    "family": "wikipedia",
+    "match": ["*://*.wikipedia.org/wiki/*", "*://*.m.wikipedia.org/wiki/*"],
+    "title": "#firstHeading, h1#firstHeading",
+    "content": "#mw-content-text > .mw-parser-output, #mw-content-text .mw-parser-output",
+    "exclude": [
+      ".infobox",
+      "table.infobox",
+      ".reference",
+      ".mw-editsection",
+      "#toc",
+      ".toc",
+      ".navbox",
+      ".vertical-navbox",
+      "sup.reference",
+      ".thumb",
+      ".reflist",
+      ".mw-references-wrap",
+      ".hatnote",
+      ".shortdescription",
+      "#catlinks",
+      ".printfooter",
+      "style",
+      "script"
+    ],
+    "rubyMode": "ignore",
+    "nextEpisode": null
+  },
+  {
+    "id": "arxiv",
+    "name": "arXiv",
+    "match": ["*://arxiv.org/abs/*", "*://ar5iv.labs.arxiv.org/html/*"],
+    "title": "h1.title, .title",
+    "content": "blockquote.abstract, #abs .abstract, article.ltx_document",
+    "exclude": [".ltx_Math", "math", ".MathJax"],
+    "rubyMode": "ignore",
+    "nextEpisode": null
+  },
+  {
+    "id": "zenn",
+    "name": "Zenn",
+    "match": ["*://zenn.dev/*/articles/*", "*://zenn.dev/*/books/*/viewer*"],
+    "title": "h1",
+    "content": "article, .znc",
+    "exclude": ["pre", "code", "rt"],
+    "rubyMode": "ignore",
+    "nextEpisode": null
+  },
+  {
+    "id": "qiita",
+    "name": "Qiita",
+    "match": ["*://qiita.com/*/items/*"],
+    "title": "h1",
+    "content": "article, .it-MdContent",
+    "exclude": ["pre", "code", "rt"],
+    "rubyMode": "ignore",
+    "nextEpisode": null
+  }
+]

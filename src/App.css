@@ -959,6 +959,25 @@ input[type="range"] {
   flex-wrap: wrap;
 }
 
+.http-status-box {
+  padding: 0.6rem 0.75rem;
+  border-radius: 8px;
+  background: var(--panel-2, var(--surface));
+  border: 1px solid var(--border);
+  font-size: 0.9rem;
+}
+
+.http-token-row {
+  width: 100%;
+}
+
+.http-token-input {
+  flex: 1;
+  min-width: 12rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+}
+
 .row input {
   flex: 1;
 }

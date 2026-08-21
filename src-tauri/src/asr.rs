@@ -285,6 +285,8 @@ impl AsrWorker {
 
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
+        let stderr = child.stderr.take().ok_or("no stderr")?;
+        crate::python_env::drain_child_stderr(stderr, "asr_worker:stderr");
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         std::thread::spawn(move || {
             use std::io::BufRead;

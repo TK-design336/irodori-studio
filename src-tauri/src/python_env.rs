@@ -1,8 +1,30 @@
 //! Ensure the configured Irodori Python has pip + optional packages.
 
 use crate::settings::{resolve_python_exe, AppSettings};
+use std::io::BufRead;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{ChildStderr, Command, Stdio};
+
+/// Read a child stderr pipe on a background thread so the process cannot
+/// stall on a full OS pipe buffer (classic silent hang with piped stderr).
+pub fn drain_child_stderr(stderr: ChildStderr, label: &'static str) {
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let preview: String = trimmed.chars().take(300).collect();
+                    eprintln!("[{label}] {preview}");
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
 
 /// Hide the console window on Windows so short-lived python/ffmpeg spawns
 /// do not flash a CMD window or steal focus from the UI (e.g. while typing).

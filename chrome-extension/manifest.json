@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "Irodori Studio Reader",
+  "version": "0.3.0",
+  "description": "ページ本文を Irodori Studio で連続読み上げ",
+  "permissions": [
+    "sidePanel",
+    "offscreen",
+    "storage",
+    "scripting",
+    "activeTab",
+    "contextMenus",
+    "tabs"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "action": {
+    "default_title": "Irodori Reader",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

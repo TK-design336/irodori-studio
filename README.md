@@ -23,6 +23,8 @@ https://youtu.be/19eGabJSkBw
 - **再生・保存**: 連続再生、連結保存、セリフ別一括エクスポート。WAV / MP3 / Opus、ファイル名の並び変更
 - **文字起こし検証**: Whisper small（CPU）で CER を確認
 - **辞書**: 置換辞書と読み辞書（英単語 / 同形異音 / 数字の追加候補）
+- **ローカル HTTP API**: Studio 起動中に Bearer トークン付きで合成・連結を呼べる（既定は 127.0.0.1）
+- **Irodori Studio Reader**: Chrome 拡張。開いているページの本文を抽出し、Studio で連続読み上げ
 
 生成エンジンは **OPT（フル精度）のみ**（Lite は使用しません）。
 
@@ -46,7 +48,19 @@ https://youtu.be/19eGabJSkBw
 
 ## ダウンロード（ビルド済み）
 
-[Releases](https://github.com/TK-design336/irodori-studio/releases) からインストーラを入手できます。
+[Releases](https://github.com/TK-design336/irodori-studio/releases) から次を入手できます。
+
+- **Irodori Studio**: Windows インストーラ（NSIS setup 推奨、または MSI）
+- **Irodori Studio Reader**: Chrome 拡張の zip（解凍してデベロッパーモードで読み込み）
+
+### Studio Reader の入れ方
+
+1. Irodori Studio を起動し、**設定 → ローカル HTTP サーバー** でトークンをコピーする
+2. リリースの `Irodori.Studio.Reader_*.zip` を解凍する
+3. Chrome の `chrome://extensions` でデベロッパーモードをオンにし、「パッケージ化されていない拡張機能を読み込む」で解凍したフォルダを選ぶ
+4. Side Panel でベース URL とトークンを保存し、「接続テスト」する
+
+詳細は `chrome-extension/README.md` を参照してください。
 
 ## 開発起動
 

@@ -81,6 +81,24 @@ pub struct AppSettings {
     /// Slice review after speed, before dataset (skip / manual / auto).
     #[serde(default = "default_slice_review")]
     pub slice_review: SliceReviewSettings,
+    /// Local HTTP API server (Chrome extension / MCP entry).
+    #[serde(default = "default_http_server_enabled")]
+    pub http_server_enabled: bool,
+    /// Bind address (do not hardcode 127.0.0.1 in callers — use this setting).
+    #[serde(default = "default_http_bind_address")]
+    pub http_bind_address: String,
+    /// Preferred listen port; if busy, try the next ports.
+    #[serde(default = "default_http_port")]
+    pub http_port: u16,
+    /// Bearer token required on all API requests.
+    #[serde(default)]
+    pub http_token: String,
+    /// Extra CORS allowlist origins (exact match).
+    #[serde(default)]
+    pub http_cors_origins: Vec<String>,
+    /// When true, allow any `chrome-extension://` Origin.
+    #[serde(default = "default_http_allow_chrome_extensions")]
+    pub http_allow_chrome_extensions: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -340,6 +358,53 @@ fn default_asr_cer_warn_threshold() -> f64 {
 
 fn default_irodori_version() -> String {
     "v3".into()
+}
+
+fn default_http_server_enabled() -> bool {
+    true
+}
+
+fn default_http_bind_address() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_http_port() -> u16 {
+    18790
+}
+
+fn default_http_allow_chrome_extensions() -> bool {
+    true
+}
+
+/// 32-byte hex token for HTTP Bearer auth.
+pub fn generate_http_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().as_simple(),
+        uuid::Uuid::new_v4().as_simple()
+    )
+}
+
+pub fn normalize_http_bind_address(v: &str) -> String {
+    let t = v.trim();
+    if t.is_empty() {
+        default_http_bind_address()
+    } else {
+        t.to_string()
+    }
+}
+
+pub fn normalize_http_cors_origins(origins: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for o in origins {
+        let t = o.trim().to_string();
+        if t.is_empty() || !seen.insert(t.clone()) {
+            continue;
+        }
+        out.push(t);
+    }
+    out
 }
 
 fn default_engine_root(folder: &str) -> PathBuf {
@@ -672,6 +737,12 @@ impl Default for AppSettings {
             export_opus_bitrate_kbps: default_export_opus_bitrate_kbps(),
             vocal_separator_model: default_vocal_separator_model(),
             slice_review: default_slice_review(),
+            http_server_enabled: default_http_server_enabled(),
+            http_bind_address: default_http_bind_address(),
+            http_port: default_http_port(),
+            http_token: String::new(),
+            http_cors_origins: Vec::new(),
+            http_allow_chrome_extensions: default_http_allow_chrome_extensions(),
         }
     }
 }
@@ -857,7 +928,16 @@ pub fn load_settings() -> AppSettings {
                     s.accent_dark = normalize_accent_dark(&s.accent_dark);
                     s.slice_review.mode =
                         normalize_slice_review_mode(&s.slice_review.mode);
-                    if needs_rewrite {
+                    s.http_bind_address =
+                        normalize_http_bind_address(&s.http_bind_address);
+                    s.http_cors_origins =
+                        normalize_http_cors_origins(s.http_cors_origins);
+                    let mut rewritten = needs_rewrite;
+                    if s.http_token.trim().is_empty() {
+                        s.http_token = generate_http_token();
+                        rewritten = true;
+                    }
+                    if rewritten {
                         let _ = save_settings(&s);
                     }
                     return s;
@@ -865,7 +945,10 @@ pub fn load_settings() -> AppSettings {
             }
         }
     }
-    AppSettings::default()
+    let mut s = AppSettings::default();
+    s.http_token = generate_http_token();
+    let _ = save_settings(&s);
+    s
 }
 
 pub fn save_settings(settings: &AppSettings) -> Result<(), String> {
