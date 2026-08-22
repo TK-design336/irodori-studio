@@ -1,11 +1,18 @@
-import {
-  splitForSpeech,
-  clampChunkChars,
-  DEFAULT_CHUNK_CHARS,
-} from "./lib/splitText.js";
-import { findProfileForUrl, getAllProfiles } from "./lib/profiles.js";
-import { PlaybackController } from "./lib/playbackQueue.js";
+import { clampChunkChars, DEFAULT_CHUNK_CHARS } from "./lib/splitText.js";
+import { getAllProfiles } from "./lib/profiles.js";
 import { clearCache, cacheStats } from "./lib/cache.js";
+import {
+  apiFetch as studioApiFetch,
+  ALL_PAGE_ORIGINS,
+  studioOrigin,
+  ensureSiteAccess,
+  isMissingHostPermissionError,
+} from "./lib/studioApi.js";
+import {
+  extractPage as extractPageFromTab,
+  injectHighlight,
+  ensureTabPermission,
+} from "./lib/pageExtract.js";
 
 const DEFAULTS = {
   baseUrl: "http://127.0.0.1:18790",
@@ -63,13 +70,16 @@ const els = {
   settingsOverlay: document.getElementById("settingsOverlay"),
 };
 
-let controller = null;
 let lastExtract = null;
-let queuePlaying = false;
+let lastPlayerStatus = null;
 let isReadingUi = false;
 let concatBusy = false;
 let concatJobId = null;
 let concatAbort = false;
+
+function playerSend(msg) {
+  return chrome.runtime.sendMessage(msg);
+}
 
 function setStatus(el, text, kind) {
   el.textContent = text || "";
@@ -214,16 +224,6 @@ async function saveSettings() {
   return { baseUrl, token, speakerId };
 }
 
-const ALL_PAGE_ORIGINS = ["http://*/*", "https://*/*"];
-
-function studioOrigin(baseUrl) {
-  try {
-    return new URL(baseUrl).origin;
-  } catch {
-    return null;
-  }
-}
-
 function currentStudioOrigin() {
   return studioOrigin(els.baseUrl.value.trim().replace(/\/$/, "") || DEFAULTS.baseUrl);
 }
@@ -237,38 +237,6 @@ function explainError(err) {
     return "再生権限の確認に失敗しました。もう一度ボタンを押してください。";
   }
   return String(err?.message || err || "");
-}
-
-async function hasOriginPermission(origins) {
-  try {
-    return await chrome.permissions.contains({ origins });
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Already-granted check only. Never prompts.
- * chrome.permissions.request() requires a user gesture even when already
- * granted, so polling / auto-next must not call it.
- */
-async function ensureHostPermission(baseUrl) {
-  const origin = studioOrigin(baseUrl);
-  if (!origin) throw new Error("ベース URL が不正です");
-  const pattern = origin + "/*";
-  if (await hasOriginPermission([pattern])) return;
-  if (await hasOriginPermission(ALL_PAGE_ORIGINS)) return;
-  throw new Error(
-    "Studio へのアクセス権限がありません。設定で「接続テスト」を押してください。",
-  );
-}
-
-/** Side Panel のクリックでは activeTab が付かないので、操作の最初にサイト権限を取る。 */
-async function ensureSiteAccess() {
-  if (await hasOriginPermission(ALL_PAGE_ORIGINS)) return;
-  throw new Error(
-    "ページへのアクセス権限がありません。「このページを読み上げ」をもう一度押し、許可してください。",
-  );
 }
 
 /**
@@ -297,20 +265,6 @@ async function assertGranted(permPromise, deniedMessage) {
   if (!granted) throw new Error(deniedMessage);
 }
 
-async function ensureTabPermission(tab) {
-  if (!tab?.url) {
-    throw new Error("このタブの URL を取得できません");
-  }
-  if (/^(chrome|chrome-extension|edge|about|devtools|chrome-search):/i.test(tab.url)) {
-    throw new Error("このページでは操作できません");
-  }
-  await ensureSiteAccess();
-}
-
-function isMissingHostPermissionError(err) {
-  return /must request permission|Cannot access contents/i.test(String(err?.message || err || ""));
-}
-
 async function getConfig() {
   return {
     baseUrl: els.baseUrl.value.trim().replace(/\/$/, "") || DEFAULTS.baseUrl,
@@ -319,41 +273,8 @@ async function getConfig() {
   };
 }
 
-async function apiFetch(path, { method = "GET", body, expectBinary = false } = {}) {
-  const { baseUrl, token } = await getConfig();
-  if (!token) {
-    throw new Error("トークンが未設定です（Studio の設定画面からコピーしてください）");
-  }
-  await ensureHostPermission(baseUrl);
-
-  let res;
-  try {
-    res = await fetch(`${baseUrl}${path}`, {
-      method,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        ...(body ? { "Content-Type": "application/json" } : {}),
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-  } catch (e) {
-    throw new Error(
-      `Studio に接続できません。アプリが起動しているか、ベース URL（${baseUrl}）を確認してください。（${e.message || e}）`,
-    );
-  }
-  if (res.status === 401 || res.status === 403) {
-    throw new Error("認証に失敗しました。トークンを確認してください。");
-  }
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`API エラー ${res.status}: ${text || res.statusText}`);
-  }
-  if (expectBinary) {
-    const buf = await res.arrayBuffer();
-    const mime = res.headers.get("content-type") || "audio/wav";
-    return { buf, mime };
-  }
-  return res.json();
+async function apiFetch(path, opts = {}) {
+  return studioApiFetch(path, { ...opts, config: await getConfig() });
 }
 
 async function refreshSpeakers(preferredId) {
@@ -441,62 +362,6 @@ async function getSelectionText() {
   }
 }
 
-async function injectExtract(tabId, profile) {
-  const run = async () => {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-        files: ["vendor/Readability.js", "content/fetchers.js", "content/extract-page.js"],
-    });
-    const [{ result }] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: (p) => globalThis.__irodoriExtract({ profile: p }),
-      args: [profile],
-    });
-    return result;
-  };
-  try {
-    return await run();
-  } catch (e) {
-    if (!isMissingHostPermissionError(e)) throw e;
-    await ensureSiteAccess();
-    try {
-      return await run();
-    } catch (e2) {
-      throw new Error(
-        "このページの内容にアクセスできません。拡張機能の「サイトへのアクセス」でこのサイトを許可してください。",
-      );
-    }
-  }
-}
-
-async function injectHighlight(tabId, chunks, color, contentSelector) {
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["content/highlight.js"],
-    });
-  } catch (e) {
-    if (isMissingHostPermissionError(e)) {
-      await ensureSiteAccess();
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        files: ["content/highlight.js"],
-      });
-    } else {
-      throw e;
-    }
-  }
-  await chrome.tabs.sendMessage(tabId, {
-    type: "IRODORI_SET_CHUNKS",
-    chunks,
-    contentSelector: contentSelector || null,
-  }).catch(() => {});
-  await chrome.tabs.sendMessage(tabId, {
-    type: "IRODORI_SET_HIGHLIGHT_COLOR",
-    color: color || els.hlColor.value,
-  }).catch(() => {});
-}
-
 async function siteKey(url) {
   try {
     return new URL(url).hostname;
@@ -545,21 +410,31 @@ async function rememberSpeakerForUrl(url, speakerId) {
   await chrome.storage.local.set({ siteSpeakers: next });
 }
 
-async function extractPage(tab) {
-  await ensureTabPermission(tab);
-  const profile = await findProfileForUrl(tab.url || "");
-  const result = await injectExtract(tab.id, profile);
-  if (!result?.ok || !result.text?.trim()) {
-    throw new Error("本文を抽出できませんでした");
+function extractPage(tab) {
+  return extractPageFromTab(tab, getChunkChars());
+}
+
+function applyPlayerStatus(st) {
+  lastPlayerStatus = st || null;
+  updateNowPlaying(st);
+  if (!st) return;
+  if (st.waiting) setStatus(els.playStatus, "生成待ち…", null);
+  else if (st.playing) setStatus(els.playStatus, "再生中", "ok");
+  else if (st.paused) setStatus(els.playStatus, "一時停止", null);
+}
+
+async function restorePlayerFromHost() {
+  try {
+    const snap = await playerSend({ type: "PLAYER_GET_STATE" });
+    if (!snap) return;
+    if (snap.extract) lastExtract = snap.extract;
+    if (snap.status) applyPlayerStatus(snap.status);
+    if (snap.playing || snap.status?.playing || snap.status?.paused || snap.status?.waiting) {
+      setReadingUi(true);
+    }
+  } catch (_) {
+    /* host idle */
   }
-  const chunks = splitForSpeech(result.text, getChunkChars());
-  return {
-    ...result,
-    chunks,
-    tabId: tab.id,
-    profileId: profile?.id || result?.family || null,
-    contentSelector: result?.contentSelector || profile?.content || null,
-  };
 }
 
 async function startReading(extract, { episodesRead = 1 } = {}) {
@@ -576,17 +451,6 @@ async function startReading(extract, { episodesRead = 1 } = {}) {
   );
   setReadingUi(true);
 
-  controller = new PlaybackController({
-    apiFetch,
-    tabId: extract.tabId,
-    onStatus: (st) => {
-      updateNowPlaying(st);
-      if (st.waiting) setStatus(els.playStatus, "生成待ち…", null);
-      else if (st.playing) setStatus(els.playStatus, "再生中", "ok");
-      else if (st.paused) setStatus(els.playStatus, "一時停止", null);
-    },
-  });
-
   if (extract.paywall) {
     setStatus(
       els.playStatus,
@@ -598,52 +462,29 @@ async function startReading(extract, { episodesRead = 1 } = {}) {
   } else {
     setStatus(els.playStatus, "読み上げを開始します…");
   }
-  let result;
-  try {
-    result = await controller.start({
-      title: extract.title,
-      url: extract.url,
-      chunks: extract.chunks,
-      speakerId: speaker,
-      speed: Number(els.rate.value),
-      volume: Number(els.volume.value),
-      episodesRead,
-    });
-  } catch (e) {
+
+  const res = await playerSend({
+    type: "PLAYER_START",
+    title: extract.title,
+    url: extract.url,
+    chunks: extract.chunks,
+    speakerId: speaker,
+    speed: Number(els.rate.value),
+    volume: Number(els.volume.value),
+    episodesRead,
+    tabId: extract.tabId,
+    nextEpisodeUrl: extract.nextEpisodeUrl || null,
+    contentSelector: extract.contentSelector || null,
+    text: extract.text || "",
+    paywall: !!extract.paywall,
+    pagesFetched: extract.pagesFetched || 1,
+    highlightColor: els.hlColor.value,
+  });
+  if (res?.ok === false) {
     setReadingUi(false);
     resetNowPlaying();
-    throw e;
+    throw new Error(res.error || "読み上げを開始できませんでした");
   }
-
-  if (result?.done && els.autoNextEpisode.checked && extract.nextEpisodeUrl) {
-    setStatus(els.playStatus, "次話へ移動します…", "ok");
-    await chrome.tabs.update(extract.tabId, { url: extract.nextEpisodeUrl });
-    await waitTabComplete(extract.tabId);
-    const next = await extractPage({ id: extract.tabId, url: extract.nextEpisodeUrl });
-    await startReading(next, { episodesRead: episodesRead + 1 });
-  } else if (result?.done) {
-    setReadingUi(false);
-    setStatus(els.playStatus, "読み上げが完了しました", "ok");
-  } else {
-    setReadingUi(false);
-  }
-}
-
-function waitTabComplete(tabId) {
-  return new Promise((resolve) => {
-    const timeout = setTimeout(() => {
-      chrome.tabs.onUpdated.removeListener(listener);
-      resolve();
-    }, 20000);
-    function listener(id, info) {
-      if (id === tabId && info.status === "complete") {
-        clearTimeout(timeout);
-        chrome.tabs.onUpdated.removeListener(listener);
-        setTimeout(resolve, 500);
-      }
-    }
-    chrome.tabs.onUpdated.addListener(listener);
-  });
 }
 
 async function synthesizeAndPlay(text) {
@@ -720,23 +561,26 @@ async function addReadLater(url, title) {
 
 async function playReadLaterQueue() {
   const { readLater } = await chrome.storage.local.get("readLater");
-  const list = [...(readLater || [])];
-  if (!list.length) {
+  if (!(readLater || []).length) {
     setStatus(els.playStatus, "キューが空です", "err");
     return;
   }
-  queuePlaying = true;
-  while (list.length && queuePlaying) {
-    const item = list.shift();
-    await chrome.storage.local.set({ readLater: list });
-    renderReadLater(list);
-    const tab = await activeTab();
-    await chrome.tabs.update(tab.id, { url: item.url });
-    await waitTabComplete(tab.id);
-    const extract = await extractPage({ id: tab.id, url: item.url });
-    await startReading(extract);
+  const tab = await activeTab();
+  setReadingUi(true);
+  setStatus(els.playStatus, "キューを再生します…");
+  const res = await playerSend({
+    type: "PLAYER_PLAY_QUEUE",
+    tabId: tab.id,
+    speakerId: els.speaker.value || "",
+    speed: Number(els.rate.value),
+    volume: Number(els.volume.value),
+    highlightColor: els.hlColor.value,
+    chunkChars: getChunkChars(),
+  });
+  if (res?.ok === false) {
+    setReadingUi(false);
+    throw new Error(res.error || "キューを再生できませんでした");
   }
-  queuePlaying = false;
 }
 
 async function waitJobComplete(jobId) {
@@ -798,21 +642,19 @@ async function concatSave() {
   const title = lastExtract.title;
 
   // During reading: reuse session job audio (no re-synth of finished lines)
-  if (isReadingUi && controller?.jobId) {
+  const sessionJobId = lastPlayerStatus?.jobId;
+  if (isReadingUi && sessionJobId) {
     setStatus(els.playStatus, "読み上げ済み音声を連結中…");
-    // Wait until current job finishes remaining lines (or use what's done via endpoint)
     concatBusy = true;
     concatAbort = false;
-    concatJobId = controller.jobId;
+    concatJobId = sessionJobId;
     updateConcatButton();
     try {
-      // Prefer waiting for full job so export is complete; abortible via button only when !isReadingUi
-      // During reading, transport ■ stops reading — also cancel wait by checking controller
       while (true) {
-        if (concatAbort || controller?.aborted) {
+        if (concatAbort || lastPlayerStatus?.stopped) {
           throw new Error("停止されました");
         }
-        const st = await apiFetch(`/v1/jobs/${controller.jobId}`);
+        const st = await apiFetch(`/v1/jobs/${sessionJobId}`);
         if (st.status === "completed" || st.completed >= st.total) break;
         if (st.status === "failed") throw new Error(st.error || "合成失敗");
         if (st.status === "cancelled") throw new Error("停止されました");
@@ -822,7 +664,7 @@ async function concatSave() {
         );
         await new Promise((r) => setTimeout(r, 400));
       }
-      await downloadJobConcat(controller.jobId, format, title);
+      await downloadJobConcat(sessionJobId, format, title);
       setStatus(els.playStatus, "連結ファイルを保存しました", "ok");
     } finally {
       concatBusy = false;
@@ -955,35 +797,31 @@ els.btnPlayQueue.addEventListener("click", () => {
   })().catch((e) => setStatus(els.playStatus, explainError(e), "err"));
 });
 els.btnStop.addEventListener("click", () => {
-  queuePlaying = false;
   concatAbort = true;
   void (async () => {
-    if (controller) await controller.stop();
+    await playerSend({ type: "PLAYER_STOP" });
     resetNowPlaying();
     setReadingUi(false);
     setStatus(els.playStatus, "停止しました");
   })();
 });
 els.btnPrev.addEventListener("click", () => {
-  void controller?.prev();
+  void playerSend({ type: "PLAYER_PREV" });
 });
 els.btnNext.addEventListener("click", () => {
-  void controller?.next();
+  void playerSend({ type: "PLAYER_NEXT" });
 });
 els.btnPlayPause.addEventListener("click", () => {
-  void (async () => {
-    if (!controller) return;
-    await controller.togglePause();
-  })();
+  void playerSend({ type: "PLAYER_TOGGLE_PAUSE" });
 });
 els.rate.addEventListener("input", () => {
   els.rateLabel.textContent = `${Number(els.rate.value).toFixed(2)}x`;
-  void controller?.setRate(Number(els.rate.value));
+  void playerSend({ type: "PLAYER_SET_RATE", rate: Number(els.rate.value) });
   void chrome.storage.local.set({ rate: Number(els.rate.value) });
 });
 els.volume.addEventListener("input", () => {
   els.volLabel.textContent = `${Math.round(Number(els.volume.value) * 100)}%`;
-  void controller?.setGain(Number(els.volume.value));
+  void playerSend({ type: "PLAYER_SET_GAIN", gain: Number(els.volume.value) });
   void chrome.storage.local.set({ volume: Number(els.volume.value) });
 });
 els.autoNextEpisode.addEventListener("change", () => {
@@ -999,7 +837,7 @@ els.speaker.addEventListener("change", () => {
     } catch (_) {
       /* ignore */
     }
-    void controller?.changeSpeaker(id);
+    void playerSend({ type: "PLAYER_CHANGE_SPEAKER", speakerId: id });
   })();
 });
 els.btnConcat.addEventListener("click", () => {
@@ -1078,7 +916,35 @@ chrome.runtime.onMessage.addListener((msg) => {
     void addReadLater(msg.url, msg.title);
   }
   if (msg?.type === "SEEK_CHUNK" && typeof msg.index === "number") {
-    void controller?.seekTo(msg.index);
+    void playerSend({ type: "PLAYER_SEEK", index: msg.index });
+  }
+  if (msg?.type === "PLAYER_STATUS" && msg.status) {
+    applyPlayerStatus(msg.status);
+  }
+  if (msg?.type === "PLAYER_EXTRACT" && msg.extract) {
+    lastExtract = msg.extract;
+  }
+  if (msg?.type === "PLAYER_PROGRESS" && msg.message) {
+    setStatus(els.playStatus, msg.message, "ok");
+  }
+  if (msg?.type === "PLAYER_ERROR" && msg.error) {
+    setReadingUi(false);
+    setStatus(els.playStatus, explainError(msg.error), "err");
+  }
+  if (msg?.type === "PLAYER_FINISHED") {
+    if (msg.reason === "done") {
+      setReadingUi(false);
+      setStatus(els.playStatus, "読み上げが完了しました", "ok");
+    } else if (msg.reason === "queue-empty") {
+      setReadingUi(false);
+      setStatus(els.playStatus, "キューの再生が完了しました", "ok");
+    }
+  }
+});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.readLater) {
+    renderReadLater(changes.readLater.newValue || []);
   }
 });
 
@@ -1118,4 +984,5 @@ void (async () => {
       );
     }
   }
+  await restorePlayerFromHost();
 })();

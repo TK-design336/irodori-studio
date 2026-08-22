@@ -2,6 +2,9 @@
  * Offscreen playback with pitch-preserving speed.
  * Uses HTMLAudioElement.preservesPitch (atempo-like) instead of
  * AudioBufferSourceNode.playbackRate which changes pitch.
+ *
+ * A silent loop + runtime port keep this document (and the SW) alive while
+ * a session is active, including TTS wait gaps when speech audio is idle.
  */
 
 let rate = 1;
@@ -15,6 +18,67 @@ let chunkPlaying = false;
 let paused = false;
 let sessionActive = false;
 let playGeneration = 0;
+
+/** Keep AUDIO_PLAYBACK valid between speech chunks. */
+let keepAliveCtx = null;
+let keepAliveAudio = null;
+
+function startSilentKeepalive() {
+  if (keepAliveCtx || keepAliveAudio) return;
+  try {
+    const ctx = new AudioContext();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    gain.gain.value = 0.001;
+    osc.frequency.value = 40;
+    osc.connect(gain).connect(ctx.destination);
+    osc.start();
+    keepAliveCtx = ctx;
+    return;
+  } catch (_) {
+    /* fall through */
+  }
+  const el = new Audio(
+    "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA",
+  );
+  el.loop = true;
+  el.volume = 0.01;
+  el.play().catch(() => {});
+  keepAliveAudio = el;
+}
+
+function stopSilentKeepalive() {
+  if (keepAliveCtx) {
+    try {
+      keepAliveCtx.close();
+    } catch (_) {
+      /* ignore */
+    }
+    keepAliveCtx = null;
+  }
+  if (!keepAliveAudio) return;
+  try {
+    keepAliveAudio.pause();
+    keepAliveAudio.removeAttribute("src");
+    keepAliveAudio.load();
+  } catch (_) {
+    /* ignore */
+  }
+  keepAliveAudio = null;
+}
+
+function connectKeepalivePort() {
+  try {
+    const port = chrome.runtime.connect({ name: "offscreen-keepalive" });
+    port.onDisconnect.addListener(() => {
+      setTimeout(connectKeepalivePort, 250);
+    });
+  } catch (_) {
+    setTimeout(connectKeepalivePort, 500);
+  }
+}
+
+connectKeepalivePort();
 
 function revokeUrl() {
   if (objectUrl) {
@@ -129,10 +193,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         rate = msg.rate || 1;
         gainValue = msg.gain ?? 0.8;
         stopAudio(false);
+        startSilentKeepalive();
         return { ok: true };
       }
       case "OFFSCREEN_SESSION_END": {
         sessionActive = false;
+        stopSilentKeepalive();
         return { ok: true };
       }
       case "OFFSCREEN_QUEUE_CHUNK": {
@@ -177,6 +243,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           blobs.clear();
           sessionActive = false;
           currentIndex = -1;
+          stopSilentKeepalive();
         }
         return { ok: true };
       }

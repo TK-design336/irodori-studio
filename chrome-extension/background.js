@@ -1,7 +1,23 @@
-/** Service worker: Side Panel, Offscreen lifecycle, message relay. */
+/** Service worker: Side Panel, Offscreen lifecycle, playback session host. */
 
-const OFFSCREEN_URL = "offscreen.html";
-const OFFSCREEN_REASON = "AUDIO_PLAYBACK";
+import { ensureOffscreen } from "./lib/offscreenDoc.js";
+import {
+  playerStart,
+  playerStop,
+  playerPause,
+  playerResume,
+  playerTogglePause,
+  playerNext,
+  playerPrev,
+  playerSeek,
+  playerSetRate,
+  playerSetGain,
+  playerChangeSpeaker,
+  playerReadTab,
+  playerPlayQueue,
+  getPlayerSnapshot,
+  recoverOffscreenSession,
+} from "./lib/playerHost.js";
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.removeAll(() => {
@@ -46,6 +62,16 @@ async function pingSidePanel(message, retries = 10) {
   return false;
 }
 
+async function addReadLater(url, title) {
+  if (!url) return { ok: false, error: "URL がありません" };
+  const { readLater } = await chrome.storage.local.get("readLater");
+  const list = readLater || [];
+  if (list.some((x) => x.url === url)) return { ok: true, exists: true };
+  list.push({ url, title: title || url, addedAt: Date.now() });
+  await chrome.storage.local.set({ readLater: list });
+  return { ok: true };
+}
+
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   try {
     await chrome.permissions.request({
@@ -63,31 +89,33 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   }
   if (info.menuItemId === "irodori-read-page") {
     await openSidePanel(tab);
-    await pingSidePanel({ type: "READ_PAGE", tabId: tab?.id });
+    try {
+      await ensureOffscreen();
+      await playerReadTab({ tabId: tab?.id });
+    } catch (e) {
+      await pingSidePanel({
+        type: "PLAYER_ERROR",
+        error: String(e?.message || e),
+      });
+    }
     return;
   }
   if (info.menuItemId === "irodori-read-later") {
+    await addReadLater(tab?.url, tab?.title);
     await openSidePanel(tab);
-    await pingSidePanel({
-      type: "ADD_READ_LATER",
-      url: tab?.url,
-      title: tab?.title,
-    });
   }
 });
 
-async function ensureOffscreen() {
-  const contexts = await chrome.runtime.getContexts({
-    contextTypes: ["OFFSCREEN_DOCUMENT"],
-    documentUrls: [chrome.runtime.getURL(OFFSCREEN_URL)],
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== "offscreen-keepalive") return;
+  port.onDisconnect.addListener(() => {
+    const snap = getPlayerSnapshot();
+    if (!snap.playing) return;
+    ensureOffscreen()
+      .then(() => recoverOffscreenSession())
+      .catch(() => {});
   });
-  if (contexts.length > 0) return;
-  await chrome.offscreen.createDocument({
-    url: OFFSCREEN_URL,
-    reasons: [OFFSCREEN_REASON],
-    justification: "Gapless speech playback while switching tabs",
-  });
-}
+});
 
 const OFFSCREEN_TYPES = new Set([
   "OFFSCREEN_SESSION_START",
@@ -104,6 +132,61 @@ const OFFSCREEN_TYPES = new Set([
   "OFFSCREEN_GET_STATE",
   "OFFSCREEN_PLAY",
 ]);
+
+const PLAYER_TYPES = new Set([
+  "PLAYER_START",
+  "PLAYER_STOP",
+  "PLAYER_PAUSE",
+  "PLAYER_RESUME",
+  "PLAYER_TOGGLE_PAUSE",
+  "PLAYER_NEXT",
+  "PLAYER_PREV",
+  "PLAYER_SEEK",
+  "PLAYER_SET_RATE",
+  "PLAYER_SET_GAIN",
+  "PLAYER_CHANGE_SPEAKER",
+  "PLAYER_READ_TAB",
+  "PLAYER_PLAY_QUEUE",
+  "PLAYER_GET_STATE",
+  "PLAYER_ADD_READ_LATER",
+]);
+
+function handlePlayer(msg) {
+  switch (msg.type) {
+    case "PLAYER_START":
+      return playerStart(msg);
+    case "PLAYER_STOP":
+      return playerStop();
+    case "PLAYER_PAUSE":
+      return playerPause();
+    case "PLAYER_RESUME":
+      return playerResume();
+    case "PLAYER_TOGGLE_PAUSE":
+      return playerTogglePause();
+    case "PLAYER_NEXT":
+      return playerNext();
+    case "PLAYER_PREV":
+      return playerPrev();
+    case "PLAYER_SEEK":
+      return playerSeek(msg.index);
+    case "PLAYER_SET_RATE":
+      return playerSetRate(msg.rate);
+    case "PLAYER_SET_GAIN":
+      return playerSetGain(msg.gain);
+    case "PLAYER_CHANGE_SPEAKER":
+      return playerChangeSpeaker(msg.speakerId);
+    case "PLAYER_READ_TAB":
+      return playerReadTab(msg);
+    case "PLAYER_PLAY_QUEUE":
+      return playerPlayQueue(msg);
+    case "PLAYER_GET_STATE":
+      return getPlayerSnapshot();
+    case "PLAYER_ADD_READ_LATER":
+      return addReadLater(msg.url, msg.title);
+    default:
+      return null;
+  }
+}
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg !== "object") return;
@@ -137,20 +220,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  if (PLAYER_TYPES.has(msg.type)) {
+    const needsDoc =
+      msg.type !== "PLAYER_GET_STATE" &&
+      msg.type !== "PLAYER_STOP" &&
+      msg.type !== "PLAYER_ADD_READ_LATER";
+    const run = async () => {
+      if (needsDoc) await ensureOffscreen();
+      const result = await handlePlayer(msg);
+      return result ?? { ok: true };
+    };
+    run()
+      .then((r) => sendResponse(r ?? { ok: true }))
+      .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
+    return true;
+  }
+
   // Side panel / content → do not re-broadcast OFFSCREEN_* (offscreen listens directly).
   if (OFFSCREEN_TYPES.has(msg.type)) {
     return;
   }
 
-  // Click-to-seek from content script → side panel
+  // Click-to-seek from content script → playback host (not the side panel)
   if (msg.type === "IRODORI_SEEK_CHUNK") {
-    chrome.runtime
-      .sendMessage({
-        type: "SEEK_CHUNK",
-        index: msg.index,
-      })
-      .catch(() => {});
-    sendResponse({ ok: true });
+    playerSeek(msg.index)
+      .then(() => sendResponse({ ok: true }))
+      .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
     return true;
   }
 });

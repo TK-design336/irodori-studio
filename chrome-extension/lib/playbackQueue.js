@@ -1,9 +1,10 @@
 /**
  * Prefetch + playback coordination.
- * Side panel owns API fetch; talks to offscreen via chrome.runtime.
+ * Service worker owns the session; talks to offscreen via chrome.runtime.
  */
 
 import { cacheKey, getCached, putCached } from "./cache.js";
+import { ensureOffscreen } from "./offscreenDoc.js";
 
 const PREFETCH = 3;
 const CHARS_PER_SEC = 8;
@@ -36,7 +37,11 @@ export class PlaybackController {
   }
 
   async ensureOffscreen() {
-    await chrome.runtime.sendMessage({ type: "ENSURE_OFFSCREEN" });
+    await ensureOffscreen();
+  }
+
+  invalidateOffscreenBuffers() {
+    this.buffersReady.clear();
   }
 
   async sendOffscreen(msg) {
@@ -76,6 +81,7 @@ export class PlaybackController {
       waiting: this.waiting,
       stopped: this.aborted && !this.playing,
       episodesRead: this.episodesRead,
+      jobId: this.jobId,
     });
   }
 
