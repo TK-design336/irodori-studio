@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   ANNOTATION_KIND_LABEL,
+  readingForApply,
   type DetectedAnnotation,
 } from "../lib/annotations";
 
@@ -69,7 +70,10 @@ export function AnnotationPopover({
   const left = Math.min(anchorRect.left, window.innerWidth - 240);
 
   const enterManual = (prefill?: string) => {
-    setManual(prefill ?? annotation.candidates[0]?.reading ?? "");
+    setManual(
+      prefill ??
+        readingForApply(annotation.kind, annotation.candidates[0]?.reading ?? ""),
+    );
     setManualModeAndPin(true);
   };
 
@@ -108,20 +112,23 @@ export function AnnotationPopover({
         </div>
       ) : (
         <ul className="annotation-popover-list">
-          {annotation.candidates.map((c, i) => (
-            <li key={`${c.reading}-${i}`}>
-              <button type="button" onClick={() => onApply(c.reading)}>
-                {c.label ? (
-                  <>
-                    <span className="annotation-popover-reading">{c.reading}</span>
-                    <span className="annotation-popover-label">{c.label}</span>
-                  </>
-                ) : (
-                  c.reading
-                )}
-              </button>
-            </li>
-          ))}
+          {annotation.candidates.map((c, i) => {
+            const reading = readingForApply(annotation.kind, c.reading);
+            return (
+              <li key={`${reading}-${i}`}>
+                <button type="button" onClick={() => onApply(reading)}>
+                  {c.label ? (
+                    <>
+                      <span className="annotation-popover-reading">{reading}</span>
+                      <span className="annotation-popover-label">{c.label}</span>
+                    </>
+                  ) : (
+                    reading
+                  )}
+                </button>
+              </li>
+            );
+          })}
           <li className="annotation-popover-manual-item">
             <button type="button" onClick={() => enterManual()}>
               手動入力…

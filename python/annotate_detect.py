@@ -43,13 +43,29 @@ def _reading_extras(reading_dict: list[dict]) -> dict[str, dict[str, list[str]]]
     return out
 
 
-def _merge_cands(cands: list[dict], extras: list[str]) -> list[dict]:
-    out = list(cands or [])
-    seen = {str(c.get("reading") or "") for c in out}
+def _merge_cands(
+    cands: list[dict],
+    extras: list[str],
+    *,
+    hiragana: bool = False,
+) -> list[dict]:
+    out: list[dict] = []
+    seen: set[str] = set()
+    for c in cands or []:
+        reading = str(c.get("reading") or "")
+        if hiragana:
+            reading = homograph_detect.katakana_to_hiragana(reading)
+        if not reading or reading in seen:
+            continue
+        seen.add(reading)
+        item = dict(c)
+        item["reading"] = reading
+        out.append(item)
     for r in extras:
-        if r and r not in seen:
-            seen.add(r)
-            out.append({"reading": r, "label": "辞書"})
+        reading = homograph_detect.katakana_to_hiragana(r) if hiragana else r
+        if reading and reading not in seen:
+            seen.add(reading)
+            out.append({"reading": reading, "label": "辞書"})
     return out
 
 
@@ -107,6 +123,7 @@ def detect_all(
                 "candidates": _merge_cands(
                     h.get("candidates") or [],
                     extras["heteronym"].get(surface, []),
+                    hiragana=True,
                 ),
             }
         )

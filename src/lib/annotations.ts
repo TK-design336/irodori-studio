@@ -63,12 +63,52 @@ export function synthTextForLine(
   return buildSynthText(text, validateReadings(text, applied ?? []));
 }
 
+/** Katakana → hiragana (同形異音の選択入力用). Leaves other characters unchanged. */
+export function katakanaToHiragana(s: string): string {
+  let out = "";
+  for (const ch of s) {
+    const code = ch.codePointAt(0);
+    if (code !== undefined && code >= 0x30a1 && code <= 0x30f6) {
+      out += String.fromCodePoint(code - 0x60);
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
+
+export function readingForApply(kind: AnnotationKind, reading: string): string {
+  const t = reading.trim();
+  return kind === "heteronym" ? katakanaToHiragana(t) : t;
+}
+
+export function normalizeDetectedAnnotations(
+  annotations: DetectedAnnotation[],
+): DetectedAnnotation[] {
+  return annotations.map((a) => {
+    if (a.kind !== "heteronym") return a;
+    const seen = new Set<string>();
+    const candidates: AnnotationCandidate[] = [];
+    for (const c of a.candidates) {
+      const reading = katakanaToHiragana(c.reading);
+      if (!reading || seen.has(reading)) continue;
+      seen.add(reading);
+      candidates.push({ ...c, reading });
+    }
+    return { ...a, candidates };
+  });
+}
+
 export function isNovelCandidate(
   annotation: DetectedAnnotation,
   reading: string,
 ): boolean {
   const t = reading.trim();
   if (!t) return false;
+  if (annotation.kind === "heteronym") {
+    const h = katakanaToHiragana(t);
+    return !annotation.candidates.some((c) => katakanaToHiragana(c.reading) === h);
+  }
   return !annotation.candidates.some((c) => c.reading === t);
 }
 

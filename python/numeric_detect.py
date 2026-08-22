@@ -10,10 +10,10 @@ from numeric_convert import candidates_for_number, normalize_ascii_digits
 # Order matters: longer / more specific patterns first
 PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("version", re.compile(r"(?i)v\d+(?:\.\d+)+")),
-    ("time_jp", re.compile(r"\d{1,2}時\d{1,2}分")),
-    ("time", re.compile(r"\d{1,2}:\d{2}(?::\d{2})?")),
-    ("date", re.compile(r"\d{4}[/\-年]\d{1,2}[/\-月]\d{1,2}日?")),
-    ("fraction_date", re.compile(r"\d{1,4}/\d{1,4}")),
+    ("time_jp", re.compile(r"[0-9０-９]{1,2}時[0-9０-９]{1,2}分(?:[0-9０-９]{1,2}秒)?")),
+    ("time", re.compile(r"[0-9０-９]{1,2}[:：][0-9０-９]{2}(?:[:：][0-9０-９]{2})?")),
+    ("date", re.compile(r"[0-9０-９]{4}[/\-年][0-9０-９]{1,2}[/\-月][0-9０-９]{1,2}日?")),
+    ("fraction_date", re.compile(r"[0-9０-９]{1,4}[/／][0-9０-９]{1,4}")),
     ("ordinal", re.compile(r"第\d+|[0-9０-９]+番目")),
     ("range", re.compile(r"\d+[〜~\-]\d+(?:本|匹|個|人|枚|冊|台|階|歳|分|秒|年|月|日)?")),
     ("counter", re.compile(r"[0-9０-９]+(?:\.\d+)?(?:本|匹|個|人|杯|枚|冊|台|階|歳|分|秒|年|月|日)")),
@@ -80,11 +80,9 @@ def detect(text: str) -> list[dict]:
             elif kind == "range":
                 cands = [{"reading": surface, "label": "範囲"}]
             elif kind == "time_jp":
-                tm = re.match(r"(\d+)時(\d+)分", surface)
-                if tm:
-                    cands = candidates_for_number(surface, tm.group(1), tm.group(2), "time")
+                cands = candidates_for_number(surface, num_part, unit_part, "time")
             elif kind == "date":
-                cands = [{"reading": surface, "label": "日付"}]
+                cands = candidates_for_number(surface, num_part, unit_part, "date")
 
             if not cands:
                 continue

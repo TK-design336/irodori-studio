@@ -237,6 +237,104 @@ def unit_reading(unit: str, mode: str = "hiragana") -> str:
     return unit
 
 
+def _append_cand(out: list[dict], reading: str, label: str, surface: str = "") -> None:
+    if not reading or reading == surface:
+        return
+    if any(c.get("reading") == reading for c in out):
+        return
+    out.append({"reading": reading, "label": label})
+
+
+def _slash_pair(surface: str) -> tuple[int, int] | None:
+    s = normalize_ascii_digits(surface).replace("／", "/")
+    if "/" not in s:
+        return None
+    parts = s.split("/")
+    if len(parts) == 2 and all(p.isdigit() for p in parts):
+        return int(parts[0]), int(parts[1])
+    return None
+
+
+def _parse_ymd(surface: str) -> tuple[int, int, int] | None:
+    s = normalize_ascii_digits(surface)
+    m = re.match(r"(\d{4})[/\-年](\d{1,2})[/\-月](\d{1,2})日?", s)
+    if not m:
+        return None
+    year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if 1 <= month <= 12 and 1 <= day <= 31:
+        return year, month, day
+    return None
+
+
+def _parse_hms(
+    surface: str,
+    num_part: str = "",
+    unit_part: str = "",
+) -> tuple[int, int, int] | None:
+    s = normalize_ascii_digits(surface).replace("：", ":")
+    if ":" in s:
+        parts = s.split(":")
+        if 2 <= len(parts) <= 3 and all(p.isdigit() for p in parts):
+            h, m = int(parts[0]), int(parts[1])
+            sec = int(parts[2]) if len(parts) == 3 else 0
+            return h, m, sec
+    m = re.match(r"(\d+)時(?:(\d+)分)?(?:(\d+)秒)?$", s)
+    if m:
+        return int(m.group(1)), int(m.group(2) or 0), int(m.group(3) or 0)
+    num = normalize_ascii_digits(num_part)
+    unit = normalize_ascii_digits(unit_part)
+    if num.isdigit() and unit.isdigit():
+        return int(num), int(unit), 0
+    return None
+
+
+def _date_notation(month: int, day: int, year: int | None = None) -> str:
+    if year is not None:
+        return f"{year}年{month}月{day}日"
+    return f"{month}月{day}日"
+
+
+def _date_hiragana(month: int, day: int, year: int | None = None) -> str:
+    body = _month_reading(month) + _day_reading(day)
+    if year is None:
+        return body
+    return _int_to_hiragana(year) + "ねん" + body
+
+
+def _fraction_notation(numer: int, denom: int) -> str:
+    return f"{denom}分の{numer}"
+
+
+def _fraction_hiragana(numer: int, denom: int) -> str:
+    return _int_to_hiragana(denom) + "ぶんの" + _int_to_hiragana(numer)
+
+
+def _time_notation(h: int, m: int, s: int = 0) -> str:
+    if s:
+        return f"{h}時{m}分{s}秒"
+    if m:
+        return f"{h}時{m}分"
+    return f"{h}時"
+
+
+def _second_reading(sec: int) -> str:
+    if sec == 0:
+        return ""
+    return _int_to_hiragana(sec) + "びょう"
+
+
+def _time_hiragana(h: int, m: int, s: int = 0) -> str:
+    return _hour_reading(h) + _minute_reading(m) + _second_reading(s)
+
+
+def _is_valid_md(month: int, day: int) -> bool:
+    return 1 <= month <= 12 and 1 <= day <= 31
+
+
+def _is_valid_hms(h: int, m: int, s: int = 0) -> bool:
+    return 0 <= h <= 24 and 0 <= m <= 59 and 0 <= s <= 59
+
+
 def candidates_for_number(
     surface: str,
     num_part: str,
@@ -247,36 +345,36 @@ def candidates_for_number(
     out: list[dict] = []
     num = normalize_ascii_digits(num_part)
 
-    if pattern == "fraction_date" and "/" in surface:
-        parts = surface.split("/")
-        if len(parts) == 2 and all(normalize_ascii_digits(p).isdigit() for p in parts):
-            a, b = parts
-            out.append(
-                {
-                    "reading": _int_to_hiragana(int(b)) + "ぶんの" + _int_to_hiragana(int(a)),
-                    "label": "分数",
-                }
-            )
-            if int(a) <= 12 and int(b) <= 31:
-                out.append(
-                    {
-                        "reading": _month_reading(int(a)) + _day_reading(int(b)),
-                        "label": "日付",
-                    }
-                )
-            return out
+    if pattern == "fraction_date":
+        pair = _slash_pair(surface)
+        if pair:
+            a, b = pair
+            if _is_valid_md(a, b):
+                _append_cand(out, _date_notation(a, b), "日付", surface)
+            _append_cand(out, _fraction_notation(a, b), "分数", surface)
+            if _is_valid_hms(a, b):
+                _append_cand(out, _time_notation(a, b), "時刻", surface)
+            if _is_valid_md(a, b):
+                _append_cand(out, _date_hiragana(a, b), "日付読み", surface)
+            _append_cand(out, _fraction_hiragana(a, b), "分数読み", surface)
+            if _is_valid_hms(a, b):
+                _append_cand(out, _time_hiragana(a, b), "時刻読み", surface)
+        return out
+
+    if pattern == "date":
+        ymd = _parse_ymd(surface)
+        if ymd:
+            year, month, day = ymd
+            _append_cand(out, _date_notation(month, day, year), "日付", surface)
+            _append_cand(out, _date_hiragana(month, day, year), "日付読み", surface)
+        return out
 
     if pattern == "time":
-        if ":" in surface:
-            h, m = surface.split(":", 1)
-            h, m = normalize_ascii_digits(h), normalize_ascii_digits(m)
-            if h.isdigit() and m.isdigit():
-                out.append(
-                    {
-                        "reading": _hour_reading(int(h)) + _minute_reading(int(m)),
-                        "label": "時刻",
-                    }
-                )
+        hms = _parse_hms(surface, num, unit_part)
+        if hms and _is_valid_hms(*hms):
+            h, m, s = hms
+            _append_cand(out, _time_notation(h, m, s), "時刻", surface)
+            _append_cand(out, _time_hiragana(h, m, s), "時刻読み", surface)
         return out
 
     if pattern == "counter" and unit_part:

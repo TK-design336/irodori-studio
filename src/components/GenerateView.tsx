@@ -83,6 +83,8 @@ import {
   filterPendingAnnotations,
   isNovelCandidate,
   newReadingId,
+  normalizeDetectedAnnotations,
+  readingForApply,
   synthTextForLine,
   validateReadings,
   type AnnotationKind,
@@ -2334,9 +2336,11 @@ export function GenerateView({
         continue;
       }
       try {
-        const detected = await invoke<DetectedAnnotation[]>(
-          "detect_annotations_cmd",
-          { text },
+        const detected = normalizeDetectedAnnotations(
+          await invoke<DetectedAnnotation[]>(
+            "detect_annotations_cmd",
+            { text },
+          ),
         );
         // Abort if a newer refresh has started while we were awaiting
         if (runId !== annotationRunId.current) return;
@@ -2656,7 +2660,7 @@ export function GenerateView({
       annotation: DetectedAnnotation,
       reading: string,
     ) => {
-      const trimmed = reading.trim();
+      const trimmed = readingForApply(annotation.kind, reading);
       if (!trimmed) return;
       const entry: AppliedReading = {
         id: newReadingId(),
@@ -2721,9 +2725,11 @@ export function GenerateView({
     }
     try {
       setStatus("読み提案を取得中…");
-      const detected = await invoke<DetectedAnnotation[]>(
-        "detect_annotations_cmd",
-        { text },
+      const detected = normalizeDetectedAnnotations(
+        await invoke<DetectedAnnotation[]>(
+          "detect_annotations_cmd",
+          { text },
+        ),
       );
       const applied = validateReadings(text, fresh.readings ?? []);
       const pending = filterPendingAnnotations(detected, applied);
@@ -2779,9 +2785,11 @@ export function GenerateView({
         const c = candidates[i];
         setStatus(`読み提案を取得中… ${i + 1}/${candidates.length}`);
         // Always call detection directly to get fresh results for the modal
-        const detected = await invoke<DetectedAnnotation[]>(
-          "detect_annotations_cmd",
-          { text: c.text },
+        const detected = normalizeDetectedAnnotations(
+          await invoke<DetectedAnnotation[]>(
+            "detect_annotations_cmd",
+            { text: c.text },
+          ),
         );
         const applied = validateReadings(c.text, c.line.readings ?? []);
         const pending = filterPendingAnnotations(detected, applied);

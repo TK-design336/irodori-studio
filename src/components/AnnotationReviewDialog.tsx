@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ANNOTATION_KIND_LABEL,
   buildSynthText,
+  readingForApply,
   type AnnotationKind,
   type DetectedAnnotation,
   type AppliedReading,
@@ -50,6 +51,7 @@ const KINDS: AnnotationKind[] = ["english", "heteronym", "numeric"];
 
 function pickDefaultReading(a: DetectedAnnotation, modes: NumericConvertModes): string {
   if (a.candidates.length === 0) return "";
+  if (a.kind === "heteronym") return readingForApply("heteronym", a.candidates[0].reading);
   if (a.kind !== "numeric") return a.candidates[0].reading;
   const preferred =
     a.candidates.find((c) => {
@@ -92,7 +94,9 @@ function ReviewRow({
 
   const selectValue = e.manualMode
     ? MANUAL_SENTINEL
-    : e.annotation.candidates.some((c) => c.reading === e.selectedReading)
+    : e.annotation.candidates.some(
+        (c) => readingForApply(e.annotation.kind, c.reading) === e.selectedReading,
+      )
       ? e.selectedReading
       : MANUAL_SENTINEL;
 
@@ -101,7 +105,9 @@ function ReviewRow({
       onChange({ manualMode: true });
       return;
     }
-    onChange({ selectedReading: val, accepted: true, manualMode: false });
+    const reading =
+      e.annotation.kind === "heteronym" ? readingForApply("heteronym", val) : val;
+    onChange({ selectedReading: reading, accepted: true, manualMode: false });
   };
 
   useEffect(() => {
@@ -142,11 +148,14 @@ function ReviewRow({
           value={selectValue}
           onChange={(ev) => handleSelect(ev.target.value)}
         >
-          {e.annotation.candidates.map((c) => (
-            <option key={c.reading} value={c.reading}>
-              {c.label ? `${c.reading} (${c.label})` : c.reading}
-            </option>
-          ))}
+          {e.annotation.candidates.map((c) => {
+            const reading = readingForApply(e.annotation.kind, c.reading);
+            return (
+              <option key={`${reading}-${c.label ?? ""}`} value={reading}>
+                {c.label ? `${reading} (${c.label})` : reading}
+              </option>
+            );
+          })}
           <option value={MANUAL_SENTINEL}>手動編集…</option>
         </select>
       )}
@@ -177,7 +186,7 @@ export function AnnotationReviewDialog({
             start: e.annotation.start,
             end: e.annotation.end,
             surface: e.annotation.surface,
-            reading: e.selectedReading.trim(),
+            reading: readingForApply(e.annotation.kind, e.selectedReading),
           }));
         return {
           lineId: l.lineId,
@@ -407,7 +416,7 @@ export function AnnotationReviewDialog({
                     start: e.annotation.start,
                     end: e.annotation.end,
                     surface: e.annotation.surface,
-                    reading: e.selectedReading.trim(),
+                    reading: readingForApply(e.annotation.kind, e.selectedReading),
                   }));
                 return {
                   lineId: l.lineId,

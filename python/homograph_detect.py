@@ -121,15 +121,28 @@ def _load_bundled() -> dict[str, dict]:
     return by_surface
 
 
+def katakana_to_hiragana(s: str) -> str:
+    """Convert katakana in a reading to hiragana (選択時の入力用)."""
+    out: list[str] = []
+    for ch in s:
+        o = ord(ch)
+        if 0x30A1 <= o <= 0x30F6:
+            out.append(chr(o - 0x60))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def _readings_candidates(readings: list[str], chosen: str | None = None) -> list[dict]:
     uniq: list[str] = []
     seen: set[str] = set()
     for r in readings:
-        if r and r not in seen:
-            seen.add(r)
-            uniq.append(r)
+        h = katakana_to_hiragana(r.strip()) if r else ""
+        if h and h not in seen:
+            seen.add(h)
+            uniq.append(h)
     if chosen:
-        c = chosen.strip()
+        c = katakana_to_hiragana(chosen.strip())
         if c and c not in seen:
             uniq.insert(0, c)
     return [{"reading": r} for r in uniq]
@@ -148,11 +161,12 @@ def _readings_note(readings: list[str], chosen: str | None = None) -> str:
     uniq: list[str] = []
     seen: set[str] = set()
     for r in readings:
-        if r and r not in seen:
-            seen.add(r)
-            uniq.append(r)
+        h = katakana_to_hiragana(r.strip()) if r else ""
+        if h and h not in seen:
+            seen.add(h)
+            uniq.append(h)
     if chosen:
-        c = chosen.strip()
+        c = katakana_to_hiragana(chosen.strip())
         if c and c not in seen:
             uniq.insert(0, c)
     if not uniq:
