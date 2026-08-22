@@ -6,9 +6,9 @@ Irodori-TTS 向け Speaker Embedding 学習 + OPT 生成フロントエンド（
 
 操作の流れは以下の動画を参照してください。
 
-[![Irodori Studio 説明動画](https://img.youtube.com/vi/19eGabJSkBw/maxresdefault.jpg)](https://youtu.be/19eGabJSkBw)
+[![Irodori Studio 説明動画](https://img.youtube.com/vi/amY91Y1t_7g/maxresdefault.jpg)](https://youtu.be/amY91Y1t_7g)
 
-https://youtu.be/19eGabJSkBw
+https://youtu.be/amY91Y1t_7g
 
 ## 機能概要
 
