@@ -4,6 +4,7 @@
  */
 
 import { PlaybackController } from "./playbackQueue.js";
+import { closeOffscreen } from "./offscreenDoc.js";
 import { apiFetch } from "./studioApi.js";
 import { extractPage, injectHighlight, waitTabComplete } from "./pageExtract.js";
 import { clampChunkChars, DEFAULT_CHUNK_CHARS } from "./splitText.js";
@@ -72,6 +73,7 @@ export async function playerStop() {
     total: 0,
     jobId: null,
   });
+  await closeOffscreen();
 }
 
 export async function playerPause() {
@@ -209,6 +211,7 @@ export async function playerStart(opts) {
     } catch (e) {
       if (gen !== sessionGen) return;
       post({ type: "PLAYER_ERROR", error: String(e?.message || e) });
+      await closeOffscreen();
     }
   })();
 
@@ -229,6 +232,7 @@ async function onSessionDone(result, opts, gen) {
     return;
   }
   post({ type: "PLAYER_FINISHED", reason: "done" });
+  await closeOffscreen();
 }
 
 async function continueNextEpisode(opts, gen) {
@@ -259,6 +263,7 @@ async function continueNextEpisode(opts, gen) {
   } catch (e) {
     if (gen !== sessionGen) return;
     post({ type: "PLAYER_ERROR", error: String(e?.message || e) });
+    await closeOffscreen();
   }
 }
 
@@ -294,7 +299,14 @@ export async function playerPlayQueue(opts) {
   }
   queuePlaying = true;
   await chrome.storage.session.set({ queuePlaying: true }).catch(() => {});
-  return playNextQueueItem(sessionGen, opts);
+  try {
+    return await playNextQueueItem(sessionGen, opts);
+  } catch (e) {
+    queuePlaying = false;
+    await chrome.storage.session.set({ queuePlaying: false }).catch(() => {});
+    await closeOffscreen();
+    throw e;
+  }
 }
 
 async function playNextQueueItem(gen, ctx) {
@@ -306,6 +318,7 @@ async function playNextQueueItem(gen, ctx) {
     queuePlaying = false;
     await chrome.storage.session.set({ queuePlaying: false }).catch(() => {});
     post({ type: "PLAYER_FINISHED", reason: "queue-empty" });
+    await closeOffscreen();
     return { ok: true };
   }
   const item = list.shift();

@@ -118,11 +118,57 @@
     });
   }
 
+  /** Keep in sync with chrome-extension/lib/sanitizeSpeech.js */
+  function hasSpeakable(text) {
+    return /[\p{L}\p{N}]/u.test(String(text || ""));
+  }
+
   function stripSpeech(text) {
-    return String(text || "")
-      .replace(/https?:\/\/\S+/gi, " ")
-      .replace(/\bwww\.\S+/gi, " ")
+    const DECOR = "[-–—―─━=_＊*☆★●○◆◇■□▪▫※~～♡♥♪♫#＃▲▼△▽]";
+    let t = String(text || "")
+      .replace(/^\uFEFF/, "")
+      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+      .replace(/[\u200B-\u200D\uFEFF\u00AD\u2060]/g, "")
+      .replace(/https?:\/\/[^\s]+/gi, " ")
+      .replace(/\bwww\.[^\s]+/gi, " ")
+      .replace(/\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/g, " ")
       .replace(/\[\d+\]/g, "")
+      .replace(/※\s*\d+/g, "")
+      .replace(/<\/?[a-zA-Z][^>]*>/g, " ")
+      .replace(/!\[[^\]]*\]\([^)]+\)/g, " ")
+      .replace(/［(?:挿絵|画像|図)］|【(?:挿絵|画像|図)】|\[(?:挿絵|画像|図|image|img|pic)\]/gi, " ")
+      .replace(/［(?:広告|ＡＤ|AD|PR|ＰＲ)］|【(?:広告|ＡＤ|AD|PR|ＰＲ)】|\[(?:PR|AD|広告)\]/gi, " ")
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .replace(/-{3,}/g, " ")
+      .replace(/={3,}/g, " ")
+      .replace(/~{3,}/g, " ")
+      .replace(/～{3,}/g, " ")
+      .replace(/\*{3,}/g, " ")
+      .replace(/＊{3,}/g, " ")
+      .replace(/_{3,}/g, " ")
+      .replace(/[─━]{3,}/g, " ")
+      .replace(/[―—]{3,}/g, " ")
+      .replace(/[☆★●○◆◇■□▪▫※♡♥♪♫]{3,}/g, " ")
+      .replace(/^#{1,6}[ \t]+/gm, "")
+      .replace(/^>[ \t]+/gm, "")
+      .replace(/^`{3,}[^\n]*$/gm, "")
+      .replace(/^[ \t]*\|?(?:[ \t]*:?-+:?[ \t]*\|)+[ \t]*:?-+:?[ \t]*\|?[ \t]*$/gm, "");
+
+    t = t.replace(new RegExp(`(?:^|\\n)[ \\t]*(?:${DECOR}[ \\t]*){2,}(?=\\n|$)`, "g"), "\n");
+    t = t.replace(
+      /([。．！？!?）」』】］])[ \t]*[-–─━=_＊*☆★●○◆◇■□▪▫※~～♡♥♪♫#＃▲▼△▽]{2,}[ \t]*/g,
+      "$1",
+    );
+    t = t.replace(new RegExp(`([。．！？!?）」』】］])[ \\t]*(?:${DECOR}[ \\t]*){3,}`, "g"), "$1");
+
+    t = t
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line && hasSpeakable(line))
+      .join("\n");
+
+    return t
       .replace(/[ \t]+\n/g, "\n")
       .replace(/\n{3,}/g, "\n\n")
       .replace(/[ \t]{2,}/g, " ")

@@ -1,6 +1,7 @@
 /** Service worker: Side Panel, Offscreen lifecycle, playback session host. */
 
-import { ensureOffscreen } from "./lib/offscreenDoc.js";
+import { setKeepaliveRecover } from "./lib/keepaliveConnect.js";
+import { closeOffscreen, ensureOffscreen, hasOffscreen } from "./lib/offscreenDoc.js";
 import {
   playerStart,
   playerStop,
@@ -18,6 +19,12 @@ import {
   getPlayerSnapshot,
   recoverOffscreenSession,
 } from "./lib/playerHost.js";
+
+setKeepaliveRecover(() => {
+  const snap = getPlayerSnapshot();
+  if (!snap.playing) return;
+  return ensureOffscreen().then(() => recoverOffscreenSession());
+});
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.removeAll(() => {
@@ -104,17 +111,6 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     await addReadLater(tab?.url, tab?.title);
     await openSidePanel(tab);
   }
-});
-
-chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== "offscreen-keepalive") return;
-  port.onDisconnect.addListener(() => {
-    const snap = getPlayerSnapshot();
-    if (!snap.playing) return;
-    ensureOffscreen()
-      .then(() => recoverOffscreenSession())
-      .catch(() => {});
-  });
 });
 
 const OFFSCREEN_TYPES = new Set([
@@ -213,8 +209,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === "STOP_AUDIO") {
-    ensureOffscreen()
-      .then(() => chrome.runtime.sendMessage({ type: "OFFSCREEN_STOP" }))
+    (async () => {
+      if (!(await hasOffscreen())) return { ok: true };
+      try {
+        await chrome.runtime.sendMessage({ type: "OFFSCREEN_STOP" });
+      } catch (_) {
+        /* document may already be gone */
+      }
+      await closeOffscreen();
+      return { ok: true };
+    })()
       .then((r) => sendResponse(r ?? { ok: true }))
       .catch((e) => sendResponse({ ok: false, error: String(e) }));
     return true;

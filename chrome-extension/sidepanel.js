@@ -1,4 +1,4 @@
-import { clampChunkChars, DEFAULT_CHUNK_CHARS } from "./lib/splitText.js";
+import { clampChunkChars, DEFAULT_CHUNK_CHARS, sanitizeForSpeech, hasSpeakable } from "./lib/splitText.js";
 import { getAllProfiles } from "./lib/profiles.js";
 import { clearCache, cacheStats } from "./lib/cache.js";
 import {
@@ -488,8 +488,8 @@ async function startReading(extract, { episodesRead = 1 } = {}) {
 }
 
 async function synthesizeAndPlay(text) {
-  const trimmed = text.trim();
-  if (!trimmed) throw new Error("読み上げるテキストがありません");
+  const trimmed = sanitizeForSpeech(text);
+  if (!trimmed || !hasSpeakable(trimmed)) throw new Error("読み上げるテキストがありません");
   const speaker = els.speaker.value;
   if (!speaker) throw new Error("話者を選択してください");
   setStatus(els.playStatus, "合成中…");

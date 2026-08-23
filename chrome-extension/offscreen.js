@@ -5,6 +5,8 @@
  *
  * A silent loop + runtime port keep this document (and the SW) alive while
  * a session is active, including TTS wait gaps when speech audio is idle.
+ * The port is not held after the session ends, so a leftover document does
+ * not hammer a sleeping service worker.
  */
 
 let rate = 1;
@@ -67,18 +69,78 @@ function stopSilentKeepalive() {
   keepAliveAudio = null;
 }
 
-function connectKeepalivePort() {
+const KEEPALIVE_PORT_NAME = "offscreen-keepalive";
+const KEEPALIVE_BACKOFF_MIN_MS = 250;
+const KEEPALIVE_BACKOFF_MAX_MS = 8000;
+
+let keepalivePort = null;
+let keepaliveTimer = null;
+let keepaliveBackoffMs = KEEPALIVE_BACKOFF_MIN_MS;
+let keepaliveWanted = false;
+
+function clearKeepaliveTimer() {
+  if (keepaliveTimer == null) return;
+  clearTimeout(keepaliveTimer);
+  keepaliveTimer = null;
+}
+
+function consumeLastError() {
+  void chrome.runtime.lastError;
+}
+
+function disconnectKeepalivePort() {
+  keepaliveWanted = false;
+  keepaliveBackoffMs = KEEPALIVE_BACKOFF_MIN_MS;
+  clearKeepaliveTimer();
+  const port = keepalivePort;
+  keepalivePort = null;
+  if (!port) return;
   try {
-    const port = chrome.runtime.connect({ name: "offscreen-keepalive" });
-    port.onDisconnect.addListener(() => {
-      setTimeout(connectKeepalivePort, 250);
-    });
+    port.disconnect();
   } catch (_) {
-    setTimeout(connectKeepalivePort, 500);
+    consumeLastError();
   }
 }
 
-connectKeepalivePort();
+function scheduleKeepaliveReconnect() {
+  if (!keepaliveWanted || keepaliveTimer != null) return;
+  const delay = keepaliveBackoffMs;
+  keepaliveBackoffMs = Math.min(KEEPALIVE_BACKOFF_MAX_MS, keepaliveBackoffMs * 2);
+  keepaliveTimer = setTimeout(() => {
+    keepaliveTimer = null;
+    connectKeepalivePort();
+  }, delay);
+}
+
+function connectKeepalivePort() {
+  if (!keepaliveWanted) return;
+  clearKeepaliveTimer();
+  if (!chrome.runtime?.id) return;
+  try {
+    const port = chrome.runtime.connect({ name: KEEPALIVE_PORT_NAME });
+    keepalivePort = port;
+    const connectedAt = Date.now();
+    port.onDisconnect.addListener(() => {
+      consumeLastError();
+      if (keepalivePort === port) keepalivePort = null;
+      if (Date.now() - connectedAt > 1000) {
+        keepaliveBackoffMs = KEEPALIVE_BACKOFF_MIN_MS;
+      }
+      if (keepaliveWanted && chrome.runtime?.id) {
+        scheduleKeepaliveReconnect();
+      }
+    });
+  } catch (_) {
+    consumeLastError();
+    if (keepaliveWanted) scheduleKeepaliveReconnect();
+  }
+}
+
+function startKeepalivePort() {
+  keepaliveWanted = true;
+  if (keepalivePort) return;
+  connectKeepalivePort();
+}
 
 function revokeUrl() {
   if (objectUrl) {
@@ -194,11 +256,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         gainValue = msg.gain ?? 0.8;
         stopAudio(false);
         startSilentKeepalive();
+        startKeepalivePort();
         return { ok: true };
       }
       case "OFFSCREEN_SESSION_END": {
         sessionActive = false;
         stopSilentKeepalive();
+        disconnectKeepalivePort();
         return { ok: true };
       }
       case "OFFSCREEN_QUEUE_CHUNK": {
@@ -244,6 +308,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           sessionActive = false;
           currentIndex = -1;
           stopSilentKeepalive();
+          disconnectKeepalivePort();
         }
         return { ok: true };
       }

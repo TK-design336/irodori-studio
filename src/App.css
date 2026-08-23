@@ -31,11 +31,11 @@
   --line: #2e3644;
   --text: #e8edf5;
   --muted: #9aa6b8;
-  --accent: #2ee6c8;
-  --accent-soft: rgba(46, 230, 200, 0.18);
-  --accent-deep: #22cbb0;
-  --accent-grad-a: #5af0d6;
-  --accent-grad-b: #20d4b4;
+  --accent: #14b371;
+  --accent-soft: rgba(20, 179, 113, 0.18);
+  --accent-deep: #158e5c;
+  --accent-grad-a: #15d182;
+  --accent-grad-b: #159d65;
   --ok: #3ecf8e;
   --bad: #e35d6a;
   --shadow: none;

@@ -1,5 +1,9 @@
 /** Split text like Studio src/lib/splitText.ts (pack mode). */
 
+import { hasSpeakable, sanitizeForSpeech } from "./sanitizeSpeech.js";
+
+export { hasSpeakable, sanitizeForSpeech } from "./sanitizeSpeech.js";
+
 export const PRESET_PUNCTUATION = ["。」", "。", "．", "？", "?", "！", "!", "\n"];
 
 export const DEFAULT_CHUNK_CHARS = 60;
@@ -70,11 +74,12 @@ export function splitText(text, delimiters, mode = "pack", packLimit = DEFAULT_C
   return packed;
 }
 
-/** Merge extremely short chunks into neighbors. */
+/** Merge extremely short chunks into neighbors. Skip unspeakable leftovers. */
 function mergeShort(chunks, minLen = 8) {
-  if (chunks.length <= 1) return chunks;
+  if (chunks.length <= 1) return chunks.filter((c) => hasSpeakable(c));
   const out = [];
   for (const c of chunks) {
+    if (!hasSpeakable(c)) continue;
     if (out.length && c.length < minLen) {
       out[out.length - 1] += c;
     } else if (out.length && out[out.length - 1].length < minLen) {
@@ -87,6 +92,10 @@ function mergeShort(chunks, minLen = 8) {
 }
 
 export function splitForSpeech(text, packLimit = DEFAULT_CHUNK_CHARS) {
+  const cleaned = sanitizeForSpeech(text);
+  if (!cleaned) return [];
   const limit = clampChunkChars(packLimit);
-  return mergeShort(splitText(text, PRESET_PUNCTUATION, "pack", limit));
+  return mergeShort(splitText(cleaned, PRESET_PUNCTUATION, "pack", limit))
+    .map((c) => sanitizeForSpeech(c))
+    .filter((c) => c && hasSpeakable(c));
 }

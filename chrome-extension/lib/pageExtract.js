@@ -1,7 +1,7 @@
 /** Page extract / highlight injection (usable from SW and side panel). */
 
 import { findProfileForUrl } from "./profiles.js";
-import { splitForSpeech, clampChunkChars, DEFAULT_CHUNK_CHARS } from "./splitText.js";
+import { splitForSpeech, sanitizeForSpeech, clampChunkChars, DEFAULT_CHUNK_CHARS } from "./splitText.js";
 import { ensureSiteAccess, isMissingHostPermissionError } from "./studioApi.js";
 
 export async function ensureTabPermission(tab) {
@@ -77,9 +77,11 @@ export async function extractPage(tab, chunkChars) {
   if (!result?.ok || !result.text?.trim()) {
     throw new Error("本文を抽出できませんでした");
   }
-  const chunks = splitForSpeech(result.text, clampChunkChars(chunkChars ?? DEFAULT_CHUNK_CHARS));
+  const text = sanitizeForSpeech(result.text);
+  const chunks = splitForSpeech(text, clampChunkChars(chunkChars ?? DEFAULT_CHUNK_CHARS));
   return {
     ...result,
+    text,
     chunks,
     tabId: tab.id,
     profileId: profile?.id || result?.family || null,

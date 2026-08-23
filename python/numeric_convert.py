@@ -78,8 +78,11 @@ def _load_counter_data() -> dict:
     return {"entries": [], "units": {}}
 
 
+_FW_DIGIT_TABLE = str.maketrans("０１２３４５６７８９．", "0123456789.")
+
+
 def normalize_ascii_digits(s: str) -> str:
-    return s.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    return s.translate(_FW_DIGIT_TABLE)
 
 
 def _int_to_hiragana(n: int) -> str:
@@ -266,11 +269,8 @@ def _parse_ymd(surface: str) -> tuple[int, int, int] | None:
     return None
 
 
-def _parse_hms(
-    surface: str,
-    num_part: str = "",
-    unit_part: str = "",
-) -> tuple[int, int, int] | None:
+def _parse_hms(surface: str) -> tuple[int, int, int] | None:
+    # Time from punctuation is colon-only (half/full width). Slash pairs are not time.
     s = normalize_ascii_digits(surface).replace("：", ":")
     if ":" in s:
         parts = s.split(":")
@@ -281,10 +281,6 @@ def _parse_hms(
     m = re.match(r"(\d+)時(?:(\d+)分)?(?:(\d+)秒)?$", s)
     if m:
         return int(m.group(1)), int(m.group(2) or 0), int(m.group(3) or 0)
-    num = normalize_ascii_digits(num_part)
-    unit = normalize_ascii_digits(unit_part)
-    if num.isdigit() and unit.isdigit():
-        return int(num), int(unit), 0
     return None
 
 
@@ -352,13 +348,9 @@ def candidates_for_number(
             if _is_valid_md(a, b):
                 _append_cand(out, _date_notation(a, b), "日付", surface)
             _append_cand(out, _fraction_notation(a, b), "分数", surface)
-            if _is_valid_hms(a, b):
-                _append_cand(out, _time_notation(a, b), "時刻", surface)
             if _is_valid_md(a, b):
                 _append_cand(out, _date_hiragana(a, b), "日付読み", surface)
             _append_cand(out, _fraction_hiragana(a, b), "分数読み", surface)
-            if _is_valid_hms(a, b):
-                _append_cand(out, _time_hiragana(a, b), "時刻読み", surface)
         return out
 
     if pattern == "date":
@@ -370,7 +362,7 @@ def candidates_for_number(
         return out
 
     if pattern == "time":
-        hms = _parse_hms(surface, num, unit_part)
+        hms = _parse_hms(surface)
         if hms and _is_valid_hms(*hms):
             h, m, s = hms
             _append_cand(out, _time_notation(h, m, s), "時刻", surface)

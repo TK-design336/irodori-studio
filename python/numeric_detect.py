@@ -7,26 +7,30 @@ import unicodedata
 
 from numeric_convert import candidates_for_number, normalize_ascii_digits
 
+# Half- and full-width digits. Time uses colon only (1:2 / 01:02 / 01：02 / ０１：０２).
+_D = r"[0-9０-９]"
+_DEC = rf"{_D}+(?:[.．]{_D}+)?"
+
 # Order matters: longer / more specific patterns first
 PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("version", re.compile(r"(?i)v\d+(?:\.\d+)+")),
-    ("time_jp", re.compile(r"[0-9０-９]{1,2}時[0-9０-９]{1,2}分(?:[0-9０-９]{1,2}秒)?")),
-    ("time", re.compile(r"[0-9０-９]{1,2}[:：][0-9０-９]{2}(?:[:：][0-9０-９]{2})?")),
-    ("date", re.compile(r"[0-9０-９]{4}[/\-年][0-9０-９]{1,2}[/\-月][0-9０-９]{1,2}日?")),
-    ("fraction_date", re.compile(r"[0-9０-９]{1,4}[/／][0-9０-９]{1,4}")),
-    ("ordinal", re.compile(r"第\d+|[0-9０-９]+番目")),
-    ("range", re.compile(r"\d+[〜~\-]\d+(?:本|匹|個|人|枚|冊|台|階|歳|分|秒|年|月|日)?")),
-    ("counter", re.compile(r"[0-9０-９]+(?:\.\d+)?(?:本|匹|個|人|杯|枚|冊|台|階|歳|分|秒|年|月|日)")),
-    ("unit_suffix", re.compile(r"[0-9０-９]+(?:\.\d+)?(?:%|％|km|kg|cm|mm|m|g|円)")),
-    ("decimal", re.compile(r"[0-9０-９]+\.[0-9０-９]+")),
-    ("integer", re.compile(r"[0-9０-９]+")),
+    ("version", re.compile(rf"(?i)v{_D}+(?:[.．]{_D}+)+")),
+    ("time_jp", re.compile(rf"{_D}{{1,2}}時{_D}{{1,2}}分(?:{_D}{{1,2}}秒)?")),
+    ("time", re.compile(rf"{_D}{{1,2}}[:：]{_D}{{1,2}}(?:[:：]{_D}{{1,2}})?")),
+    ("date", re.compile(rf"{_D}{{4}}[/\-年]{_D}{{1,2}}[/\-月]{_D}{{1,2}}日?")),
+    ("fraction_date", re.compile(rf"{_D}{{1,4}}[/／]{_D}{{1,4}}")),
+    ("ordinal", re.compile(rf"第{_D}+|{_D}+番目")),
+    ("range", re.compile(rf"{_D}+[〜～~\-]{_D}+(?:本|匹|個|人|枚|冊|台|階|歳|分|秒|年|月|日)?")),
+    ("counter", re.compile(rf"{_DEC}(?:本|匹|個|人|杯|枚|冊|台|階|歳|分|秒|年|月|日)")),
+    ("unit_suffix", re.compile(rf"{_DEC}(?:%|％|km|kg|cm|mm|m|g|円)")),
+    ("decimal", re.compile(rf"{_D}+[.．]{_D}+")),
+    ("integer", re.compile(rf"{_D}+")),
 ]
 
 COUNTER_RE = re.compile(
-    r"^([0-9０-９]+(?:\.\d+)?)(本|匹|個|人|杯|枚|冊|台|階|歳|分|秒|年|月|日)$"
+    rf"^({_DEC})(本|匹|個|人|杯|枚|冊|台|階|歳|分|秒|年|月|日)$"
 )
-UNIT_SUFFIX_RE = re.compile(r"^([0-9０-９]+(?:\.\d+)?)(%|％|km|kg|cm|mm|m|g|円)$")
-ORDINAL_RE = re.compile(r"^第(\d+)|^([0-9０-９]+)番目$")
+UNIT_SUFFIX_RE = re.compile(rf"^({_DEC})(%|％|km|kg|cm|mm|m|g|円)$")
+ORDINAL_RE = re.compile(rf"^第({_D}+)|^({_D}+)番目$")
 
 
 def _char_len(s: str) -> int:
@@ -44,7 +48,7 @@ def _extract_parts(surface: str, kind: str) -> tuple[str, str]:
     if m:
         num = m.group(1) or m.group(2) or ""
         return normalize_ascii_digits(num), ""
-    digits = re.findall(r"[0-9０-９]+(?:\.[0-9０-９]+)?", surface)
+    digits = re.findall(rf"{_D}+(?:[.．]{_D}+)?", surface)
     if digits:
         return normalize_ascii_digits(digits[0]), ""
     return surface, ""

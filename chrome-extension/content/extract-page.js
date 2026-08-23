@@ -57,9 +57,10 @@
   function stripUrlsAndFootnotes(text) {
     if (F && F.stripSpeech) return F.stripSpeech(text);
     return String(text || "")
-      .replace(/https?:\/\/\S+/gi, " ")
-      .replace(/\bwww\.\S+/gi, " ")
+      .replace(/https?:\/\/[^\s]+/gi, " ")
+      .replace(/\bwww\.[^\s]+/gi, " ")
       .replace(/\[\d+\]/g, "")
+      .replace(/-{3,}/g, " ")
       .replace(/[ \t]+\n/g, "\n")
       .replace(/\n{3,}/g, "\n\n")
       .replace(/[ \t]{2,}/g, " ")

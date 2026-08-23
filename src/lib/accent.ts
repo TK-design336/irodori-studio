@@ -87,16 +87,16 @@ export const LIGHT_ACCENTS: AccentPalette[] = [
   },
 ];
 
-/** Dark-mode accents. Default is bright teal; orange is the former default. */
+/** Dark-mode accents. Default is green; orange is the former default. */
 export const DARK_ACCENTS: AccentPalette[] = [
   {
     id: "teal",
-    label: "明るい青緑",
-    accent: "#2ee6c8",
-    accentSoft: "rgba(46, 230, 200, 0.18)",
-    accentDeep: "#22cbb0",
-    accentGradA: "#5af0d6",
-    accentGradB: "#20d4b4",
+    label: "緑",
+    accent: "#14b371",
+    accentSoft: "rgba(20, 179, 113, 0.18)",
+    accentDeep: "#158e5c",
+    accentGradA: "#15d182",
+    accentGradB: "#159d65",
   },
   {
     id: "orange",
