@@ -15,8 +15,10 @@ import {
   defaultSampling,
   DEFAULT_VOCAL_SEPARATOR_MODEL,
   isIrodoriV4,
+  sliceAutoFixSettings,
   sliceReviewSettings,
 } from "../types";
+import reviewReadySoundUrl from "../assets/sounds/phone_ring.mp3";
 
 type Props = {
   settings: AppSettings;
@@ -26,6 +28,7 @@ type Props = {
 };
 
 type TrainInputMode = "raw" | "sliced";
+type SliceMethod = "silence" | "silero";
 
 type TrainProgress = {
   step: number;
@@ -44,64 +47,49 @@ type TrainResumeInfo = {
   vocalSeparate?: boolean;
   vocalModel?: string;
   reviewMode?: string;
+  sliceMethod?: string;
   pausedForReview?: boolean;
 };
 
 const ANNOUNCE_STORAGE_KEY = "irodori.trainAnnounceDone";
 const VOCAL_SEP_STORAGE_KEY = "irodori.trainVocalSeparate";
+const SLICE_METHOD_STORAGE_KEY = "irodori.trainSliceMethod";
+
+let reviewReadyAudio: HTMLAudioElement | null = null;
 
 function playReviewReadyChime() {
   try {
-    const Ctx =
-      window.AudioContext ||
-      (window as unknown as { webkitAudioContext?: typeof AudioContext })
-        .webkitAudioContext;
-    if (!Ctx) return;
-    const ctx = new Ctx();
-    const now = ctx.currentTime;
-    const master = ctx.createGain();
-    master.gain.setValueAtTime(0.9, now);
-    master.connect(ctx.destination);
-
-    const tone = (
-      freq: number,
-      start: number,
-      dur: number,
-      peak: number,
-      type: OscillatorType = "triangle",
-    ) => {
-      const osc = ctx.createOscillator();
-      const g = ctx.createGain();
-      osc.type = type;
-      osc.frequency.setValueAtTime(freq, start);
-      g.gain.setValueAtTime(0.0001, start);
-      g.gain.exponentialRampToValueAtTime(peak, start + 0.012);
-      g.gain.exponentialRampToValueAtTime(peak * 0.72, start + dur * 0.4);
-      g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
-      osc.connect(g);
-      g.connect(master);
-      osc.start(start);
-      osc.stop(start + dur + 0.04);
+    if (reviewReadyAudio) {
+      try {
+        reviewReadyAudio.pause();
+      } catch {
+        /* */
+      }
+      reviewReadyAudio = null;
+    }
+    const audio = new Audio(reviewReadySoundUrl);
+    reviewReadyAudio = audio;
+    let remaining = 2;
+    const playOnce = () => {
+      remaining -= 1;
+      audio.currentTime = 0;
+      void audio.play().catch(() => {
+        /* ignore */
+      });
     };
-
-    const ding = (start: number) => {
-      tone(880, start, 0.18, 0.42, "square");
-      tone(1760, start, 0.18, 0.16, "sine");
-      tone(880, start + 0.22, 0.18, 0.42, "square");
-      tone(1760, start + 0.22, 0.18, 0.16, "sine");
-      tone(1319, start + 0.46, 0.38, 0.5, "square");
-      tone(2638, start + 0.46, 0.38, 0.18, "sine");
-    };
-    ding(now);
-    ding(now + 1.05);
-
-    window.setTimeout(() => {
-      void ctx.close();
-    }, 2800);
+    audio.addEventListener("ended", () => {
+      if (remaining > 0 && reviewReadyAudio === audio) {
+        playOnce();
+      } else if (reviewReadyAudio === audio) {
+        reviewReadyAudio = null;
+      }
+    });
+    playOnce();
   } catch {
     /* ignore */
   }
 }
+
 const DONE_ANNOUNCE_TEXT = "学習終了しました。この音声で問題ないですか？";
 
 function formatEta(seconds: number): string {
@@ -311,6 +299,13 @@ function folderBaseName(path: string): string {
   return (i >= 0 ? s.slice(i + 1) : s).trim();
 }
 
+function parseSliceMethod(raw: string | null | undefined): SliceMethod {
+  const v = (raw || "").trim().toLowerCase();
+  return v === "silero" || v === "vad" || v === "silero-vad" || v === "silero_vad"
+    ? "silero"
+    : "silence";
+}
+
 function TrainInputModeTabs({
   inputMode,
   disabled,
@@ -357,7 +352,61 @@ function TrainInputModeTabs({
             ) : null}
           </span>
           <span className="train-input-mode-desc">
-            すでに分割した wav クリップをそのまま学習
+            すでに分割した mp3 / mp4 / wav をそのまま学習
+          </span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SliceMethodTabs({
+  method,
+  disabled,
+  onChange,
+}: {
+  method: SliceMethod;
+  disabled?: boolean;
+  onChange: (method: SliceMethod) => void;
+}) {
+  return (
+    <div className="train-input-mode train-slice-method" role="tablist" aria-label="スライス方式">
+      <span className="train-input-mode-heading">スライス方式</span>
+      <div className="train-input-mode-row">
+        <button
+          type="button"
+          role="tab"
+          className={`train-input-mode-btn${method === "silence" ? " active" : ""}`}
+          aria-selected={method === "silence"}
+          disabled={disabled}
+          onClick={() => onChange("silence")}
+        >
+          <span className="train-input-mode-title">
+            無音カット
+            {method === "silence" ? (
+              <span className="train-input-mode-badge">選択中</span>
+            ) : null}
+          </span>
+          <span className="train-input-mode-desc">
+            dBFS 閾値で無音を切る（従来）
+          </span>
+        </button>
+        <button
+          type="button"
+          role="tab"
+          className={`train-input-mode-btn${method === "silero" ? " active" : ""}`}
+          aria-selected={method === "silero"}
+          disabled={disabled}
+          onClick={() => onChange("silero")}
+        >
+          <span className="train-input-mode-title">
+            Silero VAD
+            {method === "silero" ? (
+              <span className="train-input-mode-badge">選択中</span>
+            ) : null}
+          </span>
+          <span className="train-input-mode-desc">
+            発話かどうかで切る（CPU・軽量）
           </span>
         </button>
       </div>
@@ -395,6 +444,13 @@ export function TrainView({
       return localStorage.getItem(VOCAL_SEP_STORAGE_KEY) === "1";
     } catch {
       return false;
+    }
+  });
+  const [sliceMethod, setSliceMethod] = useState<SliceMethod>(() => {
+    try {
+      return parseSliceMethod(localStorage.getItem(SLICE_METHOD_STORAGE_KEY));
+    } catch {
+      return "silence";
     }
   });
   const [vocalModel, setVocalModel] = useState(
@@ -511,7 +567,7 @@ export function TrainView({
           const jd = e.payload.jobDir || "";
           setStatus("スライスレビュー待ち");
           setReviewReadOnly(false);
-          setReviewJobDir(jd);
+          setReviewJobDir(jd || null);
           void invoke<TrainResumeInfo | null>("get_train_resume")
             .then((info) => setResumeInfo(info))
             .catch(() =>
@@ -523,25 +579,59 @@ export function TrainView({
                       inputMode: "raw",
                       jobDir: jd,
                       pausedForReview: true,
+                      sliceMethod: "silence",
                     }
                   : null,
               ),
             );
-        } else if (e.payload.ok) {
-          setStatus(`完了: ${e.payload.embedPath ?? e.payload.message}`);
+        } else if (e.payload.ok && e.payload.embedPath) {
+          setStatus(`完了: ${e.payload.embedPath}`);
           setProgress((prev) =>
             prev ? { ...prev, fraction: 1, detail: "完了" } : prev,
           );
           setResumeInfo(null);
           setReviewJobDir(null);
           onSpeakersChanged();
-          if (announceDoneRef.current && e.payload.embedPath) {
+          if (announceDoneRef.current) {
             void playDoneAnnounceRef.current?.(e.payload.embedPath);
           }
+        } else if (e.payload.ok) {
+          // Exit 0 without an embed used to look like "全行程完了".
+          // Prefer opening slice review if the job is actually paused there.
+          void invoke<TrainResumeInfo | null>("get_train_resume")
+            .then((info) => {
+              const jd = e.payload.jobDir || info?.jobDir || "";
+              if (info?.pausedForReview && jd) {
+                setStatus("スライスレビュー待ち");
+                setReviewReadOnly(false);
+                setReviewJobDir(jd);
+                setResumeInfo(info);
+                return;
+              }
+              setStatus(
+                e.payload.message ||
+                  "学習は終了しましたが speaker embed がありません",
+              );
+              setResumeInfo(info);
+            })
+            .catch(() => {
+              setStatus(
+                e.payload.message ||
+                  "学習は終了しましたが speaker embed がありません",
+              );
+              setResumeInfo(null);
+            });
         } else {
           setStatus(e.payload.message);
           void invoke<TrainResumeInfo | null>("get_train_resume")
-            .then((info) => setResumeInfo(info))
+            .then((info) => {
+              if (info?.pausedForReview && info.jobDir) {
+                setStatus("スライスレビュー待ち");
+                setReviewReadOnly(false);
+                setReviewJobDir(info.jobDir);
+              }
+              setResumeInfo(info);
+            })
             .catch(() => setResumeInfo(null));
         }
       });
@@ -567,6 +657,9 @@ export function TrainView({
       .then((info) => {
         if (info) {
           setResumeInfo(info);
+          if (info.sliceMethod) {
+            setSliceMethodPersist(parseSliceMethod(info.sliceMethod));
+          }
           if (info.pausedForReview && info.jobDir) {
             setReviewReadOnly(false);
             setReviewJobDir(info.jobDir);
@@ -702,6 +795,15 @@ export function TrainView({
     }
   };
 
+  const setSliceMethodPersist = (method: SliceMethod) => {
+    setSliceMethod(method);
+    try {
+      localStorage.setItem(SLICE_METHOD_STORAGE_KEY, method);
+    } catch {
+      /* */
+    }
+  };
+
   const persistVocalModel = async (filename: string) => {
     setVocalModel(filename);
     if (filename === (settings.vocalSeparatorModel || DEFAULT_VOCAL_SEPARATOR_MODEL)) {
@@ -723,7 +825,14 @@ export function TrainView({
       const next = await invoke<AppSettings>("set_settings", {
         settings: {
           ...settings,
-          sliceReview: { ...cur, ...patch },
+          sliceReview: {
+            ...cur,
+            ...patch,
+            autoFix: sliceAutoFixSettings({
+              ...cur.autoFix,
+              ...(patch.autoFix || {}),
+            }),
+          },
         },
       });
       onSettingsChange?.(next);
@@ -731,6 +840,14 @@ export function TrainView({
       /* */
     }
   };
+
+  const persistAutoFix = (patch: Partial<ReturnType<typeof sliceAutoFixSettings>>) =>
+    persistSliceReview({
+      autoFix: sliceAutoFixSettings({
+        ...sliceReviewSettings(settings).autoFix,
+        ...patch,
+      }),
+    });
 
   const startJob = async (opts?: { resume?: TrainResumeInfo }) => {
     const resume = opts?.resume;
@@ -748,6 +865,10 @@ export function TrainView({
     const doVocal = resume
       ? Boolean(resume.vocalSeparate)
       : vocalSeparate;
+    const method: SliceMethod =
+      mode === "sliced"
+        ? "silence"
+        : parseSliceMethod(resume?.sliceMethod ?? sliceMethod);
     const model =
       (resume?.vocalModel || vocalModel || DEFAULT_VOCAL_SEPARATOR_MODEL).trim() ||
       DEFAULT_VOCAL_SEPARATOR_MODEL;
@@ -760,6 +881,7 @@ export function TrainView({
       setTrainSpeed(speed);
       setVocalSeparatePersist(doVocal);
       setVocalModel(model);
+      setSliceMethodPersist(method);
     }
     if (!folder || !name) {
       setStatus("音声フォルダと話者名を入力してください");
@@ -785,6 +907,7 @@ export function TrainView({
         vocalModel: model,
         jobDir: resume?.jobDir || null,
         reviewMode: (resume?.reviewMode as SliceReviewMode) || reviewMode,
+        sliceMethod: method,
       });
     } catch (e) {
       setRunning(false);
@@ -877,6 +1000,7 @@ export function TrainView({
                   vocalSeparate,
                   vocalModel,
                   reviewMode,
+                  sliceMethod,
                 },
               });
             } else if (resumeInfo) {
@@ -907,6 +1031,13 @@ export function TrainView({
             disabled={running}
             onChange={setInputMode}
           />
+          {inputMode === "raw" ? (
+            <SliceMethodTabs
+              method={sliceMethod}
+              disabled={running}
+              onChange={setSliceMethodPersist}
+            />
+          ) : null}
           <label>
             {inputMode === "sliced"
               ? "スライス済み音声フォルダ"
@@ -917,7 +1048,7 @@ export function TrainView({
                 onChange={(e) => applyInputDir(e.target.value)}
                 placeholder={
                   inputMode === "sliced"
-                    ? "slice_000.wav などが入ったフォルダ"
+                    ? "分割済みの mp3 / mp4 / wav が入ったフォルダ"
                     : "mp3 / mp4 / wav が入ったフォルダ"
                 }
                 disabled={running}
@@ -1008,6 +1139,61 @@ export function TrainView({
             )}
           </div>
           <div
+            className={`train-vocal-block${
+              sliceReviewSettings(settings).autoFix?.enabled !== false
+                ? " is-vocal-altered"
+                : ""
+            }`}
+          >
+            <label
+              className="train-announce-check"
+              title="体育館・トンネルのような残響やこもりを、WPE / 後期残響抑制 / tilt EQ など非生成の信号処理で整えます。乾いた音はそのまま通します。"
+            >
+              <input
+                type="checkbox"
+                checked={sliceReviewSettings(settings).autoFix?.enabled !== false}
+                disabled={running}
+                onChange={(e) =>
+                  void persistAutoFix({ enabled: e.target.checked })
+                }
+              />
+              スライス後に Auto Fix（残響・こもり）
+              {sliceReviewSettings(settings).autoFix?.enabled !== false
+                ? " · 有効"
+                : ""}
+            </label>
+            {sliceReviewSettings(settings).autoFix?.enabled !== false && (
+              <>
+                <div className="slice-review-aspect-toggles">
+                  {(
+                    [
+                      ["reverb", "残響（WPE）"],
+                      ["muffle", "こもり（EQ）"],
+                      ["enhance", "低音質（NR/HP）"],
+                    ] as const
+                  ).map(([key, label]) => (
+                    <label key={key} className="train-announce-check">
+                      <input
+                        type="checkbox"
+                        checked={
+                          sliceReviewSettings(settings).autoFix?.[key] !== false
+                        }
+                        disabled={running}
+                        onChange={(e) =>
+                          void persistAutoFix({ [key]: e.target.checked })
+                        }
+                      />
+                      {label}
+                    </label>
+                  ))}
+                </div>
+                <span className="param-altered-hint">
+                  セッション全体が響いている／こもっているときは全クリップにかけ、乾いた音は通しません。元フォルダは書き換えず、ジョブ内コピーだけ処理します。
+                </span>
+              </>
+            )}
+          </div>
+          <div
             className={`train-review-block${reviewMode === "auto" ? " is-review-auto" : ""}`}
           >
             <label>
@@ -1078,10 +1264,14 @@ export function TrainView({
             <button
               type="button"
               className="primary"
-              disabled={running}
+              disabled={running || !!reviewJobDir}
               onClick={start}
             >
-              {running ? "実行中…" : "学習開始"}
+              {running
+                ? "実行中…"
+                : reviewJobDir
+                  ? "レビュー待ち"
+                  : "学習開始"}
             </button>
             {running && (
               <button
@@ -1147,14 +1337,19 @@ export function TrainView({
           )}
           <p className="hint">
             {inputMode === "sliced"
-              ? "すでに分割済みのクリップ（推奨: 1秒以上の wav）をそのまま使い、データ準備 → 話者埋め込み学習を実行します。非 wav は自動で wav 化します（再スライスはしません）。"
-              : "音声の形式変換（すでに wav なら省略）→ 分割 → データ準備 → 話者埋め込みの学習、までを自動で順に実行します。"}
+              ? "分割済みクリップをそのまま使い、データ準備 → 話者埋め込みの学習を実行します。"
+              : sliceMethod === "silero"
+                ? "音声の形式変換（すでに wav なら省略）→ Silero VAD で発話区間に分割 → データ準備 → 話者埋め込みの学習、までを自動で順に実行します。初回のみ ONNX モデルを導入します。"
+                : "音声の形式変換（すでに wav なら省略）→ 無音区間で分割 → データ準備 → 話者埋め込みの学習、までを自動で順に実行します。"}
             {vocalSeparate
               ? inputMode === "raw"
                 ? " ボーカル分離はスライスより前に実行し、Vocals のみの WAV を後段に渡します（to_wav は省略）。"
                 : " ボーカル分離を各クリップに適用してから学習します。4秒未満は無音パディングして分離し、元の長さに戻します。"
               : ""}
             音源速度が 1.00 以外のときは、スライス後に各クリップへピッチ維持の速度調整をかけてから学習します（元フォルダは書き換えません）。
+            {sliceReviewSettings(settings).autoFix?.enabled !== false
+              ? " スライス後 Auto Fix が有効なときは、残響（WPE＋後期残響抑制）・こもり（tilt EQ）・低 SNR を機械的に整えてからレビューへ進みます。"
+              : ""}
             学習中は生成・設定画面へは移動できません。設定のエンジン版（v3/v4）に応じた
             YAML / Checkpoint が使われます。
           </p>
@@ -1184,6 +1379,12 @@ export function TrainView({
                 inputMode={inputMode}
                 onChange={setInputMode}
               />
+              {inputMode === "raw" ? (
+                <SliceMethodTabs
+                  method={sliceMethod}
+                  onChange={setSliceMethodPersist}
+                />
+              ) : null}
               <label>
                 {inputMode === "sliced"
                   ? "スライス済み音声フォルダ"
@@ -1272,6 +1473,62 @@ export function TrainView({
                 )}
               </div>
               <div
+                className={`train-vocal-block${
+                  sliceReviewSettings(settings).autoFix?.enabled !== false
+                    ? " is-vocal-altered"
+                    : ""
+                }`}
+              >
+                <label
+                  className="train-announce-check"
+                  title="体育館・トンネルのような残響やこもりを、WPE / 後期残響抑制 / tilt EQ など非生成の信号処理で整えます。乾いた音はそのまま通します。"
+                >
+                  <input
+                    type="checkbox"
+                    checked={
+                      sliceReviewSettings(settings).autoFix?.enabled !== false
+                    }
+                    onChange={(e) =>
+                      void persistAutoFix({ enabled: e.target.checked })
+                    }
+                  />
+                  スライス後に Auto Fix（残響・こもり）
+                  {sliceReviewSettings(settings).autoFix?.enabled !== false
+                    ? " · 有効"
+                    : ""}
+                </label>
+                {sliceReviewSettings(settings).autoFix?.enabled !== false && (
+                  <>
+                    <div className="slice-review-aspect-toggles">
+                      {(
+                        [
+                          ["reverb", "残響（WPE）"],
+                          ["muffle", "こもり（EQ）"],
+                          ["enhance", "低音質（NR/HP）"],
+                        ] as const
+                      ).map(([key, label]) => (
+                        <label key={key} className="train-announce-check">
+                          <input
+                            type="checkbox"
+                            checked={
+                              sliceReviewSettings(settings).autoFix?.[key] !==
+                              false
+                            }
+                            onChange={(e) =>
+                              void persistAutoFix({ [key]: e.target.checked })
+                            }
+                          />
+                          {label}
+                        </label>
+                      ))}
+                    </div>
+                    <span className="param-altered-hint">
+                      セッション全体が響いている／こもっているときは全クリップにかけ、乾いた音は通しません。元フォルダは書き換えず、ジョブ内コピーだけ処理します。
+                    </span>
+                  </>
+                )}
+              </div>
+              <div
                 className={`train-review-block${reviewMode === "auto" ? " is-review-auto" : ""}`}
               >
                 <label>
@@ -1306,19 +1563,19 @@ export function TrainView({
                 />
                 終了通知
               </label>
-              <div className="row">
-                <button
-                  type="button"
-                  className="primary"
-                  onClick={() => void startJob()}
-                >
-                  この内容で開始
-                </button>
-                <button type="button" onClick={() => setConfirmOpen(false)}>
-                  キャンセル
-                </button>
-              </div>
             </div>
+            <footer className="panel-footer row">
+              <button
+                type="button"
+                className="primary"
+                onClick={() => void startJob()}
+              >
+                この内容で開始
+              </button>
+              <button type="button" onClick={() => setConfirmOpen(false)}>
+                キャンセル
+              </button>
+            </footer>
           </div>
         </div>
       )}

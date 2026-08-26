@@ -59,7 +59,37 @@ export type SliceReviewSettings = {
   autoRemovePercent?: number;
   /** auto: keep at most this many slices (0 = no cap) */
   autoKeepMax?: number;
+  /** Non-generative WPE / tilt / denoise on sliced clips before review. */
+  autoFix: SliceAutoFixSettings;
 };
+
+export type SliceAutoFixSettings = {
+  enabled: boolean;
+  /** WPE + late-reverb suppression when the session/slice sounds wet. */
+  reverb: boolean;
+  /** Spectral tilt / boxiness EQ for muffled takes. */
+  muffle: boolean;
+  /** High-pass, light Wiener denoise, soft declip. */
+  enhance: boolean;
+};
+
+export const DEFAULT_SLICE_AUTO_FIX: SliceAutoFixSettings = {
+  enabled: true,
+  reverb: true,
+  muffle: true,
+  enhance: true,
+};
+
+export function sliceAutoFixSettings(
+  raw?: Partial<SliceAutoFixSettings> | null,
+): SliceAutoFixSettings {
+  return {
+    enabled: raw?.enabled !== false,
+    reverb: raw?.reverb !== false,
+    muffle: raw?.muffle !== false,
+    enhance: raw?.enhance !== false,
+  };
+}
 
 export const DEFAULT_SLICE_REVIEW: SliceReviewSettings = {
   mode: "manual",
@@ -84,6 +114,7 @@ export const DEFAULT_SLICE_REVIEW: SliceReviewSettings = {
   },
   autoRemovePercent: 0,
   autoKeepMax: 0,
+  autoFix: { ...DEFAULT_SLICE_AUTO_FIX },
 };
 
 export function sliceReviewSettings(
@@ -95,6 +126,7 @@ export function sliceReviewSettings(
       ...DEFAULT_SLICE_REVIEW,
       aspects: { ...DEFAULT_SLICE_REVIEW.aspects },
       thresholds: { ...DEFAULT_SLICE_REVIEW.thresholds },
+      autoFix: { ...DEFAULT_SLICE_AUTO_FIX },
     };
   }
   const pct = Number(raw.autoRemovePercent);
@@ -113,6 +145,7 @@ export function sliceReviewSettings(
       ? Math.min(90, Math.max(0, pct))
       : 0,
     autoKeepMax: Number.isFinite(keep) ? Math.max(0, Math.floor(keep)) : 0,
+    autoFix: sliceAutoFixSettings(raw.autoFix),
   };
 }
 
@@ -308,6 +341,12 @@ export type LineVariant = {
   id: string;
   seed: number;
   wavPath: string;
+  /** Snapshot of inputs used for this WAV. Missing → inherit line-level snapshot. */
+  generatedText?: string | null;
+  generatedSpeakerEmbedPath?: string | null;
+  generatedCaption?: string | null;
+  generatedCfgScaleCaption?: number | null;
+  generatedSampling?: SamplingParams | null;
 };
 
 export type ProjectLine = {
@@ -336,7 +375,66 @@ export type ProjectLine = {
   generatedCfgScaleCaption?: number | null;
   volume: number;
   speed: number;
+  /** Post-generation tone / denoise. Missing → all off. */
+  audioFx?: AudioFx;
 };
+
+/** Line post-FX amounts in 0..1 (0 = bypass). Keep in sync with Rust `AudioFx`. */
+export type AudioFx = {
+  highpass: number;
+  muffle: number;
+  clarity: number;
+  air: number;
+  flatten: number;
+  deesser: number;
+  denoise: number;
+};
+
+export function defaultAudioFx(): AudioFx {
+  return {
+    highpass: 0,
+    muffle: 0,
+    clarity: 0,
+    air: 0,
+    flatten: 0,
+    deesser: 0,
+    denoise: 0,
+  };
+}
+
+function clampFx01(n: unknown): number {
+  const v = typeof n === "number" ? n : Number(n);
+  if (!Number.isFinite(v)) return 0;
+  return Math.min(1, Math.max(0, v));
+}
+
+export function audioFxOf(
+  line: { audioFx?: AudioFx | null } | null | undefined,
+): AudioFx {
+  const raw = line?.audioFx;
+  if (!raw) return defaultAudioFx();
+  return {
+    highpass: clampFx01(raw.highpass),
+    muffle: clampFx01(raw.muffle),
+    clarity: clampFx01(raw.clarity),
+    air: clampFx01(raw.air),
+    flatten: clampFx01(raw.flatten),
+    deesser: clampFx01(raw.deesser),
+    denoise: clampFx01(raw.denoise),
+  };
+}
+
+export function audioFxActive(fx: AudioFx): boolean {
+  return (
+    fx.highpass > 0.001 ||
+    fx.muffle > 0.001 ||
+    fx.clarity > 0.001 ||
+    fx.air > 0.001 ||
+    fx.flatten > 0.001 ||
+    fx.deesser > 0.001 ||
+    fx.denoise > 0.001
+  );
+}
 
 /** Stable compare for dirty-check / cache keys. */
 export function samplingEqual(
@@ -406,22 +504,60 @@ export function wavPathBelongsToLine(
   });
 }
 
+function variantHasOwnGeneration(v: LineVariant): boolean {
+  return (
+    v.generatedText !== undefined ||
+    v.generatedSpeakerEmbedPath !== undefined ||
+    v.generatedCaption !== undefined ||
+    v.generatedCfgScaleCaption !== undefined ||
+    v.generatedSampling !== undefined
+  );
+}
+
+export function inheritLineGeneration(
+  line: ProjectLine,
+  variant: LineVariant,
+): LineVariant {
+  if (variantHasOwnGeneration(variant)) return variant;
+  return {
+    ...variant,
+    generatedText: line.generatedText,
+    generatedSpeakerEmbedPath: line.generatedSpeakerEmbedPath,
+    generatedCaption: line.generatedCaption,
+    generatedCfgScaleCaption: line.generatedCfgScaleCaption,
+    generatedSampling: line.generatedSampling
+      ? { ...line.generatedSampling }
+      : line.generatedSampling,
+  };
+}
+
 export function backfillLineVariants(p: Project): Project {
   let changed = false;
   const lines = p.lines.map((l) => {
-    if (l.variants && l.variants.length > 0) {
-      const synced = syncLineWavPath(l);
-      if (synced.wavPath !== l.wavPath) changed = true;
-      return synced;
+    let line = l;
+    if (!line.variants || line.variants.length === 0) {
+      if (line.wavPath) {
+        changed = true;
+        line = syncLineWavPath({
+          ...line,
+          variants: [{ id: line.id, seed: 0, wavPath: line.wavPath }],
+        });
+      } else {
+        return line;
+      }
     }
-    if (l.wavPath) {
-      changed = true;
-      return syncLineWavPath({
-        ...l,
-        variants: [{ id: l.id, seed: 0, wavPath: l.wavPath }],
-      });
-    }
-    return l;
+    const variants = line.variants ?? [];
+    let variantsChanged = false;
+    const stamped = variants.map((v) => {
+      const next = inheritLineGeneration(line, v);
+      if (next !== v) variantsChanged = true;
+      return next;
+    });
+    const synced = syncLineWavPath(
+      variantsChanged ? { ...line, variants: stamped } : line,
+    );
+    if (synced.wavPath !== l.wavPath || variantsChanged) changed = true;
+    return synced;
   });
   return changed ? { ...p, lines } : p;
 }

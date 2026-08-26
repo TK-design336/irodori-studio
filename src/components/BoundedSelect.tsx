@@ -6,12 +6,16 @@ import {
   useMemo,
   useRef,
   useState,
+  type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
 
 export type SelectOption = {
   value: string;
   label: string;
+  /** Colored parenthetical after the label (e.g. real name / gender / age). */
+  meta?: string;
+  metaTone?: "realName" | "gender" | "age";
 };
 
 type Props = {
@@ -26,6 +30,13 @@ type Props = {
   /** Show a text field and filter options as the user types. */
   searchable?: boolean;
   searchPlaceholder?: string;
+  /** Extra content below the search field (e.g. sort toolbar). */
+  menuToolbar?: ReactNode;
+  /** Extra panel rendered beside the menu (must stay inside menuRef for outside-click). */
+  menuAside?: ReactNode;
+  /** Preferred side for menuAside; flips when space is insufficient. */
+  menuAsideSide?: "left" | "right";
+  onOpenChange?: (open: boolean) => void;
   "aria-label"?: string;
   onClick?: (e: React.MouseEvent) => void;
 };
@@ -36,11 +47,14 @@ type MenuPos = {
   width: number;
   maxHeight: number;
   openUp: boolean;
+  asideSide: "left" | "right";
 };
 
 const MENU_MAX = 280;
 const MARGIN = 8;
 const SEARCH_H = 36;
+const TOOLBAR_H = 32;
+const ASIDE_W = 220;
 
 function foldQuery(s: string): string {
   return s.normalize("NFKC").toLowerCase().replace(/[\s_\-・．.]/g, "");
@@ -50,8 +64,11 @@ function computePos(
   trigger: DOMRect,
   itemCount: number,
   searchable: boolean,
+  hasToolbar: boolean,
+  preferAside: "left" | "right",
+  hasAside: boolean,
 ): MenuPos {
-  const extra = searchable ? SEARCH_H : 0;
+  const extra = (searchable ? SEARCH_H : 0) + (hasToolbar ? TOOLBAR_H : 0);
   const estH = Math.min(MENU_MAX, Math.max(36, itemCount * 26 + 6 + extra));
   const spaceBelow = window.innerHeight - trigger.bottom - MARGIN;
   const spaceAbove = trigger.top - MARGIN;
@@ -64,6 +81,17 @@ function computePos(
   }
   if (left < MARGIN) left = MARGIN;
 
+  let asideSide = preferAside;
+  if (hasAside) {
+    const spaceRight = window.innerWidth - (left + width) - MARGIN;
+    const spaceLeft = left - MARGIN;
+    if (preferAside === "right" && spaceRight < ASIDE_W && spaceLeft > spaceRight) {
+      asideSide = "left";
+    } else if (preferAside === "left" && spaceLeft < ASIDE_W && spaceRight > spaceLeft) {
+      asideSide = "right";
+    }
+  }
+
   if (openUp) {
     return {
       top: trigger.top - MARGIN,
@@ -71,6 +99,7 @@ function computePos(
       width,
       maxHeight,
       openUp: true,
+      asideSide,
     };
   }
   return {
@@ -79,6 +108,7 @@ function computePos(
     width,
     maxHeight,
     openUp: false,
+    asideSide,
   };
 }
 
@@ -96,10 +126,25 @@ export function BoundedSelect({
   disabled = false,
   searchable = false,
   searchPlaceholder = "検索…",
+  menuToolbar,
+  menuAside,
+  menuAsideSide = "right",
+  onOpenChange,
   "aria-label": ariaLabel,
   onClick,
 }: Props) {
   const [open, setOpen] = useState(false);
+
+  const setOpenNotify = useCallback(
+    (next: boolean | ((prev: boolean) => boolean)) => {
+      setOpen((prev) => {
+        const resolved = typeof next === "function" ? next(prev) : next;
+        if (resolved !== prev) onOpenChange?.(resolved);
+        return resolved;
+      });
+    },
+    [onOpenChange],
+  );
   const [pos, setPos] = useState<MenuPos | null>(null);
   const [highlight, setHighlight] = useState(-1);
   const [query, setQuery] = useState("");
@@ -112,24 +157,42 @@ export function BoundedSelect({
   const selected = options.find((o) => o.value === value);
   const label =
     selected?.label ?? displayLabel ?? (value ? value : placeholder);
+  const selectedMeta = selected?.meta;
+  const selectedMetaTone = selected?.metaTone;
 
   const filtered = useMemo(() => {
     if (!searchable) return options;
     const q = foldQuery(query);
     if (!q) return options;
-    return options.filter((o) => foldQuery(o.label).includes(q));
+    return options.filter(
+      (o) =>
+        foldQuery(o.label).includes(q) ||
+        (o.meta ? foldQuery(o.meta).includes(q) : false),
+    );
   }, [options, query, searchable]);
+
+  const hasToolbar = Boolean(menuToolbar);
+  const hasAside = Boolean(menuAside);
 
   const updatePos = useCallback(() => {
     const el = triggerRef.current;
     if (!el) return;
-    setPos(computePos(el.getBoundingClientRect(), options.length, searchable));
-  }, [options.length, searchable]);
+    setPos(
+      computePos(
+        el.getBoundingClientRect(),
+        options.length,
+        searchable,
+        hasToolbar,
+        menuAsideSide,
+        hasAside,
+      ),
+    );
+  }, [options.length, searchable, hasToolbar, menuAsideSide, hasAside]);
 
   useLayoutEffect(() => {
     if (!open) return;
     updatePos();
-  }, [open, updatePos]);
+  }, [open, updatePos, hasAside]);
 
   useLayoutEffect(() => {
     if (!open) return;
@@ -165,11 +228,11 @@ export function BoundedSelect({
       const t = e.target as Node;
       if (triggerRef.current?.contains(t)) return;
       if (menuRef.current?.contains(t)) return;
-      setOpen(false);
+      setOpenNotify(false);
     };
     document.addEventListener("pointerdown", onPointerDown);
     return () => document.removeEventListener("pointerdown", onPointerDown);
-  }, [open]);
+  }, [open, setOpenNotify]);
 
   useEffect(() => {
     if (!open || highlight < 0) return;
@@ -179,7 +242,7 @@ export function BoundedSelect({
 
   const pick = (v: string) => {
     onChange(v);
-    setOpen(false);
+    setOpenNotify(false);
     triggerRef.current?.focus();
   };
 
@@ -193,7 +256,7 @@ export function BoundedSelect({
     if (isComposingKey(e)) return;
     if (e.key === "Escape") {
       e.preventDefault();
-      setOpen(false);
+      setOpenNotify(false);
       triggerRef.current?.focus();
       return;
     }
@@ -232,7 +295,7 @@ export function BoundedSelect({
       return;
     }
     if (e.key === "Tab") {
-      setOpen(false);
+      setOpenNotify(false);
     }
   };
 
@@ -241,7 +304,7 @@ export function BoundedSelect({
     if (!open) {
       if (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter" || e.key === " ") {
         e.preventDefault();
-        setOpen(true);
+        setOpenNotify(true);
         return;
       }
       if (
@@ -253,7 +316,7 @@ export function BoundedSelect({
       ) {
         e.preventDefault();
         setQuery(e.key);
-        setOpen(true);
+        setOpenNotify(true);
       }
       return;
     }
@@ -271,66 +334,91 @@ export function BoundedSelect({
     createPortal(
       <div
         ref={menuRef}
-        className={`bounded-select-menu${className ? ` ${className}` : ""}`}
+        className={`bounded-select-portal${
+          menuAside ? ` aside-${pos.asideSide}` : ""
+        }`}
         style={{
           top: pos.openUp ? undefined : pos.top,
           bottom: pos.openUp ? window.innerHeight - pos.top : undefined,
           left: pos.left,
-          width: pos.width,
-          maxHeight: pos.maxHeight,
         }}
       >
-        {searchable && (
-          <div className="bounded-select-search">
-            <input
-              ref={searchRef}
-              type="text"
-              value={query}
-              placeholder={searchPlaceholder}
-              autoComplete="off"
-              autoCorrect="off"
-              spellCheck={false}
-              aria-label={searchPlaceholder}
-              aria-autocomplete="list"
-              aria-controls={listId}
-              aria-activedescendant={activeDesc}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={onMenuKeyDown}
-              onClick={(e) => e.stopPropagation()}
-            />
-          </div>
-        )}
-        <ul ref={listRef} id={listId} role="listbox" className="bounded-select-list">
-          {filtered.length === 0 ? (
-            <li className="bounded-select-empty" role="presentation">
-              該当なし
-            </li>
-          ) : (
-            filtered.map((opt, i) => {
-              const active = opt.value === value;
-              return (
-                <li
-                  key={opt.value === "" ? `__empty-${i}` : opt.value}
-                  role="presentation"
-                >
-                  <button
-                    type="button"
-                    id={`${listId}-opt-${i}`}
-                    role="option"
-                    aria-selected={active}
-                    className={`bounded-select-option${active ? " selected" : ""}${
-                      i === highlight ? " highlight" : ""
-                    }`}
-                    onMouseEnter={() => setHighlight(i)}
-                    onClick={() => pick(opt.value)}
-                  >
-                    {opt.label}
-                  </button>
-                </li>
-              );
-            })
+        <div
+          className={`bounded-select-menu${className ? ` ${className}` : ""}`}
+          style={{
+            width: pos.width,
+            maxHeight: pos.maxHeight,
+          }}
+        >
+          {searchable && (
+            <div className="bounded-select-search">
+              <input
+                ref={searchRef}
+                type="text"
+                value={query}
+                placeholder={searchPlaceholder}
+                autoComplete="off"
+                autoCorrect="off"
+                spellCheck={false}
+                aria-label={searchPlaceholder}
+                aria-autocomplete="list"
+                aria-controls={listId}
+                aria-activedescendant={activeDesc}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={onMenuKeyDown}
+                onClick={(e) => e.stopPropagation()}
+              />
+            </div>
           )}
-        </ul>
+          {menuToolbar && (
+            <div
+              className="bounded-select-toolbar"
+              onClick={(e) => e.stopPropagation()}
+              onPointerDown={(e) => e.stopPropagation()}
+            >
+              {menuToolbar}
+            </div>
+          )}
+          <ul ref={listRef} id={listId} role="listbox" className="bounded-select-list">
+            {filtered.length === 0 ? (
+              <li className="bounded-select-empty" role="presentation">
+                該当なし
+              </li>
+            ) : (
+              filtered.map((opt, i) => {
+                const active = opt.value === value;
+                return (
+                  <li
+                    key={opt.value === "" ? `__empty-${i}` : opt.value}
+                    role="presentation"
+                  >
+                    <button
+                      type="button"
+                      id={`${listId}-opt-${i}`}
+                      role="option"
+                      aria-selected={active}
+                      className={`bounded-select-option${active ? " selected" : ""}${
+                        i === highlight ? " highlight" : ""
+                      }`}
+                      onMouseEnter={() => setHighlight(i)}
+                      onClick={() => pick(opt.value)}
+                    >
+                      <span className="bounded-select-option-main">{opt.label}</span>
+                      {opt.meta && (
+                        <span
+                          className={`speaker-opt-meta meta-${opt.metaTone ?? "realName"}`}
+                        >
+                          ({opt.meta})
+                        </span>
+                      )}
+                    </button>
+                  </li>
+                );
+              })
+            )}
+          </ul>
+        </div>
+        {menuAside}
       </div>,
       document.body,
     );
@@ -350,11 +438,20 @@ export function BoundedSelect({
         aria-label={ariaLabel}
         onClick={(e) => {
           onClick?.(e);
-          if (!disabled) setOpen((o) => !o);
+          if (!disabled) setOpenNotify((o) => !o);
         }}
         onKeyDown={onTriggerKeyDown}
       >
-        <span className="bounded-select-label">{label}</span>
+        <span className="bounded-select-label">
+          {label}
+          {selectedMeta && (
+            <span
+              className={`speaker-opt-meta meta-${selectedMetaTone ?? "realName"}`}
+            >
+              ({selectedMeta})
+            </span>
+          )}
+        </span>
         <span className="bounded-select-caret" aria-hidden>
           ▾
         </span>

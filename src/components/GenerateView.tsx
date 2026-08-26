@@ -31,14 +31,15 @@ import {
   asrCerWarnThreshold,
   samplingEqualIgnoringSeed,
   normalizeLineVariants,
-  primaryVariant,
   syncLineWavPath,
   wavPathBelongsToLine,
   backfillLineVariants,
+  inheritLineGeneration,
   newVariantId,
   clampCandidateCount,
   MAX_LINE_VARIANTS,
   multiGenerateModeOf,
+  audioFxOf,
   type LineVariant,
 } from "../types";
 import { SamplingPanel } from "./SamplingPanel";
@@ -49,6 +50,7 @@ import { isSupportedDocFile, filesFromDataTransfer, acceptFileDrag } from "../li
 import { AnnotationReviewDialog, type NumericConvertModes } from "./AnnotationReviewDialog";
 import { AnnotationOverlay } from "./AnnotationOverlay";
 import { BoundedSelect } from "./BoundedSelect";
+import { SpeakerSelect } from "./SpeakerSelect";
 import { EmojiPalette } from "./EmojiPalette";
 import { BatchMoreMenu } from "./BatchMoreMenu";
 import { lineExportFileName } from "../lib/exportFileName";
@@ -159,29 +161,312 @@ function lineSynthText(line: ProjectLine): string {
   return synthTextForLine(line.text, line.readings);
 }
 
+type VariantGenerationSnap = {
+  generatedText: string;
+  generatedSpeakerEmbedPath: string;
+  generatedCaption: string;
+  generatedCfgScaleCaption: number;
+  generatedSampling: SamplingParams;
+};
+
+function generationSnap(
+  text: string,
+  speakerKey: string,
+  caption: string,
+  cfgScaleCaption: number,
+  sampling: SamplingParams,
+): VariantGenerationSnap {
+  return {
+    generatedText: text,
+    generatedSpeakerEmbedPath: speakerKey,
+    generatedCaption: caption,
+    generatedCfgScaleCaption: cfgScaleCaption,
+    generatedSampling: generatedSamplingSnapshot(sampling),
+  };
+}
+
+function stampVariantGeneration(
+  variant: LineVariant,
+  snap: VariantGenerationSnap,
+): LineVariant {
+  return { ...variant, ...snap };
+}
+
+type DirtyDiff = {
+  label: string;
+  from: string;
+  to: string;
+};
+
+function truncateDiffText(s: string, max = 56): string {
+  const t = s.replace(/\s+/g, " ").trim();
+  if (!t) return "（空）";
+  return t.length <= max ? t : `${t.slice(0, max)}…`;
+}
+
+function displayPathTail(path: string): string {
+  if (!path) return "（なし）";
+  const i = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return i >= 0 ? path.slice(i + 1) : path;
+}
+
+function formatDiffNum(v: number): string {
+  if (!Number.isFinite(v)) return String(v);
+  if (Number.isInteger(v)) return String(v);
+  return String(Math.round(v * 100) / 100);
+}
+
+function formatDiffSeconds(v: number | null | undefined): string {
+  if (v == null || !Number.isFinite(v)) return "自動";
+  return `${v}秒`;
+}
+
+function formatTSchedule(mode: string): string {
+  if (mode === "sway") return "Sway";
+  if (mode === "linear") return "線形";
+  return mode || "（空）";
+}
+
+function formatCfgMode(mode: string): string {
+  if (mode === "independent") return "独立";
+  if (mode === "joint") return "一括";
+  if (mode === "alternating") return "交互";
+  return mode || "（空）";
+}
+
+function parseSpeakerConditionKey(key: string): {
+  kind: "embed" | "ref" | "caption";
+  embedPath: string;
+  extra: string;
+} {
+  if (key.startsWith("ref\0")) {
+    const rest = key.slice("ref\0".length);
+    const i = rest.indexOf("\0");
+    if (i >= 0) {
+      return {
+        kind: "ref",
+        embedPath: rest.slice(0, i),
+        extra: rest.slice(i + 1),
+      };
+    }
+    return { kind: "ref", embedPath: rest, extra: "" };
+  }
+  if (key.startsWith("caption\0")) {
+    const rest = key.slice("caption\0".length);
+    const i = rest.indexOf("\0");
+    if (i >= 0) {
+      return {
+        kind: "caption",
+        embedPath: rest.slice(0, i),
+        extra: rest.slice(i + 1),
+      };
+    }
+    return { kind: "caption", embedPath: rest, extra: "" };
+  }
+  return { kind: "embed", embedPath: key, extra: "" };
+}
+
+function speakerConditionDisplay(
+  speakers: SpeakerInfo[],
+  key: string,
+): string {
+  if (!key) return "（なし）";
+  const parsed = parseSpeakerConditionKey(key);
+  const sp = speakers.find((s) => s.embedPath === parsed.embedPath);
+  const name = sp
+    ? speakerOptionLabel(sp)
+    : displayPathTail(parsed.embedPath);
+  if (parsed.kind === "ref") {
+    const wav = displayPathTail(parsed.extra);
+    return wav !== "（なし）" ? `${name} / ${wav}` : name;
+  }
+  if (parsed.kind === "caption" && parsed.extra) {
+    return `${name} / ${truncateDiffText(parsed.extra, 32)}`;
+  }
+  return name || "（なし）";
+}
+
+function samplingDirtyDiffs(
+  current: SamplingParams,
+  generated: SamplingParams,
+): DirtyDiff[] {
+  const diffs: DirtyDiff[] = [];
+  const add = (label: string, from: string, to: string) => {
+    if (from !== to) diffs.push({ label, from, to });
+  };
+  add("ステップ数", formatDiffNum(generated.numSteps), formatDiffNum(current.numSteps));
+  add("長さ", formatDiffSeconds(generated.seconds), formatDiffSeconds(current.seconds));
+  add(
+    "長さ倍率",
+    formatDiffNum(generated.durationScale),
+    formatDiffNum(current.durationScale),
+  );
+  add(
+    "時間スケジュール",
+    formatTSchedule(generated.tScheduleMode),
+    formatTSchedule(current.tScheduleMode),
+  );
+  add("Sway係数", formatDiffNum(generated.swayCoeff), formatDiffNum(current.swayCoeff));
+  add(
+    "CFG方式",
+    formatCfgMode(generated.cfgGuidanceMode),
+    formatCfgMode(current.cfgGuidanceMode),
+  );
+  add(
+    "テキスト強度",
+    formatDiffNum(generated.cfgScaleText),
+    formatDiffNum(current.cfgScaleText),
+  );
+  add(
+    "話者強度",
+    formatDiffNum(generated.cfgScaleSpeaker),
+    formatDiffNum(current.cfgScaleSpeaker),
+  );
+  return diffs;
+}
+
+function variantDirtyDiffs(
+  line: ProjectLine,
+  variant: LineVariant,
+  speakers: SpeakerInfo[],
+): DirtyDiff[] {
+  const diffs: DirtyDiff[] = [];
+  if (!wavPathMatchesLine(line, variant.wavPath)) {
+    diffs.push({
+      label: "WAV",
+      from: variant.wavPath ? displayPathTail(variant.wavPath) : "（なし）",
+      to: "この行のものではない",
+    });
+  }
+  const genText = variant.generatedText ?? line.generatedText ?? "";
+  const curText = lineSynthText(line);
+  if (genText !== curText) {
+    diffs.push({
+      label: "テキスト",
+      from: truncateDiffText(genText),
+      to: truncateDiffText(curText),
+    });
+  }
+  const curSpeaker = speakerConditionKey(speakers, line.speakerEmbedPath);
+  const genSpeaker =
+    variant.generatedSpeakerEmbedPath ?? line.generatedSpeakerEmbedPath ?? "";
+  if (genSpeaker !== curSpeaker) {
+    const genP = parseSpeakerConditionKey(genSpeaker);
+    const curP = parseSpeakerConditionKey(curSpeaker);
+    if (genP.embedPath && genP.embedPath === curP.embedPath) {
+      if (genP.kind === "ref" || curP.kind === "ref") {
+        diffs.push({
+          label: "参照音源",
+          from: displayPathTail(genP.extra),
+          to: displayPathTail(curP.extra),
+        });
+      } else if (genP.kind === "caption" || curP.kind === "caption") {
+        diffs.push({
+          label: "話者キャプション",
+          from: truncateDiffText(genP.extra),
+          to: truncateDiffText(curP.extra),
+        });
+      } else {
+        diffs.push({
+          label: "話者",
+          from: speakerConditionDisplay(speakers, genSpeaker),
+          to: speakerConditionDisplay(speakers, curSpeaker),
+        });
+      }
+    } else {
+      diffs.push({
+        label: "話者",
+        from: speakerConditionDisplay(speakers, genSpeaker),
+        to: speakerConditionDisplay(speakers, curSpeaker),
+      });
+    }
+  }
+  const curCaption = effectiveLineCaption(line, speakers);
+  const genCaption = variant.generatedCaption ?? line.generatedCaption ?? "";
+  if (genCaption !== curCaption) {
+    diffs.push({
+      label: "キャプション",
+      from: truncateDiffText(genCaption),
+      to: truncateDiffText(curCaption),
+    });
+  }
+  if (curCaption || genCaption) {
+    const genCfg =
+      variant.generatedCfgScaleCaption ??
+      line.generatedCfgScaleCaption ??
+      DEFAULT_CFG_SCALE_CAPTION;
+    const curCfg = effectiveCfgScaleCaption(line, speakers);
+    if (genCfg !== curCfg) {
+      diffs.push({
+        label: "キャプション強度",
+        from: formatDiffNum(genCfg),
+        to: formatDiffNum(curCfg),
+      });
+    }
+  }
+  const genSampling = variant.generatedSampling ?? line.generatedSampling;
+  if (
+    genSampling != null &&
+    !samplingEqualIgnoringSeed(line.sampling, genSampling)
+  ) {
+    diffs.push(...samplingDirtyDiffs(line.sampling, genSampling));
+  }
+  return diffs;
+}
+
+function dirtyDiffKey(diffs: DirtyDiff[]): string {
+  return diffs.map((d) => `${d.label}\0${d.from}\0${d.to}`).join("\n");
+}
+
+function lineDirtyGroups(
+  line: ProjectLine,
+  speakers: SpeakerInfo[],
+): { title: string; diffs: DirtyDiff[] }[] {
+  const variants = normalizeLineVariants(line);
+  const listed =
+    variants.length > 0
+      ? variants
+      : line.wavPath
+        ? [{ id: line.id, seed: 0, wavPath: line.wavPath }]
+        : [];
+  const groups = listed
+    .map((v, i) => ({
+      title: `音声 ${i + 1}`,
+      diffs: variantDirtyDiffs(line, v, speakers),
+    }))
+    .filter((g) => g.diffs.length > 0);
+  if (groups.length === 0) return [];
+  const allSame =
+    groups.length === listed.length &&
+    groups.every((g) => dirtyDiffKey(g.diffs) === dirtyDiffKey(groups[0].diffs));
+  if (groups.length === 1 || allSame) {
+    return [{ title: "", diffs: groups[0].diffs }];
+  }
+  return groups;
+}
+
+function isVariantDirty(
+  line: ProjectLine,
+  variant: LineVariant,
+  speakers: SpeakerInfo[],
+): boolean {
+  return variantDirtyDiffs(line, variant, speakers).length > 0;
+}
+
 function isDirty(
   line: ProjectLine,
   speakers: SpeakerInfo[],
 ): boolean {
   const variants = normalizeLineVariants(line);
   if (variants.length === 0 && !line.wavPath) return true;
-  if ((line.generatedText ?? "") !== lineSynthText(line)) return true;
-  const key = speakerConditionKey(speakers, line.speakerEmbedPath);
-  if ((line.generatedSpeakerEmbedPath ?? "") !== key) return true;
-  const caption = effectiveLineCaption(line, speakers);
-  if ((line.generatedCaption ?? "") !== caption) return true;
-  if (caption || (line.generatedCaption ?? "")) {
-    const genCfg =
-      line.generatedCfgScaleCaption ?? DEFAULT_CFG_SCALE_CAPTION;
-    if (genCfg !== effectiveCfgScaleCaption(line, speakers)) return true;
+  if (variants.length === 0) {
+    return isVariantDirty(
+      line,
+      { id: line.id, seed: 0, wavPath: line.wavPath ?? "" },
+      speakers,
+    );
   }
-  if (
-    line.generatedSampling != null &&
-    !samplingEqualIgnoringSeed(line.sampling, line.generatedSampling)
-  ) {
-    return true;
-  }
-  return false;
+  return variants.some((v) => isVariantDirty(line, v, speakers));
 }
 
 /** Persist a novel reading to the reading dict only if it is not already a candidate. */
@@ -382,6 +667,60 @@ function AsrBadge({ result }: { result: AsrLineResult }) {
         <span className="asr-tooltip-label">文字起こし</span>
         {result.asrText || "（空）"}
       </span>
+    </span>
+  );
+}
+
+function DirtyDiffRows({ diffs }: { diffs: DirtyDiff[] }) {
+  return (
+    <>
+      {diffs.map((d, i) => (
+        <span className="dirty-diff-row" key={`${d.label}-${i}`}>
+          <span className="asr-tooltip-label">{d.label}</span>
+          <span className="dirty-diff-change">
+            <span className="dirty-diff-from">{d.from}</span>
+            <span className="dirty-diff-arrow">→</span>
+            <span className="dirty-diff-to">{d.to}</span>
+          </span>
+        </span>
+      ))}
+    </>
+  );
+}
+
+function DirtyDiffTooltip({
+  diffs,
+  groups,
+  heading = "現在の設定と異なります",
+}: {
+  diffs?: DirtyDiff[];
+  groups?: { title: string; diffs: DirtyDiff[] }[];
+  heading?: string;
+}) {
+  const shown =
+    groups && groups.length > 0
+      ? groups
+      : diffs && diffs.length > 0
+        ? [{ title: "", diffs }]
+        : [];
+  if (shown.length === 0) {
+    return (
+      <span className="asr-tooltip" role="tooltip">
+        音声が現在の設定と一致しません
+      </span>
+    );
+  }
+  return (
+    <span className="asr-tooltip" role="tooltip">
+      <strong>{heading}</strong>
+      {shown.map((g, i) => (
+        <span className="dirty-diff-group" key={g.title || i}>
+          {g.title ? (
+            <span className="dirty-diff-variant">{g.title}</span>
+          ) : null}
+          <DirtyDiffRows diffs={g.diffs} />
+        </span>
+      ))}
     </span>
   );
 }
@@ -1315,18 +1654,9 @@ export function GenerateView({
   const panelSampling = project
     ? (samplingByProject[project.name] ?? project.defaultSampling)
     : defaultSampling();
+  const panelSamplingRef = useRef(panelSampling);
+  panelSamplingRef.current = panelSampling;
   selectedIdRef.current = selectedId;
-
-  const speakerOptions = useMemo(
-    () => [
-      { value: "", label: "話者を選択…" },
-      ...speakers.map((s) => ({
-        value: s.embedPath,
-        label: speakerOptionLabel(s),
-      })),
-    ],
-    [speakers],
-  );
 
   const displayLines = useMemo(() => {
     if (!project) return [];
@@ -1348,18 +1678,26 @@ export function GenerateView({
       [name]: id ? [id] : [],
     }));
     selectionAnchorRef.current = id;
+    selectedIdRef.current = id;
     selectedIdsRef.current = id ? [id] : [];
   }, []);
 
   const onPanelSampling = useCallback((s: SamplingParams) => {
     const name = projectRef.current?.name;
     if (!name) return;
+    panelSamplingRef.current = s;
     setSamplingByProject((prev) => ({ ...prev, [name]: s }));
   }, []);
+
+  const samplingForLine = (line: ProjectLine): SamplingParams =>
+    line.id === selectedIdRef.current
+      ? panelSamplingRef.current
+      : line.sampling;
 
   const playerRef = useRef<LineAudioPlayer | null>(null);
   const persistChain = useRef(Promise.resolve());
   const skipSamplingAutoApply = useRef(false);
+  const skipAutoApplySamplingJson = useRef<string | null>(null);
   const speedTimer = useRef<number | null>(null);
   const lineDraftsRef = useRef<Map<string, string>>(new Map());
   /** Last text used for annotation detect (skip unchanged lines). */
@@ -1513,7 +1851,11 @@ export function GenerateView({
   }, []);
 
   /** Abort sequential batch playback so single-line / edit ops take over. */
-  const cancelBatchPlayback = (opts?: { stopAudio?: boolean }) => {
+  const cancelBatchPlayback = (opts?: {
+    stopAudio?: boolean;
+    /** Leave sequential mode on (same-line variant takeover still pauses via the row button). */
+    keepActive?: boolean;
+  }) => {
     batchPlayGenRef.current += 1;
     playGenRef.current += 1;
     if (opts?.stopAudio) {
@@ -1522,7 +1864,7 @@ export function GenerateView({
       playerRef.current?.cancelSilence();
       playerRef.current?.releaseEndedWaiters();
     }
-    if (batchPlayActiveRef.current) {
+    if (batchPlayActiveRef.current && !opts?.keepActive) {
       batchPlayActiveRef.current = false;
       setBatchPlayActive(false);
       setStatus("一括再生を停止");
@@ -1701,14 +2043,15 @@ export function GenerateView({
     }, false);
   }, [persist]);
 
-  // Live volume while playing
+  // Live volume / EQ while playing
   useEffect(() => {
     const player = playerRef.current;
     if (!player || !selected || player.activeLineId !== selected.id) return;
     player.setVolume(selected.volume);
-  }, [selected?.volume, selected?.id]);
+    player.setAudioFx(audioFxOf(selected));
+  }, [selected?.volume, selected?.id, selected?.audioFx]);
 
-  // Speed: debounce during playback only (ffmpeg atempo). Do not run on wavPath changes.
+  // Speed + denoise: debounce during playback only (ffmpeg). Do not run on wavPath changes.
   useEffect(() => {
     const player = playerRef.current;
     if (!player || !selected || player.activeLineId !== selected.id) return;
@@ -1718,6 +2061,7 @@ export function GenerateView({
     if (speedTimer.current) window.clearTimeout(speedTimer.current);
     const wavPath = selected.wavPath;
     const speed = selected.speed;
+    const denoise = audioFxOf(selected).denoise;
     const lineId = selected.id;
     const gen = playGenRef.current;
     speedTimer.current = window.setTimeout(() => {
@@ -1727,6 +2071,7 @@ export function GenerateView({
           const playPath = await invoke<string>("prepare_playback_wav", {
             src: wavPath,
             speed,
+            denoise,
           });
           const bytes = await invoke<number[]>("read_file_bytes", {
             path: playPath,
@@ -1737,7 +2082,7 @@ export function GenerateView({
             new Uint8Array(bytes),
           );
         } catch (e) {
-          setStatus(`速度反映失敗: ${e}`);
+          setStatus(`音声調整の反映失敗: ${e}`);
         }
       })();
     }, 280);
@@ -1745,16 +2090,20 @@ export function GenerateView({
     return () => {
       if (speedTimer.current) window.clearTimeout(speedTimer.current);
     };
-  }, [selected?.speed, selected?.id]);
+  }, [selected?.speed, selected?.audioFx?.denoise, selected?.id]);
 
   // Auto-apply sampling to selected line (serialized, skip when syncing from line→panel)
   useEffect(() => {
-    if (skipSamplingAutoApply.current) {
-      skipSamplingAutoApply.current = false;
-      return;
-    }
+    const skipProjectSwitch = skipSamplingAutoApply.current;
+    skipSamplingAutoApply.current = false;
+    const skipJson = skipAutoApplySamplingJson.current;
+    skipAutoApplySamplingJson.current = null;
+    if (skipProjectSwitch) return;
     const id = selectedIdRef.current;
     if (!id) return;
+    if (skipJson !== null && skipJson === JSON.stringify(panelSampling)) {
+      return;
+    }
     void persist((prev) => {
       const line = prev.lines.find((l) => l.id === id);
       if (!line) return prev;
@@ -1771,8 +2120,28 @@ export function GenerateView({
   }, [panelSampling, persist]);
 
   const syncPanelFromLine = (line: ProjectLine) => {
-    skipSamplingAutoApply.current = true;
+    skipAutoApplySamplingJson.current = JSON.stringify(line.sampling);
     onPanelSampling(line.sampling);
+  };
+
+  /** Keep panel + line.sampling on the values that will actually be synthesized. */
+  const adoptSamplingForGenerate = (
+    line: ProjectLine,
+    sampling: SamplingParams,
+  ) => {
+    onSelectedId(line.id);
+    skipAutoApplySamplingJson.current = JSON.stringify(sampling);
+    onPanelSampling(sampling);
+    const cur = projectRef.current?.lines.find((l) => l.id === line.id);
+    if (!cur || JSON.stringify(cur.sampling) === JSON.stringify(sampling)) {
+      return;
+    }
+    void persist((prev) => ({
+      ...prev,
+      lines: prev.lines.map((l) =>
+        l.id === line.id ? withLineSampling(l, sampling) : l,
+      ),
+    }), false);
   };
 
   const ensureWorker = async () => {
@@ -2058,6 +2427,13 @@ export function GenerateView({
               id: copiedVariantId,
               seed: variant.seed,
               wavPath: dest,
+              generatedText: variant.generatedText,
+              generatedSpeakerEmbedPath: variant.generatedSpeakerEmbedPath,
+              generatedCaption: variant.generatedCaption,
+              generatedCfgScaleCaption: variant.generatedCfgScaleCaption,
+              generatedSampling: variant.generatedSampling
+                ? { ...variant.generatedSampling }
+                : variant.generatedSampling,
             });
           } catch {
             /* skip missing variant files */
@@ -2246,6 +2622,7 @@ export function GenerateView({
       generatedCfgScaleCaption: null,
       volume: selected?.volume ?? 1,
       speed: selected?.speed ?? 1,
+      audioFx: audioFxOf(selected),
     };
     await persist((prevProj) => ({
       ...prevProj,
@@ -2261,6 +2638,7 @@ export function GenerateView({
     const fallback = speakers[0];
     const vol = selected?.volume ?? 1;
     const spd = selected?.speed ?? 1;
+    const fx = audioFxOf(selected);
     let curName = prev?.speakerName ?? fallback?.name ?? "";
     let curEmbed = prev?.speakerEmbedPath ?? fallback?.embedPath ?? "";
     const unmatched: string[] = [];
@@ -2291,6 +2669,7 @@ export function GenerateView({
         generatedCfgScaleCaption: null,
         volume: vol,
         speed: spd,
+        audioFx: { ...fx },
       };
     });
     await persist((prevProj) => ({
@@ -2839,6 +3218,7 @@ export function GenerateView({
       generatedCfgScaleCaption: null,
       volume: cur.volume,
       speed: cur.speed,
+      audioFx: audioFxOf(cur),
     };
     lineDraftsRef.current.set(id, before);
     lineDraftsRef.current.set(newId, after);
@@ -2977,6 +3357,11 @@ export function GenerateView({
         if (k === "sampling") {
           return (
             JSON.stringify(nextLine.sampling) === JSON.stringify(cur.sampling)
+          );
+        }
+        if (k === "audioFx") {
+          return (
+            JSON.stringify(audioFxOf(nextLine)) === JSON.stringify(audioFxOf(cur))
           );
         }
         return nextLine[k] === cur[k];
@@ -3529,12 +3914,13 @@ export function GenerateView({
   const applyAudioToAll = () => {
     if (!selected) return;
     const { volume, speed } = selected;
+    const audioFx = audioFxOf(selected);
     askConfirm(
-      `Volume ${volume.toFixed(2)} / Speed ${speed.toFixed(2)} を全行に適用します。よろしいですか？`,
+      `Volume ${volume.toFixed(2)} / Speed ${speed.toFixed(2)} と追加調整を全行に適用します。よろしいですか？`,
       () => {
         void persist((prev) => ({
           ...prev,
-          lines: prev.lines.map((l) => ({ ...l, volume, speed })),
+          lines: prev.lines.map((l) => ({ ...l, volume, speed, audioFx })),
         }));
         setStatus("全行に Audio Adjustment を一括適用");
       },
@@ -3544,14 +3930,15 @@ export function GenerateView({
   const applyAudioToSameSpeaker = () => {
     if (!selected) return;
     const { volume, speed, speakerEmbedPath, speakerName } = selected;
+    const audioFx = audioFxOf(selected);
     askConfirm(
-      `Volume / Speed を話者「${speakerName || "未選択"}」の全行に適用します。よろしいですか？`,
+      `Volume / Speed / 追加調整を話者「${speakerName || "未選択"}」の全行に適用します。よろしいですか？`,
       () => {
         void persist((prev) => ({
           ...prev,
           lines: prev.lines.map((l) =>
             l.speakerEmbedPath === speakerEmbedPath
-              ? { ...l, volume, speed }
+              ? { ...l, volume, speed, audioFx }
               : l,
           ),
         }));
@@ -3674,8 +4061,7 @@ export function GenerateView({
         speakersRef.current,
       );
       const synthText = lineSynthText(fresh);
-      const s =
-        fresh.id === selectedIdRef.current ? panelSampling : fresh.sampling;
+      const s = samplingForLine(fresh);
       const contentKey = lineContentKey(
         synthText,
         speakerKey,
@@ -3800,8 +4186,6 @@ export function GenerateView({
         synthArgs.cfgScaleCaption = cfgCaptionUsed;
       }
 
-      // DEV: log synthArgs to console for debugging
-      console.log("[synthesize_line args]", JSON.stringify(synthArgs, null, 2));
       const resp = await invoke<{ used_seed?: number }>("synthesize_line", {
         args: synthArgs,
       });
@@ -3833,6 +4217,13 @@ export function GenerateView({
         id: variantId,
         seed: usedSeed,
         wavPath: outPath,
+        ...generationSnap(
+          textUsed,
+          speakerUsed,
+          captionUsed,
+          cfgCaptionUsed,
+          s,
+        ),
       };
       let updated = syncLineWavPath({
         ...(projectRef.current?.lines.find((l) => l.id === fresh.id) ??
@@ -3847,15 +4238,18 @@ export function GenerateView({
       });
       if (persistToLine) {
         let nextVariants: LineVariant[];
-        const idx = existingVariants.findIndex((v) => v.id === variantId);
+        const inheritedExisting = existingVariants.map((v) =>
+          inheritLineGeneration(fresh, v),
+        );
+        const idx = inheritedExisting.findIndex((v) => v.id === variantId);
         if (idx >= 0) {
-          nextVariants = existingVariants.map((v, i) =>
+          nextVariants = inheritedExisting.map((v, i) =>
             i === idx ? nextVariant : v,
           );
-        } else if (existingVariants.length === 0) {
+        } else if (inheritedExisting.length === 0) {
           nextVariants = [nextVariant];
         } else {
-          nextVariants = [...existingVariants, nextVariant];
+          nextVariants = [...inheritedExisting, nextVariant];
         }
         updated = syncLineWavPath({ ...updated, variants: nextVariants });
         await persist((prev) => ({
@@ -3909,16 +4303,6 @@ export function GenerateView({
   ): Promise<ProjectLine | null> => {
     const fresh =
       projectRef.current?.lines.find((l) => l.id === line.id) ?? line;
-    const current = normalizeLineVariants(fresh);
-    const merged = [...current, ...added];
-    const dropped =
-      merged.length > MAX_LINE_VARIANTS
-        ? merged.slice(0, merged.length - MAX_LINE_VARIANTS)
-        : [];
-    const kept =
-      merged.length > MAX_LINE_VARIANTS
-        ? merged.slice(-MAX_LINE_VARIANTS)
-        : merged;
     const speakerKey = speakerConditionKey(
       speakersRef.current,
       fresh.speakerEmbedPath,
@@ -3928,8 +4312,26 @@ export function GenerateView({
       fresh,
       speakersRef.current,
     );
-    const s =
-      fresh.id === selectedIdRef.current ? panelSampling : fresh.sampling;
+    const s = samplingForLine(fresh);
+    const snap = generationSnap(
+      lineSynthText(fresh),
+      speakerKey,
+      captionUsed,
+      cfgCaptionUsed,
+      s,
+    );
+    const current = normalizeLineVariants(fresh).map((v) =>
+      inheritLineGeneration(fresh, v),
+    );
+    const merged = [...current, ...added.map((v) => stampVariantGeneration(v, snap))];
+    const dropped =
+      merged.length > MAX_LINE_VARIANTS
+        ? merged.slice(0, merged.length - MAX_LINE_VARIANTS)
+        : [];
+    const kept =
+      merged.length > MAX_LINE_VARIANTS
+        ? merged.slice(-MAX_LINE_VARIANTS)
+        : merged;
     for (const v of dropped) {
       try {
         await invoke("delete_file", { path: v.wavPath });
@@ -3943,12 +4345,13 @@ export function GenerateView({
         if (l.id !== fresh.id) return l;
         return syncLineWavPath({
           ...l,
+          sampling: { ...s },
           variants: kept,
-          generatedText: lineSynthText(l),
-          generatedSpeakerEmbedPath: speakerKey,
-          generatedCaption: captionUsed,
-          generatedCfgScaleCaption: cfgCaptionUsed,
-          generatedSampling: generatedSamplingSnapshot(s),
+          generatedText: snap.generatedText,
+          generatedSpeakerEmbedPath: snap.generatedSpeakerEmbedPath,
+          generatedCaption: snap.generatedCaption,
+          generatedCfgScaleCaption: snap.generatedCfgScaleCaption,
+          generatedSampling: snap.generatedSampling,
         });
       }),
     }));
@@ -3958,30 +4361,6 @@ export function GenerateView({
       syncLineWavPath({ ...fresh, variants: kept })
     );
   };
-
-  const synthesizeLine = async (
-    line: ProjectLine,
-    opts: { force?: boolean } = {},
-  ): Promise<{ wav: string; line: ProjectLine; variantId: string } | null> => {
-    const fresh =
-      projectRef.current?.lines.find((l) => l.id === line.id) ?? line;
-    const variants = normalizeLineVariants(fresh);
-    const variantId = variants[0]?.id ?? fresh.id;
-    const useLegacyPath = variants.length === 0;
-    const result = await synthesizeVariant(line, variantId, {
-      force: opts.force,
-      useLegacyPath,
-    });
-    if (!result) return null;
-    return {
-      wav: result.wav,
-      line: result.line,
-      variantId: result.variantId,
-    };
-  };
-
-  const samplingForLine = (line: ProjectLine): SamplingParams =>
-    line.id === selectedIdRef.current ? panelSampling : line.sampling;
 
   const candidateCountForLine = (line: ProjectLine): number =>
     clampCandidateCount(samplingForLine(line).numCandidates);
@@ -4112,7 +4491,18 @@ export function GenerateView({
           }
           break;
         }
-        newVariants.push({ id: ids[i], seed: usedSeed, wavPath });
+        newVariants.push({
+          id: ids[i],
+          seed: usedSeed,
+          wavPath,
+          ...generationSnap(
+            synthText,
+            speakerKey,
+            captionUsed,
+            cfgCaptionUsed,
+            s,
+          ),
+        });
       }
       if (newVariants.length === 0) return null;
 
@@ -4245,6 +4635,16 @@ export function GenerateView({
           id: variantId,
           seed: result.seed,
           wavPath: result.wav,
+          ...generationSnap(
+            lineSynthText(fresh),
+            speakerConditionKey(
+              speakersRef.current,
+              fresh.speakerEmbedPath,
+            ),
+            effectiveLineCaption(fresh, speakersRef.current),
+            effectiveCfgScaleCaption(fresh, speakersRef.current),
+            samplingForLine(fresh),
+          ),
         };
         const updated = await appendVariants(fresh, [variant]);
         if (!updated) {
@@ -4297,10 +4697,10 @@ export function GenerateView({
   ): Promise<{ line: ProjectLine; newVariants: LineVariant[] } | null> => {
     const fresh =
       projectRef.current?.lines.find((l) => l.id === line.id) ?? line;
-    const n = candidateCountForLine(fresh);
+    const sampling = samplingForLine(fresh);
+    const n = clampCandidateCount(sampling.numCandidates);
     cancelBatchPlayback({ stopAudio: true });
-    onSelectedId(fresh.id);
-    syncPanelFromLine(fresh);
+    adoptSamplingForGenerate(fresh, sampling);
 
     const gen = batchPlayGenRef.current;
     playGenRef.current += 1;
@@ -4373,83 +4773,6 @@ export function GenerateView({
     run();
   };
 
-  const resolveWavForPlay = async (
-    line: ProjectLine,
-    variantId?: string | null,
-  ): Promise<{ wav: string; line: ProjectLine; variantId: string } | null> => {
-    commitDrafts();
-    const fresh =
-      projectRef.current?.lines.find((l) => l.id === line.id) ?? line;
-    const variants = normalizeLineVariants(fresh);
-    const target =
-      variants.find((v) => v.id === variantId) ?? primaryVariant(fresh);
-    if (target && !isDirty(fresh, speakersRef.current)) {
-      const ok = await invoke<boolean>("file_exists", { path: target.wavPath });
-      if (ok && wavPathMatchesLine(fresh, target.wavPath)) {
-        return { wav: target.wavPath, line: fresh, variantId: target.id };
-      }
-    }
-
-    const speakerKey = speakerConditionKey(
-      speakersRef.current,
-      fresh.speakerEmbedPath,
-    );
-    const captionUsed = effectiveLineCaption(fresh, speakersRef.current);
-    const cfgCaptionUsed = effectiveCfgScaleCaption(
-      fresh,
-      speakersRef.current,
-    );
-    const contentKey = lineContentKey(
-      lineSynthText(fresh),
-      speakerKey,
-      captionUsed,
-      cfgCaptionUsed,
-      fresh.sampling,
-    );
-    const mem = readyCacheRef.current.get(fresh.id);
-    const primary = primaryVariant(fresh);
-    if (
-      mem &&
-      mem.key === contentKey &&
-      primary &&
-      (!variantId || variantId === primary.id)
-    ) {
-      const ok = await invoke<boolean>("file_exists", { path: mem.wavPath });
-      if (ok) {
-        return {
-          wav: mem.wavPath,
-          line: fresh,
-          variantId: primary.id,
-        };
-      }
-    }
-
-    if (
-      !isDirty(fresh, speakersRef.current) &&
-      primary &&
-      wavPathMatchesLine(fresh, primary.wavPath)
-    ) {
-      const ok = await invoke<boolean>("file_exists", {
-        path: primary.wavPath,
-      });
-      if (ok) {
-        readyCacheRef.current.set(fresh.id, {
-          key: contentKey,
-          wavPath: primary.wavPath,
-        });
-        return { wav: primary.wavPath, line: fresh, variantId: primary.id };
-      }
-    }
-
-    const result = await synthesizeLine(fresh, { force: false });
-    if (!result) return null;
-    return {
-      wav: result.wav,
-      line: result.line,
-      variantId: result.variantId,
-    };
-  };
-
   const startPlayback = async (
     line: ProjectLine,
     wavPath: string,
@@ -4464,6 +4787,7 @@ export function GenerateView({
       const playPath = await invoke<string>("prepare_playback_wav", {
         src: wavPath,
         speed: line.speed,
+        denoise: audioFxOf(line).denoise,
       });
       if (gen !== playGenRef.current) return;
       const exists = await invoke<boolean>("file_exists", { path: playPath });
@@ -4475,6 +4799,7 @@ export function GenerateView({
         path: playPath,
       });
       if (gen !== playGenRef.current) return;
+      player.setAudioFx(audioFxOf(line));
       await player.loadFromBytes(
         line.id,
         variantId,
@@ -4577,22 +4902,31 @@ export function GenerateView({
       return;
     }
 
-    cancelBatchPlayback();
+    const keepSequential =
+      batchPlayActiveRef.current && player.activeLineId === line.id;
+    cancelBatchPlayback({ keepActive: keepSequential });
+    const sequentialGen = keepSequential ? batchPlayGenRef.current : null;
 
     const variant = normalizeLineVariants(line).find((v) => v.id === variantId);
     if (!variant) return;
 
-    if (
-      !isDirty(line, speakers) &&
-      (await invoke<boolean>("file_exists", { path: variant.wavPath }))
-    ) {
-      await startPlayback(line, variant.wavPath, variantId);
+    const exists = await invoke<boolean>("file_exists", {
+      path: variant.wavPath,
+    });
+    if (!exists) {
+      setStatus(`再生失敗: ファイルがありません (${variant.wavPath})`);
       return;
     }
+    await startPlayback(line, variant.wavPath, variantId);
 
-    const resolved = await resolveWavForPlay(line, variantId);
-    if (!resolved) return;
-    await startPlayback(resolved.line, resolved.wav, resolved.variantId);
+    if (sequentialGen != null) {
+      void player.waitUntilInactive().then(() => {
+        if (sequentialGen !== batchPlayGenRef.current) return;
+        if (!batchPlayActiveRef.current) return;
+        batchPlayActiveRef.current = false;
+        setBatchPlayActive(false);
+      });
+    }
   };
 
   const pruneVariantKeep = (lineId: string, keepIds: string[]) => {
@@ -4693,7 +5027,8 @@ export function GenerateView({
       batchPlayActiveRef.current &&
       !player.isActiveVariant(line.id, variant.id)
     ) {
-      cancelBatchPlayback();
+      const keepSequential = player.activeLineId === line.id;
+      cancelBatchPlayback({ keepActive: keepSequential });
     }
     try {
       const exists = await invoke<boolean>("file_exists", {
@@ -4809,6 +5144,8 @@ export function GenerateView({
 
         let ok = 0;
         let fail = 0;
+        const panelOwnerId = selectedIdRef.current;
+        const panelSnap = { ...panelSamplingRef.current };
         for (let i = 0; i < targets.length; i++) {
           if (gen !== batchPlayGenRef.current) break;
           const line =
@@ -4817,10 +5154,11 @@ export function GenerateView({
           if (!line.text.trim()) continue;
           if (!isDirty(line, speakers)) continue;
 
-          onSelectedId(line.id);
-          syncPanelFromLine(line);
+          const sampling =
+            line.id === panelOwnerId ? panelSnap : line.sampling;
+          adoptSamplingForGenerate(line, sampling);
           setStatus(`一括生成中… ${i + 1}/${targets.length}`);
-          const individual = generateModeForLine(line) === "individual";
+          const individual = multiGenerateModeOf(sampling) === "individual";
           const result = await synthesizeLineAudio(
             line,
             "overwrite",
@@ -5012,6 +5350,7 @@ export function GenerateView({
       dest,
       volume: line.volume,
       speed: line.speed,
+      audioFx: audioFxOf(line),
       format,
       bitrateKbps: exportBitrateKbps(format, settings),
     });
@@ -5166,6 +5505,7 @@ export function GenerateView({
             src: r.wavs[0],
             volume: r.line.volume,
             speed: r.line.speed,
+            audioFx: audioFxOf(r.line),
           })),
           silenceSecs,
           dest,
@@ -5495,6 +5835,10 @@ export function GenerateView({
                   lineVariants.length > 0 &&
                   !!line.wavPath &&
                   wavPathMatchesLine(line);
+                const lineIsDirty = isDirty(line, speakers);
+                const dirtyGroups = lineIsDirty
+                  ? lineDirtyGroups(line, speakers)
+                  : [];
                 const showLineSeek =
                   hasKeptAudio &&
                   (batchPlayActive
@@ -5546,11 +5890,12 @@ export function GenerateView({
                       <span className="line-idx" title="ドラッグで範囲選択">
                         {i + 1}
                       </span>
-                      <BoundedSelect
+                      <SpeakerSelect
                         className="speaker-select"
+                        speakers={speakers}
                         value={line.speakerEmbedPath}
                         displayLabel={lineSpeakerDisplayLabel(line, speakers)}
-                        options={speakerOptions}
+                        emptyLabel="話者を選択…"
                         placeholder="話者を選択…"
                         searchable
                         searchPlaceholder="話者を検索…"
@@ -5596,12 +5941,15 @@ export function GenerateView({
                         ))}
                       {line.wavPath &&
                         wavPathMatchesLine(line) &&
-                        !isDirty(line, speakers) && (
+                        !lineIsDirty && (
                         <span className="badge">WAV</span>
                       )}
                       {line.wavPath &&
-                        (!wavPathMatchesLine(line) || isDirty(line, speakers)) && (
-                        <span className="badge dirty">要再生成</span>
+                        (!wavPathMatchesLine(line) || lineIsDirty) && (
+                        <span className="badge dirty asr-badge">
+                          要再生成
+                          <DirtyDiffTooltip groups={dirtyGroups} />
+                        </span>
                       )}
                       {asrByLine[line.id] && (
                         <AsrBadge result={asrByLine[line.id]} />
@@ -5731,6 +6079,7 @@ export function GenerateView({
                     {showLineSeek ? (
                       <div
                         className="variant-seek-stack"
+                        onPointerDown={(e) => e.stopPropagation()}
                         onClick={(e) => e.stopPropagation()}
                       >
                         {lineVariants.map((variant, vi) => {
@@ -5761,11 +6110,19 @@ export function GenerateView({
                           const isKept =
                             showKeepCheck &&
                             keptVariantIds.includes(variant.id);
+                          const variantDiffs = variantDirtyDiffs(
+                            line,
+                            variant,
+                            speakers,
+                          );
+                          const variantStale = variantDiffs.length > 0;
                           return (
                             <div
                               className={`variant-seek-row${
                                 showKeepCheck ? " multi" : ""
-                              }${isKept ? " is-kept" : ""}`}
+                              }${isKept ? " is-kept" : ""}${
+                                variantStale ? " is-stale" : ""
+                              }`}
                               key={variant.id}
                             >
                               {showKeepCheck ? (
@@ -5796,67 +6153,76 @@ export function GenerateView({
                               >
                                 {isPlayingVariant ? "❚❚" : "▶"}
                               </button>
-                              <input
-                                type="range"
-                                min={0}
-                                max={duration || 0}
-                                step={0.01}
-                                value={Math.min(currentTime, duration || 0)}
-                                disabled={duration <= 0}
-                                onPointerDown={() => {
-                                  userSeekingKeyRef.current = `${line.id}:${variant.id}`;
-                                }}
-                                onChange={(e) => {
-                                  const time = Number(e.target.value);
-                                  setSeekDraft({
-                                    lineId: line.id,
-                                    variantId: variant.id,
-                                    time,
-                                  });
-                                  if (
-                                    userSeekingKeyRef.current !==
-                                    `${line.id}:${variant.id}`
-                                  ) {
-                                    return;
-                                  }
-                                  void seekVariant(line, variant, time);
-                                }}
-                                onPointerUp={() => {
-                                  if (
-                                    userSeekingKeyRef.current ===
-                                    `${line.id}:${variant.id}`
-                                  ) {
-                                    userSeekingKeyRef.current = null;
-                                  }
-                                  window.setTimeout(() => {
-                                    setSeekDraft((d) => {
-                                      if (
-                                        !d ||
-                                        d.lineId !== line.id ||
-                                        d.variantId !== variant.id
-                                      ) {
-                                        return d;
-                                      }
-                                      const p = playerRef.current;
-                                      if (
-                                        p?.isActiveVariant(
-                                          d.lineId,
-                                          d.variantId,
-                                        ) &&
-                                        p.hasBuffer
-                                      ) {
-                                        return null;
-                                      }
-                                      return d;
+                              <div
+                                className={`variant-seek-track${
+                                  variantStale ? " is-stale-track asr-badge" : ""
+                                }`}
+                              >
+                                <input
+                                  type="range"
+                                  min={0}
+                                  max={duration || 0}
+                                  step={0.01}
+                                  value={Math.min(currentTime, duration || 0)}
+                                  disabled={duration <= 0}
+                                  onPointerDown={() => {
+                                    userSeekingKeyRef.current = `${line.id}:${variant.id}`;
+                                  }}
+                                  onChange={(e) => {
+                                    const time = Number(e.target.value);
+                                    setSeekDraft({
+                                      lineId: line.id,
+                                      variantId: variant.id,
+                                      time,
                                     });
-                                  }, 0);
-                                }}
-                              />
-                              <span className="seek-time">
-                                {duration > 0
-                                  ? `${currentTime.toFixed(1)} / ${duration.toFixed(1)}s`
-                                  : `seed ${variant.seed}`}
-                              </span>
+                                    if (
+                                      userSeekingKeyRef.current !==
+                                      `${line.id}:${variant.id}`
+                                    ) {
+                                      return;
+                                    }
+                                    void seekVariant(line, variant, time);
+                                  }}
+                                  onPointerUp={() => {
+                                    if (
+                                      userSeekingKeyRef.current ===
+                                      `${line.id}:${variant.id}`
+                                    ) {
+                                      userSeekingKeyRef.current = null;
+                                    }
+                                    window.setTimeout(() => {
+                                      setSeekDraft((d) => {
+                                        if (
+                                          !d ||
+                                          d.lineId !== line.id ||
+                                          d.variantId !== variant.id
+                                        ) {
+                                          return d;
+                                        }
+                                        const p = playerRef.current;
+                                        if (
+                                          p?.isActiveVariant(
+                                            d.lineId,
+                                            d.variantId,
+                                          ) &&
+                                          p.hasBuffer
+                                        ) {
+                                          return null;
+                                        }
+                                        return d;
+                                      });
+                                    }, 0);
+                                  }}
+                                />
+                                <span className="seek-time">
+                                  {duration > 0
+                                    ? `${currentTime.toFixed(1)} / ${duration.toFixed(1)}s`
+                                    : `seed ${variant.seed}`}
+                                </span>
+                                {variantStale ? (
+                                  <DirtyDiffTooltip diffs={variantDiffs} />
+                                ) : null}
+                              </div>
                               <button
                                 type="button"
                                 className="line-btn danger variant-delete-btn"
@@ -5917,6 +6283,7 @@ export function GenerateView({
         <AudioAdjustmentPanel
           volume={selected?.volume ?? 1}
           speed={selected?.speed ?? 1}
+          audioFx={selected ? audioFxOf(selected) : undefined}
           disabled={!selected}
           collapsed={audioCollapsed}
           onToggle={() => setAudioCollapsed((v) => !v)}

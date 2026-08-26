@@ -59,6 +59,9 @@ pub struct TrainResumeInfo {
     pub vocal_model: String,
     #[serde(default = "default_review_mode")]
     pub review_mode: String,
+    /// Raw-mode slicer: "silence" (pydub) or "silero" (Silero VAD).
+    #[serde(default = "default_slice_method")]
+    pub slice_method: String,
     /// Waiting for user to finish SliceReviewView.
     #[serde(default)]
     pub paused_for_review: bool,
@@ -74,6 +77,19 @@ fn default_vocal_model() -> String {
 
 fn default_review_mode() -> String {
     "manual".into()
+}
+
+fn default_slice_method() -> String {
+    "silence".into()
+}
+
+fn normalize_slice_method(v: &str) -> String {
+    let t = v.trim().to_ascii_lowercase();
+    if t == "silero" || t == "vad" || t == "silero-vad" || t == "silero_vad" {
+        "silero".into()
+    } else {
+        "silence".into()
+    }
 }
 
 pub struct TrainState {
@@ -138,6 +154,43 @@ pub fn clear_resume_info(train_state: &TrainState) {
     *train_state.resume.lock() = None;
 }
 
+fn extract_review_ready(line: &str) -> Option<String> {
+    const MARKER: &str = "REVIEW_READY=";
+    let trimmed = line.trim();
+    let rest = if let Some(r) = trimmed.strip_prefix(MARKER) {
+        r
+    } else if let Some(idx) = trimmed.find(MARKER) {
+        &trimmed[idx + MARKER.len()..]
+    } else {
+        return None;
+    };
+    let jd = rest.trim();
+    if jd.is_empty() {
+        None
+    } else {
+        Some(jd.to_string())
+    }
+}
+
+fn pending_manual_review_dir(job_dir: &str, review_mode: &str) -> Option<String> {
+    if crate::settings::normalize_slice_review_mode(review_mode) != "manual" {
+        return None;
+    }
+    let root = PathBuf::from(job_dir.trim());
+    if !root.is_dir() {
+        return None;
+    }
+    if root.join(".done_review").is_file() {
+        return None;
+    }
+    let review = root.join("slice_review");
+    if review.join("metrics.json").is_file() || review.join("ready.json").is_file() {
+        Some(root.to_string_lossy().into_owned())
+    } else {
+        None
+    }
+}
+
 fn parse_step_line(line: &str) -> Option<(u32, u32, String)> {
     let rest = line.strip_prefix("STEP ")?;
     let (nums, name) = rest.split_once(' ')?;
@@ -183,6 +236,7 @@ pub fn start_train_job(
     vocal_model: Option<String>,
     job_dir: Option<String>,
     review_mode: Option<String>,
+    slice_method: Option<String>,
     train_state: Arc<TrainState>,
 ) -> Result<(), String> {
     if train_state.running.swap(true, Ordering::SeqCst) {
@@ -227,6 +281,11 @@ pub fn start_train_job(
             .as_deref()
             .unwrap_or(settings.slice_review.mode.as_str()),
     );
+    let slice_method = if mode == "sliced" {
+        "silence".to_string()
+    } else {
+        normalize_slice_method(slice_method.as_deref().unwrap_or("silence"))
+    };
 
     // Seed resume info (job_dir filled when JOB_DIR= is printed, or from arg).
     {
@@ -240,6 +299,7 @@ pub fn start_train_job(
             vocal_separate,
             vocal_model: vocal_model.clone(),
             review_mode: review_mode.clone(),
+            slice_method: slice_method.clone(),
             paused_for_review: false,
         });
     }
@@ -269,8 +329,11 @@ pub fn start_train_job(
             if vocal_separate {
                 crate::python_env::ensure_audio_separator(&python)?;
             }
-            // Slice review metrics deps (best-effort; skip mode may not need them).
-            if review_mode != "skip" {
+            if mode == "raw" && slice_method == "silero" {
+                crate::python_env::ensure_silero_vad(&python)?;
+            }
+            // Slice review / Auto Fix deps (best-effort).
+            if review_mode != "skip" || settings.slice_review.auto_fix.enabled {
                 crate::python_env::ensure_packages_best_effort(
                     &python,
                     "import numpy, scipy, librosa, soundfile, pyloudnorm",
@@ -304,6 +367,7 @@ pub fn start_train_job(
                 let review = &settings.slice_review;
                 let aspects = &review.aspects;
                 let th = &review.thresholds;
+                let af = &review.auto_fix;
                 let cfg = serde_json::json!({
                     "aspects": {
                         "A": aspects.a, "B": aspects.b, "C": aspects.c, "D": aspects.d,
@@ -320,6 +384,12 @@ pub fn start_train_job(
                     "auto": {
                         "removePercent": review.auto_remove_percent.clamp(0.0, 90.0),
                         "keepMax": review.auto_keep_max,
+                    },
+                    "autoFix": {
+                        "enabled": af.enabled,
+                        "reverb": af.reverb,
+                        "muffle": af.muffle,
+                        "enhance": af.enhance,
                     }
                 });
                 std::fs::write(&p, cfg.to_string()).map_err(|e| e.to_string())?;
@@ -361,6 +431,8 @@ pub fn start_train_job(
                 .arg(review_model_cache.display().to_string())
                 .arg("--asr-model-dir")
                 .arg(asr_dir.display().to_string())
+                .arg("--slice-method")
+                .arg(&slice_method)
                 .current_dir(&irodori_root)
                 .env("IRODORI_ROOT", &irodori_root)
                 .env("PYTHONPATH", &irodori_root)
@@ -399,10 +471,13 @@ pub fn start_train_job(
 
             let app_out = app.clone();
             let resume_state = train_state.clone();
+            let review_job_shared: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            let review_out = review_job_shared.clone();
+            let review_err = review_job_shared.clone();
+            let resume_err = train_state.clone();
             let out_handle = std::thread::spawn(move || {
                 let reader = BufReader::new(stdout);
                 let mut embed: Option<String> = None;
-                let mut review_job: Option<String> = None;
                 let mut current_step = TrainProgressEvent {
                     step: 0,
                     total: 5,
@@ -414,10 +489,10 @@ pub fn start_train_job(
                     if let Some(rest) = line.strip_prefix("EMBED_OK=") {
                         embed = Some(rest.to_string());
                     }
-                    if let Some(rest) = line.strip_prefix("REVIEW_READY=") {
-                        review_job = Some(rest.to_string());
+                    if let Some(jd) = extract_review_ready(&line) {
+                        *review_out.lock() = Some(jd.clone());
                         if let Some(info) = resume_state.resume.lock().as_mut() {
-                            info.job_dir = rest.to_string();
+                            info.job_dir = jd;
                             info.paused_for_review = true;
                         }
                     }
@@ -457,13 +532,20 @@ pub fn start_train_job(
                     }
                     let _ = app_out.emit("train-log", TrainLogEvent { line });
                 }
-                (embed, review_job)
+                embed
             });
 
             let app_err = app.clone();
             let err_handle = std::thread::spawn(move || {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines().flatten() {
+                    if let Some(jd) = extract_review_ready(&line) {
+                        *review_err.lock() = Some(jd.clone());
+                        if let Some(info) = resume_err.resume.lock().as_mut() {
+                            info.job_dir = jd;
+                            info.paused_for_review = true;
+                        }
+                    }
                     let _ = app_err.emit(
                         "train-log",
                         TrainLogEvent {
@@ -475,8 +557,21 @@ pub fn start_train_job(
 
             let status = child.wait().map_err(|e| e.to_string())?;
             *train_state.child_pid.lock() = None;
-            let (embed, review_job) = out_handle.join().ok().unwrap_or((None, None));
+            let embed = out_handle.join().ok().flatten();
             let _ = err_handle.join();
+            let mut review_job = review_job_shared.lock().clone();
+            if review_job.is_none() {
+                let snapshot = train_state.resume.lock().clone();
+                if let Some(info) = snapshot {
+                    if let Some(jd) = pending_manual_review_dir(&info.job_dir, &review_mode) {
+                        if let Some(cur) = train_state.resume.lock().as_mut() {
+                            cur.job_dir = jd.clone();
+                            cur.paused_for_review = true;
+                        }
+                        review_job = Some(jd);
+                    }
+                }
+            }
 
             let cancelled = train_state.cancel_requested.load(Ordering::SeqCst);
             if cancelled {
@@ -487,6 +582,12 @@ pub fn start_train_job(
             }
             if !status.success() {
                 return Err(format!("pipeline exited with {status}"));
+            }
+            if embed.is_none() {
+                return Err(
+                    "学習パイプラインは終了しましたが speaker embed がありません（スライスレビュー未完了の可能性があります）"
+                        .into(),
+                );
             }
             Ok((embed, false, None))
         })();
@@ -566,12 +667,30 @@ pub fn run_blend(
     weight_c: f64,
     output_name: &str,
 ) -> Result<String, String> {
-    let python_dir = studio_python_dir()?;
-    let script = python_dir.join("blend_embeddings.py");
     let out_dir = std::path::Path::new(settings.outputs_root()).join("_blends");
     std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
     let safe = crate::project::sanitize_name(output_name);
     let out_path = out_dir.join(format!("{safe}.speaker.safetensors"));
+    run_blend_to(
+        settings, embed_a, embed_b, embed_c, weight_a, weight_b, weight_c, &out_path,
+    )
+}
+
+pub fn run_blend_to(
+    settings: &AppSettings,
+    embed_a: &str,
+    embed_b: &str,
+    embed_c: Option<&str>,
+    weight_a: f64,
+    weight_b: f64,
+    weight_c: f64,
+    out_path: &std::path::Path,
+) -> Result<String, String> {
+    let python_dir = studio_python_dir()?;
+    let script = python_dir.join("blend_embeddings.py");
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
 
     let python = resolve_python_exe(settings).ok_or_else(|| {
         format!("Python が見つかりません: {}", settings.python_exe())
@@ -591,7 +710,7 @@ pub fn run_blend(
         .arg("--weight-c")
         .arg(weight_c.to_string())
         .arg("--output")
-        .arg(&out_path);
+        .arg(out_path);
     if let Some(c) = embed_c.filter(|s| !s.is_empty()) {
         cmd.arg("--embed-c").arg(c);
     }
@@ -694,6 +813,215 @@ pub fn load_slice_review_log(job_dir: &str) -> Result<serde_json::Value, String>
     serde_json::from_str(&text).map_err(|e| e.to_string())
 }
 
+pub fn load_slice_autofix_log(job_dir: &str) -> Result<serde_json::Value, String> {
+    let path = slice_review_dir(job_dir)?.join("autofix_log.json");
+    if !path.is_file() {
+        return Ok(serde_json::json!({}));
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+fn dir_has_wav(dir: &PathBuf) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    rd.flatten().any(|e| {
+        e.path()
+            .extension()
+            .and_then(|x| x.to_str())
+            .map(|x| x.eq_ignore_ascii_case("wav"))
+            .unwrap_or(false)
+    })
+}
+
+fn copy_wavs(src: &PathBuf, dest: &PathBuf) -> Result<u64, String> {
+    std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
+    let mut n = 0u64;
+    let rd = std::fs::read_dir(src).map_err(|e| e.to_string())?;
+    for ent in rd.flatten() {
+        let p = ent.path();
+        let is_wav = p
+            .extension()
+            .and_then(|x| x.to_str())
+            .map(|x| x.eq_ignore_ascii_case("wav"))
+            .unwrap_or(false);
+        if !is_wav {
+            continue;
+        }
+        let Some(name) = p.file_name() else { continue };
+        std::fs::copy(&p, dest.join(name)).map_err(|e| e.to_string())?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+fn materialize_job_sliced(job_dir: &PathBuf) -> Result<PathBuf, String> {
+    let dest = job_dir.join("sliced");
+    if dest.is_dir() && dir_has_wav(&dest) {
+        return Ok(dest);
+    }
+    let metrics = job_dir.join("slice_review").join("metrics.json");
+    if metrics.is_file() {
+        if let Ok(text) = std::fs::read_to_string(&metrics) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(path) = val
+                    .get("slices")
+                    .and_then(|s| s.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|r| r.get("path"))
+                    .and_then(|p| p.as_str())
+                {
+                    if let Some(parent) = PathBuf::from(path).parent() {
+                        if parent.is_dir() && dir_has_wav(&parent.to_path_buf()) {
+                            let n = copy_wavs(&parent.to_path_buf(), &dest)?;
+                            if n > 0 {
+                                return Ok(dest);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Err("sliced wavs not found (job/sliced が空です)".into())
+}
+
+fn write_review_cfg(settings: &AppSettings) -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join("irodori-studio");
+    let _ = std::fs::create_dir_all(&dir);
+    let p = dir.join(format!("slice_review_cfg_{}.json", std::process::id()));
+    let review = &settings.slice_review;
+    let aspects = &review.aspects;
+    let th = &review.thresholds;
+    let af = &review.auto_fix;
+    let cfg = serde_json::json!({
+        "aspects": {
+            "A": aspects.a, "B": aspects.b, "C": aspects.c, "D": aspects.d,
+            "E": aspects.e, "F": aspects.f, "G": aspects.g, "H": aspects.h,
+            "I": aspects.i, "J": aspects.j,
+        },
+        "thresholds": {
+            "outlierZ": th.outlier_z,
+            "durationZ": th.duration_z,
+            "durationIqrMult": th.duration_iqr_mult,
+            "speedZ": th.speed_z,
+            "centroidZ": th.centroid_z,
+        },
+        "auto": {
+            "removePercent": review.auto_remove_percent.clamp(0.0, 90.0),
+            "keepMax": review.auto_keep_max,
+        },
+        "autoFix": {
+            "enabled": true,
+            "reverb": af.reverb,
+            "muffle": af.muffle,
+            "enhance": af.enhance,
+        }
+    });
+    std::fs::write(&p, cfg.to_string()).map_err(|e| e.to_string())?;
+    Ok(p)
+}
+
+fn run_python_script(
+    python: &PathBuf,
+    script: &PathBuf,
+    args: &[&str],
+    cwd: &str,
+) -> Result<(), String> {
+    let mut cmd = Command::new(python);
+    cmd.arg("-u").arg(script);
+    for a in args {
+        cmd.arg(a);
+    }
+    cmd.current_dir(cwd)
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONUNBUFFERED", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::python_env::hide_console(&mut cmd);
+    let output = cmd
+        .output()
+        .map_err(|e| format!("{} 起動失敗: {e}", script.display()))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        let out = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "{} が失敗しました: {err} {out}",
+            script
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("python")
+        ));
+    }
+    Ok(())
+}
+
+/// Apply Auto Fix from SliceReviewView, then recompute metrics.
+pub fn run_slice_autofix(
+    job_dir: &str,
+    settings: &AppSettings,
+) -> Result<serde_json::Value, String> {
+    let root = PathBuf::from(job_dir.trim());
+    if !root.is_dir() {
+        return Err(format!("job dir not found: {}", root.display()));
+    }
+    let python = resolve_python_exe(settings).ok_or_else(|| {
+        format!("Python が見つかりません: {}", settings.python_exe())
+    })?;
+    crate::python_env::ensure_packages_best_effort(
+        &python,
+        "import numpy, scipy, soundfile",
+        &["numpy", "scipy", "soundfile"],
+    );
+    let py_dir = crate::settings::studio_python_dir()?;
+    let sliced = materialize_job_sliced(&root)?;
+    let backup = root.join("sliced_pre_autofix");
+    let review_dir = root.join("slice_review");
+    std::fs::create_dir_all(&review_dir).map_err(|e| e.to_string())?;
+    let log_path = review_dir.join("autofix_log.json");
+    let cfg = write_review_cfg(settings)?;
+    let autofix_py = py_dir.join("preprocess_autofix.py");
+    let sliced_s = sliced.display().to_string();
+    let backup_s = backup.display().to_string();
+    let log_s = log_path.display().to_string();
+    let cfg_s = cfg.display().to_string();
+    run_python_script(
+        &python,
+        &autofix_py,
+        &[
+            "--sliced-dir",
+            &sliced_s,
+            "--backup-dir",
+            &backup_s,
+            "--out-log",
+            &log_s,
+            "--config-json",
+            &cfg_s,
+        ],
+        settings.irodori_root(),
+    )?;
+    let metrics_py = py_dir.join("slice_review_metrics.py");
+    let review_s = review_dir.display().to_string();
+    run_python_script(
+        &python,
+        &metrics_py,
+        &[
+            "--sliced-dir",
+            &sliced_s,
+            "--out-dir",
+            &review_s,
+            "--config-json",
+            &cfg_s,
+            "--force",
+        ],
+        settings.irodori_root(),
+    )?;
+    let _ = std::fs::write(root.join(".done_autofix"), b"");
+    load_slice_autofix_log(job_dir)
+}
+
 pub fn save_slice_review_exclusions(
     job_dir: &str,
     exclusions: serde_json::Value,
@@ -738,17 +1066,90 @@ pub fn save_slice_review_exclusions(
     Ok(())
 }
 
+/// Restore pre-Auto-Fix backups for slices the user turned Auto Fix OFF.
+fn apply_autofix_reverts(root: &PathBuf) -> Result<u64, String> {
+    let review = root.join("slice_review");
+    let excl_path = review.join("exclusions.json");
+    let log_path = review.join("autofix_log.json");
+    if !excl_path.is_file() || !log_path.is_file() {
+        return Ok(0);
+    }
+    let exclusions: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&excl_path).map_err(|e| e.to_string())?,
+    )
+    .unwrap_or(serde_json::json!({}));
+    let log: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&log_path).map_err(|e| e.to_string())?,
+    )
+    .unwrap_or(serde_json::json!({}));
+    let backup_dir = log
+        .get("backupDir")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| root.join("sliced_pre_autofix"));
+    let sliced_dir = log
+        .get("slicedDir")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| root.join("sliced"));
+    let files = log.get("files").and_then(|v| v.as_object());
+    let Some(excl_obj) = exclusions.as_object() else {
+        return Ok(0);
+    };
+    let mut reverted: Vec<String> = Vec::new();
+    for (name, meta) in excl_obj {
+        let off = meta
+            .get("autoFixOff")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !off {
+            continue;
+        }
+        let changed = files
+            .and_then(|m| m.get(name))
+            .and_then(|f| f.get("changed"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !changed {
+            continue;
+        }
+        let src = backup_dir.join(name);
+        let dest = sliced_dir.join(name);
+        if !src.is_file() {
+            continue;
+        }
+        std::fs::copy(&src, &dest).map_err(|e| {
+            format!("Auto Fix 処理前の復元に失敗: {} ({e})", src.display())
+        })?;
+        reverted.push(name.clone());
+    }
+    let n = reverted.len() as u64;
+    let _ = std::fs::write(
+        review.join("autofix_reverts.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "count": n,
+            "files": reverted,
+        }))
+        .unwrap_or_default()
+            + "\n",
+    );
+    Ok(n)
+}
+
 /// Mark review done and invalidate dataset/manifest so they rebuild with exclusions.
-pub fn complete_slice_review(job_dir: &str) -> Result<(), String> {
+pub fn complete_slice_review(job_dir: &str) -> Result<u64, String> {
     let root = PathBuf::from(job_dir.trim());
     if !root.is_dir() {
         return Err(format!("job dir not found: {}", root.display()));
     }
+    let reverted = apply_autofix_reverts(&root)?;
     let review_dir = root.join("slice_review");
     std::fs::create_dir_all(&review_dir).map_err(|e| e.to_string())?;
     std::fs::write(root.join(".done_review"), b"").map_err(|e| e.to_string())?;
     // Force dataset + latent rebuild with updated exclusions.
     let _ = std::fs::remove_file(root.join(".done_dataset"));
     let _ = std::fs::remove_file(root.join(".done_prepare_manifest"));
-    Ok(())
+    Ok(reverted)
 }

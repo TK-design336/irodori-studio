@@ -17,6 +17,7 @@ import type {
 import {
   activePaths,
   DEFAULT_SLICE_REVIEW,
+  DEFAULT_SLICE_AUTO_FIX,
   DEFAULT_VOCAL_SEPARATOR_MODEL,
   sliceReviewSettings,
 } from "../types";
@@ -1253,6 +1254,8 @@ function SliceReviewSettingsEditor({
         外れ値でフラグします。I はこもり（高域不足）に加え、妙に響く・残る音
         （共鳴・残響）も同じ観点で検知します。auto は観点ヒットに加え、
         総合スコア上位から指定％を切り、残件数上限まで落とします（0 は無効、上限 90%）。
+        Auto Fix はレビューの前に、体育館・トンネルのような残響やこもりを
+        非生成の信号処理（WPE / 後期残響抑制 / tilt EQ / 軽い NR）で整えます。
       </p>
       <div
         className={`train-review-block${value.mode === "auto" ? " is-review-auto" : ""}`}
@@ -1319,6 +1322,67 @@ function SliceReviewSettingsEditor({
             />
           </label>
         </div>
+      </div>
+      <div
+        className={`train-vocal-block${
+          value.autoFix?.enabled !== false ? " is-vocal-altered" : ""
+        }`}
+      >
+        <label className="train-announce-check">
+          <input
+            type="checkbox"
+            checked={value.autoFix?.enabled !== false}
+            onChange={(e) =>
+              onChange({
+                ...value,
+                autoFix: {
+                  enabled: e.target.checked,
+                  reverb: value.autoFix?.reverb !== false,
+                  muffle: value.autoFix?.muffle !== false,
+                  enhance: value.autoFix?.enhance !== false,
+                },
+              })
+            }
+          />
+          スライス後 Auto Fix（残響・こもり・低音質）
+          {value.autoFix?.enabled !== false ? " · 有効" : ""}
+        </label>
+        {value.autoFix?.enabled !== false && (
+          <>
+            <div className="slice-review-aspect-toggles">
+              {(
+                [
+                  ["reverb", "残響（WPE＋後期残響）"],
+                  ["muffle", "こもり（tilt / 箱鳴り EQ）"],
+                  ["enhance", "低音質（ハイパス / NR / デクリップ）"],
+                ] as const
+              ).map(([key, label]) => (
+                <label key={key} className="train-announce-check">
+                  <input
+                    type="checkbox"
+                    checked={value.autoFix?.[key] !== false}
+                    onChange={(e) =>
+                      onChange({
+                        ...value,
+                        autoFix: {
+                          enabled: value.autoFix?.enabled !== false,
+                          reverb: value.autoFix?.reverb !== false,
+                          muffle: value.autoFix?.muffle !== false,
+                          enhance: value.autoFix?.enhance !== false,
+                          [key]: e.target.checked,
+                        },
+                      })
+                    }
+                  />
+                  {label}
+                </label>
+              ))}
+            </div>
+            <p className="hint" style={{ margin: 0 }}>
+              バッチの中央値が体育館・ホール寄り（発話後の残響テールが長い）なら全スライスに残響処理をかけます。乾いたスタジオ録音はほぼ無処理です。ニューラル復元は使いません。
+            </p>
+          </>
+        )}
       </div>
       <div className="slice-review-aspect-toggles">
         {ASPECT_META.map(([id, label]) => (
@@ -1394,6 +1458,7 @@ function SliceReviewSettingsEditor({
             ...DEFAULT_SLICE_REVIEW,
             aspects: { ...DEFAULT_SLICE_REVIEW.aspects },
             thresholds: { ...DEFAULT_SLICE_REVIEW.thresholds },
+            autoFix: { ...DEFAULT_SLICE_AUTO_FIX },
           })
         }
       >

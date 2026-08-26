@@ -1,3 +1,7 @@
+import type { AudioFx } from "../types";
+import { defaultAudioFx } from "../types";
+import { applyAudioFxToNodes } from "./audioFx";
+
 /** Single-source audio playback with seek + live volume (speed via pre-stretched buffer). */
 
 export type PlaybackSnapshot = {
@@ -16,6 +20,13 @@ export class LineAudioPlayer {
   private ctx: AudioContext | null = null;
   private source: AudioBufferSourceNode | null = null;
   private gain: GainNode | null = null;
+  private highpass: BiquadFilterNode | null = null;
+  private lowshelf: BiquadFilterNode | null = null;
+  private presence: BiquadFilterNode | null = null;
+  private highshelf: BiquadFilterNode | null = null;
+  private deess: BiquadFilterNode | null = null;
+  private compressor: DynamicsCompressorNode | null = null;
+  private makeup: GainNode | null = null;
   private buffer: AudioBuffer | null = null;
   private lineId: string | null = null;
   private variantId: string | null = null;
@@ -23,6 +34,7 @@ export class LineAudioPlayer {
   private offset = 0;
   private playing = false;
   private volume = 1;
+  private audioFx: AudioFx = defaultAudioFx();
   private raf = 0;
   private endedWaiters: Array<() => void> = [];
   private silenceSource: AudioBufferSourceNode | null = null;
@@ -76,6 +88,95 @@ export class LineAudioPlayer {
   private ensureCtx() {
     if (!this.ctx) this.ctx = new AudioContext();
     return this.ctx;
+  }
+
+  private fxNodes() {
+    if (
+      !this.highpass ||
+      !this.lowshelf ||
+      !this.presence ||
+      !this.highshelf ||
+      !this.deess ||
+      !this.compressor ||
+      !this.makeup
+    ) {
+      return null;
+    }
+    return {
+      highpass: this.highpass,
+      lowshelf: this.lowshelf,
+      presence: this.presence,
+      highshelf: this.highshelf,
+      deess: this.deess,
+      compressor: this.compressor,
+      makeup: this.makeup,
+    };
+  }
+
+  private ensureChain(ctx: AudioContext) {
+    if (this.gain && this.fxNodes()) return;
+    this.disconnectChain();
+    const highpass = ctx.createBiquadFilter();
+    const lowshelf = ctx.createBiquadFilter();
+    const presence = ctx.createBiquadFilter();
+    const highshelf = ctx.createBiquadFilter();
+    const deess = ctx.createBiquadFilter();
+    const compressor = ctx.createDynamicsCompressor();
+    const makeup = ctx.createGain();
+    const gain = ctx.createGain();
+    highpass.connect(lowshelf);
+    lowshelf.connect(presence);
+    presence.connect(highshelf);
+    highshelf.connect(deess);
+    deess.connect(compressor);
+    compressor.connect(makeup);
+    makeup.connect(gain);
+    gain.connect(ctx.destination);
+    this.highpass = highpass;
+    this.lowshelf = lowshelf;
+    this.presence = presence;
+    this.highshelf = highshelf;
+    this.deess = deess;
+    this.compressor = compressor;
+    this.makeup = makeup;
+    this.gain = gain;
+    this.applyFx();
+    this.gain.gain.value = this.volume;
+  }
+
+  private applyFx() {
+    const nodes = this.fxNodes();
+    if (!nodes) return;
+    applyAudioFxToNodes(nodes, this.audioFx);
+  }
+
+  private disconnectChain() {
+    const nodes = [
+      this.highpass,
+      this.lowshelf,
+      this.presence,
+      this.highshelf,
+      this.deess,
+      this.compressor,
+      this.makeup,
+      this.gain,
+    ];
+    for (const n of nodes) {
+      if (!n) continue;
+      try {
+        n.disconnect();
+      } catch {
+        /* */
+      }
+    }
+    this.highpass = null;
+    this.lowshelf = null;
+    this.presence = null;
+    this.highshelf = null;
+    this.deess = null;
+    this.compressor = null;
+    this.makeup = null;
+    this.gain = null;
   }
 
   private disconnectSource() {
@@ -182,7 +283,7 @@ export class LineAudioPlayer {
       this.lineId = null;
       this.variantId = null;
       this.buffer = null;
-      this.gain = null;
+      this.disconnectChain();
       this.listeners.onChange(null);
     } else {
       this.emit();
@@ -210,6 +311,9 @@ export class LineAudioPlayer {
     this.volume = volume;
     this.offset = 0;
     this.playing = false;
+    this.ensureChain(ctx);
+    this.applyFx();
+    if (this.gain) this.gain.gain.value = volume;
     this.emit();
   }
 
@@ -227,13 +331,13 @@ export class LineAudioPlayer {
   private startSource() {
     if (!this.ctx || !this.buffer) return;
     this.disconnectSource();
-    this.gain = this.ctx.createGain();
-    this.gain.gain.value = this.volume;
+    this.ensureChain(this.ctx);
+    this.applyFx();
+    if (this.gain) this.gain.gain.value = this.volume;
     const src = this.ctx.createBufferSource();
     src.buffer = this.buffer;
     src.playbackRate.value = 1;
-    src.connect(this.gain);
-    this.gain.connect(this.ctx.destination);
+    src.connect(this.highpass!);
     src.onended = () => {
       if (this.source === src) this.finishEnded();
     };
@@ -274,6 +378,11 @@ export class LineAudioPlayer {
   setVolume(volume: number) {
     this.volume = volume;
     if (this.gain) this.gain.gain.value = volume;
+  }
+
+  setAudioFx(fx: AudioFx) {
+    this.audioFx = { ...fx };
+    this.applyFx();
   }
 
   /** Replace buffer while keeping playhead ratio (for pitch-preserving speed change). */

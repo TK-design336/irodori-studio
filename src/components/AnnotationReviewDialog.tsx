@@ -1,7 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ANNOTATION_KIND_LABEL,
-  buildSynthText,
   readingForApply,
   type AnnotationKind,
   type DetectedAnnotation,
@@ -80,6 +79,89 @@ function initLines(items: AnnotationReviewItem[], modes: NumericConvertModes): R
 }
 
 const MANUAL_SENTINEL = "__manual__";
+
+type PreviewSpan = {
+  start: number;
+  end: number;
+  kind: AnnotationKind;
+  reading: string;
+};
+
+function dropOverlappingSpans(spans: PreviewSpan[]): PreviewSpan[] {
+  const sorted = [...spans]
+    .filter((s) => s.start < s.end && s.reading.trim().length > 0)
+    .sort((a, b) => a.start - b.start || b.end - b.start - (a.end - a.start));
+  const kept: PreviewSpan[] = [];
+  for (const s of sorted) {
+    if (kept.some((k) => k.start < s.end && s.start < k.end)) continue;
+    kept.push(s);
+  }
+  return kept;
+}
+
+function highlightOriginal(text: string, spans: PreviewSpan[]): ReactNode {
+  const chars = [...text];
+  const kept = dropOverlappingSpans(spans);
+  const nodes: ReactNode[] = [];
+  let cursor = 0;
+  kept.forEach((s, i) => {
+    const start = Math.max(0, Math.min(s.start, chars.length));
+    const end = Math.max(start, Math.min(s.end, chars.length));
+    if (start > cursor) {
+      nodes.push(
+        <span key={`t-${cursor}`}>{chars.slice(cursor, start).join("")}</span>,
+      );
+    }
+    nodes.push(
+      <mark
+        key={`h-${start}-${i}`}
+        className={`annotation-mark annotation-mark--${s.kind} annotation-mark--static`}
+        title={`${ANNOTATION_KIND_LABEL[s.kind]} → ${s.reading}`}
+      >
+        {chars.slice(start, end).join("")}
+      </mark>,
+    );
+    cursor = end;
+  });
+  if (cursor < chars.length) {
+    nodes.push(
+      <span key={`t-${cursor}`}>{chars.slice(cursor).join("")}</span>,
+    );
+  }
+  return nodes.length > 0 ? nodes : text;
+}
+
+function highlightSynth(text: string, spans: PreviewSpan[]): ReactNode {
+  const chars = [...text];
+  const kept = dropOverlappingSpans(spans);
+  const nodes: ReactNode[] = [];
+  let cursor = 0;
+  kept.forEach((s, i) => {
+    const start = Math.max(0, Math.min(s.start, chars.length));
+    const end = Math.max(start, Math.min(s.end, chars.length));
+    if (start > cursor) {
+      nodes.push(
+        <span key={`t-${cursor}`}>{chars.slice(cursor, start).join("")}</span>,
+      );
+    }
+    nodes.push(
+      <mark
+        key={`h-${start}-${i}`}
+        className={`annotation-mark annotation-mark--${s.kind} annotation-mark--static`}
+        title={`${ANNOTATION_KIND_LABEL[s.kind]}: ${s.reading}`}
+      >
+        {s.reading}
+      </mark>,
+    );
+    cursor = end;
+  });
+  if (cursor < chars.length) {
+    nodes.push(
+      <span key={`t-${cursor}`}>{chars.slice(cursor).join("")}</span>,
+    );
+  }
+  return nodes.length > 0 ? nodes : text;
+}
 
 function ReviewRow({
   entry: e,
@@ -188,11 +270,17 @@ export function AnnotationReviewDialog({
             surface: e.annotation.surface,
             reading: readingForApply(e.annotation.kind, e.selectedReading),
           }));
+        const spans: PreviewSpan[] = [...l.applied, ...newReadings].map((r) => ({
+          start: r.start,
+          end: r.end,
+          kind: r.kind,
+          reading: r.reading,
+        }));
         return {
           lineId: l.lineId,
           label: l.label,
           original: l.text,
-          synth: buildSynthText(l.text, [...l.applied, ...newReadings]),
+          spans,
         };
       }),
     [lines],
@@ -389,11 +477,15 @@ export function AnnotationReviewDialog({
                     {multi && <div className="katakana-line-label">{p.label}</div>}
                     <div className="annotation-review-diff-row">
                       <span className="annotation-review-diff-label">原文</span>
-                      <span>{p.original}</span>
+                      <span className="annotation-review-diff-text" spellCheck={false}>
+                        {highlightOriginal(p.original, p.spans)}
+                      </span>
                     </div>
                     <div className="annotation-review-diff-row">
                       <span className="annotation-review-diff-label">推論</span>
-                      <span>{p.synth}</span>
+                      <span className="annotation-review-diff-text" spellCheck={false}>
+                        {highlightSynth(p.original, p.spans)}
+                      </span>
                     </div>
                   </div>
                 ))}

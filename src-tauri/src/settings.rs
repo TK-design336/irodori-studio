@@ -116,6 +116,25 @@ pub struct SliceReviewSettings {
     /// auto: keep at most this many slices (0 = no cap).
     #[serde(default)]
     pub auto_keep_max: u32,
+    /// Non-generative WPE / tilt / denoise on sliced clips before review.
+    #[serde(default = "default_slice_auto_fix")]
+    pub auto_fix: SliceAutoFixSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SliceAutoFixSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// WPE + late-reverb suppression when the session/slice sounds wet.
+    #[serde(default = "default_true")]
+    pub reverb: bool,
+    /// Spectral tilt / boxiness EQ for muffled takes.
+    #[serde(default = "default_true")]
+    pub muffle: bool,
+    /// High-pass, light Wiener denoise, soft declip.
+    #[serde(default = "default_true")]
+    pub enhance: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -208,6 +227,15 @@ fn default_slice_review_thresholds() -> SliceReviewThresholds {
     }
 }
 
+fn default_slice_auto_fix() -> SliceAutoFixSettings {
+    SliceAutoFixSettings {
+        enabled: true,
+        reverb: true,
+        muffle: true,
+        enhance: true,
+    }
+}
+
 pub fn default_slice_review() -> SliceReviewSettings {
     SliceReviewSettings {
         mode: default_slice_review_mode(),
@@ -215,6 +243,7 @@ pub fn default_slice_review() -> SliceReviewSettings {
         thresholds: default_slice_review_thresholds(),
         auto_remove_percent: 0.0,
         auto_keep_max: 0,
+        auto_fix: default_slice_auto_fix(),
     }
 }
 

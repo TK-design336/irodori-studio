@@ -338,6 +338,31 @@ def cosine(a, b) -> float:
     return float(np.dot(a, b) / (na * nb))
 
 
+def attach_autofix(out_dir: Path, rows: list[dict[str, Any]]) -> None:
+    log = load_json(out_dir / "autofix_log.json", {})
+    if not isinstance(log, dict):
+        return
+    files = log.get("files")
+    if not isinstance(files, dict):
+        return
+    batch = log.get("batch") if isinstance(log.get("batch"), dict) else {}
+    for row in rows:
+        info = files.get(row.get("file"))
+        if not isinstance(info, dict):
+            continue
+        row["autoFix"] = {
+            "ops": list(info.get("ops") or []),
+            "changed": bool(info.get("changed")),
+            "c50": info.get("c50"),
+            "rt60": info.get("rt60"),
+            "tilt": info.get("tilt"),
+            "snr": info.get("snr"),
+            "batchReverb": bool(batch.get("reverb")),
+            "batchMuffle": bool(batch.get("muffle")),
+            "backupDir": log.get("backupDir"),
+        }
+
+
 def aspect_enabled(aspects: dict[str, bool], key: str) -> bool:
     default = key not in ("E", "J")
     return bool(aspects.get(key, default))
@@ -413,6 +438,10 @@ def main() -> int:
     ):
         print("SKIP metrics (cache hit)", flush=True)
         metrics = load_json(metrics_path, {})
+        rows = list(metrics.get("slices") or [])
+        attach_autofix(out_dir, rows)
+        metrics["slices"] = rows
+        save_json(metrics_path, metrics)
         if args.apply_auto:
             apply_auto_exclusions(out_dir, metrics, aspects, thresholds, th, auto_cfg)
         emit_fraction(1, 1, "cache")
@@ -430,13 +459,18 @@ def main() -> int:
     embed_names: list[str] = []
     n = len(wavs)
     print(f"REVIEW_METRICS slices={n} signal-only", flush=True)
+    emit_fraction(0, n, "start")
     for i, w in enumerate(wavs, start=1):
-        emit_fraction(i, n, w.name)
-        y, sr = sf.read(str(w), always_2d=False)
-        if getattr(y, "ndim", 1) > 1:
-            y = np.mean(y, axis=1)
-        y = np.asarray(y, dtype=np.float32)
-        sig = compute_signal_metrics(y, int(sr))
+        try:
+            y, sr = sf.read(str(w), always_2d=False)
+            if getattr(y, "ndim", 1) > 1:
+                y = np.mean(y, axis=1)
+            y = np.asarray(y, dtype=np.float32)
+            sig = compute_signal_metrics(y, int(sr))
+        except Exception as e:  # noqa: BLE001
+            print(f"WARN metrics {w.name}: {e}", flush=True)
+            emit_fraction(i, n, w.name)
+            continue
         script = transcripts.get(w.name)
         mora = mora_count(script) if script else 0
         dur = float(sig["duration"] or 0.0)
@@ -468,7 +502,11 @@ def main() -> int:
                 **sig,
             }
         )
+        emit_fraction(i, n, w.name)
+        if i == n or i % 10 == 0:
+            print(f"REVIEW_METRICS {i}/{n} {w.name}", flush=True)
 
+    print("REVIEW_METRICS aggregating", flush=True)
     speaker_sims: dict[str, float] = {}
     hist_sims: list[float] = []
     if embeds:
@@ -673,6 +711,8 @@ def main() -> int:
         row["hitCount"] = len(hit)
         row["outlierScore"] = round(outlier, 4)
         row["outlierParts"] = {k: round(v, 4) for k, v in parts.items()}
+
+    attach_autofix(out_dir, rows)
 
     metrics = {
         "version": METRICS_VERSION,

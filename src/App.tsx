@@ -5,6 +5,7 @@ import { SettingsView } from "./components/SettingsView";
 import { TrainView } from "./components/TrainView";
 import { SpeakerView } from "./components/SpeakerView";
 import { DictionaryView } from "./components/DictionaryView";
+import { SpeakerSortProvider } from "./components/SpeakerSortContext";
 import { IconMoon, IconSun } from "./components/icons";
 import type {
   AppSettings,
@@ -145,6 +146,7 @@ function App() {
   }
 
   return (
+    <SpeakerSortProvider>
     <div className="app-shell">
       <header className="topbar">
         <div className="brand">
@@ -335,6 +337,7 @@ function App() {
         </div>
       </div>
     </div>
+    </SpeakerSortProvider>
   );
 }
 

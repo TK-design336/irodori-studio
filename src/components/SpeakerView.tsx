@@ -6,9 +6,12 @@ import {
   formatBlendPercents,
   type BlendWeights,
 } from "./BlendTernaryPlot";
+import { SpeakerSortPanel } from "./SpeakerSortPanel";
+import { useSpeakerSort } from "./SpeakerSortContext";
 import type { SpeakerInfo } from "../types";
-import { speakerOptionLabel, speakerRealName } from "../types";
+import { defaultSampling, speakerRealName } from "../types";
 import { noteSpeakerRename } from "../lib/speakerResolve";
+import { sortAndFilterSpeakers, collectSpeakerTags, speakerMatchesQuery } from "../lib/speakerSort";
 
 type Props = {
   speakers: SpeakerInfo[];
@@ -17,10 +20,6 @@ type Props = {
 };
 
 type ProfileKind = "ref" | "caption";
-
-type SortKey = "name" | "realName" | "gender" | "age" | "tag";
-type SortDir = "asc" | "desc";
-type KindFilterKey = "trained" | "blend" | "ref" | "caption";
 
 type ConfirmState = {
   message: string;
@@ -33,21 +32,6 @@ const SPEAKER_KIND_LABEL: Record<string, string> = {
   ref: "参照音源",
   caption: "キャプション",
 };
-
-const KIND_FILTERS: { key: KindFilterKey; label: string }[] = [
-  { key: "trained", label: "埋め込み" },
-  { key: "blend", label: "ブレンド" },
-  { key: "ref", label: "参照音源" },
-  { key: "caption", label: "キャプション" },
-];
-
-const SORT_BUTTONS: { key: SortKey; label: string }[] = [
-  { key: "name", label: "名前" },
-  { key: "realName", label: "本名" },
-  { key: "gender", label: "性別" },
-  { key: "age", label: "年齢帯" },
-  { key: "tag", label: "タグ" },
-];
 
 const GENDER_OPTIONS = [
   { value: "", label: "性別" },
@@ -65,14 +49,18 @@ const AGE_OPTIONS = [
   { value: "senior", label: "老年" },
 ];
 
-const GENDER_ORDER: Record<string, number> = { female: 0, male: 1, other: 2 };
-const AGE_ORDER: Record<string, number> = {
-  child: 0,
-  teen: 1,
-  adult: 2,
-  middle: 3,
-  senior: 4,
-};
+const BLEND_PREVIEW_TEXT_KEY = "irodori.blendPreviewText";
+const DEFAULT_BLEND_PREVIEW_TEXT = "こんにちは。これは話者ブレンドの確認です。";
+
+function loadBlendPreviewText(): string {
+  try {
+    const saved = localStorage.getItem(BLEND_PREVIEW_TEXT_KEY);
+    if (saved != null) return saved;
+  } catch {
+    /* */
+  }
+  return DEFAULT_BLEND_PREVIEW_TEXT;
+}
 
 function speakerTags(sp: Pick<SpeakerInfo, "tags">): string[] {
   return (sp.tags ?? []).map((t) => t.trim()).filter(Boolean);
@@ -84,24 +72,12 @@ function addUniqueTag(tags: string[], raw: string): string[] {
   return [...tags, tag];
 }
 
-function cmpOptionalOrder(
-  a: string | null | undefined,
-  b: string | null | undefined,
-  order: Record<string, number>,
-  dir: number,
-): number {
-  const ae = !a;
-  const be = !b;
-  if (ae && be) return 0;
-  if (ae) return 1;
-  if (be) return -1;
-  return ((order[a] ?? 99) - (order[b] ?? 99)) * dir;
-}
-
 export function SpeakerView({ speakers, onSpeakersChanged, isV4 }: Props) {
   // ── 折りたたみ状態 ──
   const [manageCollapsed, setManageCollapsed] = useState(false);
   const [blendCollapsed, setBlendCollapsed] = useState(false);
+  const [listAsideOpen, setListAsideOpen] = useState(false);
+  const [listQuery, setListQuery] = useState("");
 
   // ── ブレンド ──
   const [embedA, setEmbedA] = useState("");
@@ -110,6 +86,14 @@ export function SpeakerView({ speakers, onSpeakersChanged, isV4 }: Props) {
   const [weights, setWeights] = useState<BlendWeights>({ a: 0.5, b: 0.5, c: 0 });
   const [blendName, setBlendName] = useState("");
   const [blendMsg, setBlendMsg] = useState("");
+  const [blendBusy, setBlendBusy] = useState(false);
+  const [previewText, setPreviewText] = useState(loadBlendPreviewText);
+  const [previewAudioUrl, setPreviewAudioUrl] = useState("");
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+  const previewAudioUrlRef = useRef("");
+  const previewEmbedPathRef = useRef("");
+  const previewSigRef = useRef("");
+  const previewGenRef = useRef(0);
 
   // ── プロファイル編集 ──
   const [profileEditPath, setProfileEditPath] = useState<string | null>(null);
@@ -125,15 +109,8 @@ export function SpeakerView({ speakers, onSpeakersChanged, isV4 }: Props) {
   const [profileMsg, setProfileMsg] = useState("");
   const [profileBusy, setProfileBusy] = useState(false);
 
-  // ── ソート / 表示種 ──
-  const [sortKey, setSortKey] = useState<SortKey>("name");
-  const [sortDir, setSortDir] = useState<SortDir>("asc");
-  const [kindFilter, setKindFilter] = useState<Record<KindFilterKey, boolean>>({
-    trained: true,
-    blend: true,
-    ref: true,
-    caption: true,
-  });
+  // ── ソート / 表示種（共有） ──
+  const speakerSort = useSpeakerSort();
   const [listTagDrafts, setListTagDrafts] = useState<Record<string, string>>({});
   const [listRealNameDrafts, setListRealNameDrafts] = useState<Record<string, string>>({});
   const [listNameDrafts, setListNameDrafts] = useState<Record<string, string>>({});
@@ -158,45 +135,31 @@ export function SpeakerView({ speakers, onSpeakersChanged, isV4 }: Props) {
     [speakers],
   );
 
-  const visibleSpeakers = useMemo(() => {
-    const filtered = speakers.filter((s) => {
-      const k = s.kind as KindFilterKey;
-      return kindFilter[k] ?? true;
-    });
-    const dir = sortDir === "asc" ? 1 : -1;
-    const copy = [...filtered];
-    copy.sort((a, b) => {
-      let primary = 0;
-      if (sortKey === "name") {
-        primary = a.name.localeCompare(b.name, "ja") * dir;
-      } else if (sortKey === "realName") {
-        primary = speakerRealName(a).localeCompare(speakerRealName(b), "ja") * dir;
-      } else if (sortKey === "gender") {
-        primary = cmpOptionalOrder(a.gender, b.gender, GENDER_ORDER, dir);
-      } else if (sortKey === "age") {
-        primary = cmpOptionalOrder(a.ageRange, b.ageRange, AGE_ORDER, dir);
-      } else {
-        const at = speakerTags(a).join(",");
-        const bt = speakerTags(b).join(",");
-        if (!at && !bt) primary = 0;
-        else if (!at) primary = 1;
-        else if (!bt) primary = -1;
-        else primary = at.localeCompare(bt, "ja") * dir;
-      }
-      return primary !== 0 ? primary : a.name.localeCompare(b.name, "ja");
-    });
-    return copy;
-  }, [speakers, kindFilter, sortKey, sortDir]);
-
-  const speakerOptions = useMemo(
-    () => [
-      { value: "", label: "選択…" },
-      ...embedSpeakers.map((s) => ({
-        value: s.embedPath,
-        label: speakerOptionLabel(s),
-      })),
+  const visibleSpeakers = useMemo(
+    () =>
+      sortAndFilterSpeakers(speakers, {
+        sortKey: speakerSort.sortKey,
+        sortDir: speakerSort.sortDir,
+        kindFilter: speakerSort.kindFilter,
+        tagFilter: speakerSort.tagFilter,
+      }),
+    [
+      speakers,
+      speakerSort.sortKey,
+      speakerSort.sortDir,
+      speakerSort.kindFilter,
+      speakerSort.tagFilter,
     ],
-    [embedSpeakers],
+  );
+
+  const searchedSpeakers = useMemo(
+    () => visibleSpeakers.filter((sp) => speakerMatchesQuery(sp, listQuery)),
+    [visibleSpeakers, listQuery],
+  );
+
+  const availableTags = useMemo(
+    () => collectSpeakerTags(speakers),
+    [speakers],
   );
 
   const nameA = embedSpeakers.find((s) => s.embedPath === embedA)?.name ?? "A";
@@ -211,6 +174,85 @@ export function SpeakerView({ speakers, onSpeakersChanged, isV4 }: Props) {
         return s > 0 ? { a: w.a / s, b: w.b / s, c: 0 } : { a: 0.5, b: 0.5, c: 0 };
       });
     }
+  };
+
+  const blendSignature = () =>
+    JSON.stringify({
+      a: embedA,
+      b: embedB,
+      c: embedC,
+      w: weights,
+    });
+
+  const validateBlendSelection = (): string | null => {
+    if (!embedA || !embedB) return "話者 A と B を選択してください";
+    const ids = [embedA, embedB, embedC].filter(Boolean);
+    if (new Set(ids).size !== ids.length) return "同じ話者を複数回選べません";
+    return null;
+  };
+
+  useEffect(() => {
+    previewGenRef.current += 1;
+    previewEmbedPathRef.current = "";
+    previewSigRef.current = "";
+    setPreviewAudioUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      previewAudioUrlRef.current = "";
+      return "";
+    });
+  }, [embedA, embedB, embedC, weights]);
+
+  useEffect(() => {
+    const audio = previewAudioRef.current;
+    if (audio && previewAudioUrl) {
+      audio.play().catch(() => { /* 自動再生が拒否されてもコントロールは残す */ });
+    }
+  }, [previewAudioUrl]);
+
+  useEffect(() => {
+    return () => {
+      if (previewAudioUrlRef.current) {
+        URL.revokeObjectURL(previewAudioUrlRef.current);
+      }
+    };
+  }, []);
+
+  const persistPreviewText = (value: string) => {
+    setPreviewText(value);
+    try {
+      localStorage.setItem(BLEND_PREVIEW_TEXT_KEY, value);
+    } catch {
+      /* */
+    }
+  };
+
+  const defaultBlendName = () => {
+    const pct = formatBlendPercents(weights, Boolean(embedC));
+    return blendName.trim() || (
+      embedC
+        ? `${nameA}${pct.a}_${nameB}${pct.b}_${nameC}${pct.c}`
+        : `${nameA}_${nameB}_${pct.b}`
+    );
+  };
+
+  const ensurePreviewBlend = async (): Promise<string> => {
+    const sig = blendSignature();
+    if (previewEmbedPathRef.current && previewSigRef.current === sig) {
+      return previewEmbedPathRef.current;
+    }
+    const out = await invoke<string>("blend_embeddings", {
+      embedA,
+      embedB,
+      embedC: embedC || null,
+      weightA: weights.a,
+      weightB: weights.b,
+      weightC: embedC ? weights.c : 0,
+      outputName: "preview",
+      preview: true,
+    });
+    previewEmbedPathRef.current = out;
+    previewSigRef.current = sig;
+    return out;
   };
 
   // ── 参照音源リスト操作 ──
@@ -363,22 +405,6 @@ export function SpeakerView({ speakers, onSpeakersChanged, isV4 }: Props) {
     }
   };
 
-  const clickSort = (key: SortKey) => {
-    if (sortKey === key) {
-      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
-    } else {
-      setSortKey(key);
-      setSortDir("asc");
-    }
-  };
-
-  const toggleKindFilter = (key: KindFilterKey) => {
-    setKindFilter((prev) => ({ ...prev, [key]: !prev[key] }));
-  };
-
-  const sortDirMark = (key: SortKey) =>
-    sortKey === key ? (sortDir === "asc" ? " ▲" : " ▼") : "";
-
   const commitProfileTag = () => {
     const next = addUniqueTag(profileTags, profileTagDraft);
     if (next !== profileTags) setProfileTags(next);
@@ -509,19 +535,70 @@ export function SpeakerView({ speakers, onSpeakersChanged, isV4 }: Props) {
     }
   };
 
-  const doBlend = async () => {
-    if (!embedA || !embedB) { setBlendMsg("話者 A と B を選択してください"); return; }
-    const ids = [embedA, embedB, embedC].filter(Boolean);
-    if (new Set(ids).size !== ids.length) {
-      setBlendMsg("同じ話者を複数回選べません");
-      return;
+  const doPreviewSynth = async () => {
+    const err = validateBlendSelection();
+    if (err) { setBlendMsg(err); return; }
+    const text = previewText.trim();
+    if (!text) { setBlendMsg("チェック用のセリフを入力してください"); return; }
+
+    const gen = ++previewGenRef.current;
+    setBlendBusy(true);
+    setBlendMsg("ブレンドして合成しています…");
+    try {
+      const embedPath = await ensurePreviewBlend();
+      if (previewGenRef.current !== gen) return;
+      await invoke("ensure_worker");
+      if (previewGenRef.current !== gen) return;
+      const outPath = await invoke<string>("line_cache_wav_path", {
+        projectName: "_blend_preview",
+        lineId: "check",
+      });
+      const s = defaultSampling();
+      await invoke("synthesize_line", {
+        args: {
+          text,
+          refEmbed: embedPath,
+          outputWav: outPath,
+          numSteps: s.numSteps,
+          numCandidates: 1,
+          seed: s.seed,
+          seconds: s.seconds,
+          durationScale: s.durationScale,
+          tScheduleMode: s.tScheduleMode,
+          swayCoeff: s.swayCoeff,
+          cfgGuidanceMode: s.cfgGuidanceMode,
+          cfgScaleText: s.cfgScaleText,
+          cfgScaleSpeaker: s.cfgScaleSpeaker,
+        },
+      });
+      if (previewGenRef.current !== gen) return;
+      const exists = await invoke<boolean>("file_exists", { path: outPath });
+      if (!exists) {
+        setBlendMsg("合成失敗: 音声ファイルを作れませんでした");
+        return;
+      }
+      const bytes = await invoke<number[]>("read_file_bytes", { path: outPath });
+      if (previewGenRef.current !== gen) return;
+      const blob = new Blob([new Uint8Array(bytes)], { type: "audio/wav" });
+      const url = URL.createObjectURL(blob);
+      setPreviewAudioUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        previewAudioUrlRef.current = url;
+        return url;
+      });
+      setBlendMsg("合成チェック完了。問題なければ保存できます");
+    } catch (e) {
+      if (previewGenRef.current === gen) setBlendMsg(String(e));
+    } finally {
+      setBlendBusy(false);
     }
-    const pct = formatBlendPercents(weights, Boolean(embedC));
-    const name = blendName.trim() || (
-      embedC
-        ? `${nameA}${pct.a}_${nameB}${pct.b}_${nameC}${pct.c}`
-        : `${nameA}_${nameB}_${pct.b}`
-    );
+  };
+
+  const doBlend = async () => {
+    const err = validateBlendSelection();
+    if (err) { setBlendMsg(err); return; }
+    const name = defaultBlendName();
+    setBlendBusy(true);
     try {
       const out = await invoke<string>("blend_embeddings", {
         embedA,
@@ -536,13 +613,227 @@ export function SpeakerView({ speakers, onSpeakersChanged, isV4 }: Props) {
       onSpeakersChanged();
     } catch (e) {
       setBlendMsg(String(e));
+    } finally {
+      setBlendBusy(false);
     }
   };
 
   const showRefCapSplit = !isV4;
 
+  const listSearchField = (
+    <div className="speaker-list-search">
+      <input
+        type="search"
+        value={listQuery}
+        onChange={(e) => setListQuery(e.target.value)}
+        placeholder="話者を検索…"
+        aria-label="登録話者を検索"
+        autoComplete="off"
+        autoCorrect="off"
+        spellCheck={false}
+      />
+    </div>
+  );
+
+  const profileListBody =
+    speakers.length === 0 ? (
+      <p className="hint">まだ登録された話者はありません</p>
+    ) : visibleSpeakers.length === 0 ? (
+      <p className="hint">表示種の選択に一致する話者はありません</p>
+    ) : searchedSpeakers.length === 0 ? (
+      <p className="hint">検索に一致する話者はありません</p>
+    ) : (
+      searchedSpeakers.map((sp) => (
+        <div
+          key={sp.embedPath}
+          className={`profile-list-item${profileEditPath === sp.embedPath ? " active" : ""}`}
+        >
+          <div className="profile-list-main">
+            {editingNamePath === sp.embedPath ? (
+              <input
+                ref={nameEditRef}
+                className="speaker-name-input"
+                aria-label={`${sp.name} の話者名`}
+                title="Enter で確定 / Esc でキャンセル"
+                value={listNameDrafts[sp.embedPath] ?? sp.name}
+                disabled={profileBusy}
+                onChange={(e) =>
+                  setListNameDrafts((prev) => ({
+                    ...prev,
+                    [sp.embedPath]: e.target.value,
+                  }))
+                }
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    (e.target as HTMLInputElement).blur();
+                  } else if (e.key === "Escape") {
+                    e.preventDefault();
+                    skipNameCommitRef.current = true;
+                    setListNameDrafts((prev) => {
+                      const next = { ...prev };
+                      delete next[sp.embedPath];
+                      return next;
+                    });
+                    setEditingNamePath(null);
+                  }
+                }}
+                onBlur={() => {
+                  if (skipNameCommitRef.current) {
+                    skipNameCommitRef.current = false;
+                    return;
+                  }
+                  void commitListName(sp);
+                }}
+              />
+            ) : (
+              <button
+                type="button"
+                className="speaker-name-edit-btn"
+                aria-label={`${sp.name} の話者名を編集`}
+                title="クリックして話者名を編集"
+                disabled={profileBusy}
+                onClick={() => beginNameEdit(sp)}
+              >
+                {sp.name}
+              </button>
+            )}
+            <span className="profile-kind-badge">
+              {SPEAKER_KIND_LABEL[sp.kind] ?? sp.kind}
+            </span>
+            <input
+              className="speaker-realname-input"
+              aria-label={`${sp.name} の話者本名`}
+              title="話者本名（俳優・声優名）"
+              value={listRealNameDrafts[sp.embedPath] ?? speakerRealName(sp)}
+              disabled={profileBusy}
+              placeholder="本名"
+              onChange={(e) =>
+                setListRealNameDrafts((prev) => ({
+                  ...prev,
+                  [sp.embedPath]: e.target.value,
+                }))
+              }
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  (e.target as HTMLInputElement).blur();
+                }
+              }}
+              onBlur={() => commitListRealName(sp)}
+            />
+            <select
+              className="speaker-meta-select"
+              aria-label={`${sp.name} の性別`}
+              value={sp.gender ?? ""}
+              disabled={profileBusy}
+              onChange={(e) =>
+                void saveSpeakerMeta(sp, { gender: e.target.value || null })
+              }
+            >
+              {GENDER_OPTIONS.map((o) => (
+                <option key={o.value || "none"} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+            <select
+              className="speaker-meta-select"
+              aria-label={`${sp.name} の年齢帯`}
+              value={sp.ageRange ?? ""}
+              disabled={profileBusy}
+              onChange={(e) =>
+                void saveSpeakerMeta(sp, { ageRange: e.target.value || null })
+              }
+            >
+              {AGE_OPTIONS.map((o) => (
+                <option key={o.value || "none"} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+            {speakerTags(sp).map((tag) => (
+              <span key={tag} className="speaker-tag-chip">
+                {tag}
+                <button
+                  type="button"
+                  disabled={profileBusy}
+                  title={`${tag} を削除`}
+                  onClick={() =>
+                    void saveSpeakerMeta(sp, {
+                      tags: speakerTags(sp).filter((t) => t !== tag),
+                    })
+                  }
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+            <input
+              className="speaker-tag-input"
+              aria-label={`${sp.name} にタグを追加`}
+              value={listTagDrafts[sp.embedPath] ?? ""}
+              disabled={profileBusy}
+              placeholder="タグ追加"
+              onChange={(e) =>
+                setListTagDrafts((prev) => ({
+                  ...prev,
+                  [sp.embedPath]: e.target.value,
+                }))
+              }
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === ",") {
+                  e.preventDefault();
+                  addListTag(sp);
+                }
+              }}
+              onBlur={() => addListTag(sp)}
+            />
+            <span
+              className="profile-list-detail"
+              title={
+                sp.kind === "ref"
+                  ? (sp.refWavs?.join(", ") ?? sp.refWav ?? "")
+                  : sp.kind === "caption"
+                    ? (sp.caption ?? "")
+                    : sp.embedPath
+              }
+            >
+              {sp.kind === "ref"
+                ? sp.refWavs && sp.refWavs.length > 1
+                  ? `${sp.refWavs.length}ファイル`
+                  : (sp.refWav ?? "")
+                : sp.kind === "caption"
+                  ? (sp.caption ?? "")
+                  : ""}
+            </span>
+          </div>
+          <div className="row profile-list-actions">
+            {(sp.kind === "ref" || sp.kind === "caption") && (
+              <button
+                type="button"
+                disabled={profileBusy}
+                onClick={() => beginEditProfile(sp)}
+              >
+                編集
+              </button>
+            )}
+            <button
+              type="button"
+              className="danger"
+              disabled={profileBusy}
+              onClick={() => requestDeleteSpeaker(sp)}
+            >
+              削除
+            </button>
+          </div>
+        </div>
+      ))
+    );
+
   return (
-    <div className="speaker-layout">
+    <div className={`speaker-layout${listAsideOpen ? " with-list-aside" : ""}`}>
+      <div className="speaker-layout-main">
       {/* ── Section 1: 話者管理 ── */}
       <section className={`panel speaker-manage-panel${manageCollapsed ? " collapsed" : ""}`}>
         <header className="panel-header" onClick={() => setManageCollapsed((v) => !v)}>
@@ -706,203 +997,40 @@ export function SpeakerView({ speakers, onSpeakersChanged, isV4 }: Props) {
               <span className="status-text">{profileMsg}</span>
             </div>
 
-            {/* ── 話者リスト ── */}
+            {/* ── 話者リスト（インライン / 右サイドへ展開可） ── */}
             <hr />
             <div className="speaker-list-header">
               <h4>登録話者一覧</h4>
-              <div className="speaker-list-toolbar">
-                <div className="speaker-sort-row">
-                  <span className="hint">表示種:</span>
-                  {KIND_FILTERS.map((f) => (
-                    <button
-                      key={f.key}
-                      type="button"
-                      className={kindFilter[f.key] ? "sort-btn active" : "sort-btn"}
-                      aria-pressed={kindFilter[f.key]}
-                      title={kindFilter[f.key] ? "表示中（クリックで非表示）" : "非表示（クリックで表示）"}
-                      onClick={() => toggleKindFilter(f.key)}
-                    >
-                      {f.label}
-                    </button>
-                  ))}
-                </div>
-                <div className="speaker-sort-row">
-                  <span className="hint">並び替え:</span>
-                  {SORT_BUTTONS.map((b) => (
-                    <button
-                      key={b.key}
-                      type="button"
-                      className={sortKey === b.key ? "sort-btn active" : "sort-btn"}
-                      title="クリックで昇順・降順を切替"
-                      onClick={() => clickSort(b.key)}
-                    >
-                      {b.label}{sortDirMark(b.key)}
-                    </button>
-                  ))}
-                </div>
-              </div>
+              <button
+                type="button"
+                className={`speaker-sort-expand-btn${listAsideOpen ? " active" : ""}`}
+                aria-expanded={listAsideOpen}
+                aria-label="登録話者一覧を右サイドパネルで開く"
+                title="右サイドパネルで一覧を開く"
+                onClick={() => setListAsideOpen((v) => !v)}
+              >
+                {listAsideOpen ? "一覧を戻す" : "サイドで開く"}
+                <span className="chevron" aria-hidden>
+                  {listAsideOpen ? "◂" : "▸"}
+                </span>
+              </button>
             </div>
-            <div className="profile-list profile-list-scrollable">
-              {speakers.length === 0 ? (
-                <p className="hint">まだ登録された話者はありません</p>
-              ) : visibleSpeakers.length === 0 ? (
-                <p className="hint">表示種の選択に一致する話者はありません</p>
-              ) : (
-                visibleSpeakers.map((sp) => (
-                  <div key={sp.embedPath}
-                    className={`profile-list-item${profileEditPath === sp.embedPath ? " active" : ""}`}>
-                    <div className="profile-list-main">
-                      {editingNamePath === sp.embedPath ? (
-                        <input
-                          ref={nameEditRef}
-                          className="speaker-name-input"
-                          aria-label={`${sp.name} の話者名`}
-                          title="Enter で確定 / Esc でキャンセル"
-                          value={listNameDrafts[sp.embedPath] ?? sp.name}
-                          disabled={profileBusy}
-                          onChange={(e) => setListNameDrafts((prev) => ({
-                            ...prev,
-                            [sp.embedPath]: e.target.value,
-                          }))}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter") {
-                              e.preventDefault();
-                              (e.target as HTMLInputElement).blur();
-                            } else if (e.key === "Escape") {
-                              e.preventDefault();
-                              skipNameCommitRef.current = true;
-                              setListNameDrafts((prev) => {
-                                const next = { ...prev };
-                                delete next[sp.embedPath];
-                                return next;
-                              });
-                              setEditingNamePath(null);
-                            }
-                          }}
-                          onBlur={() => {
-                            if (skipNameCommitRef.current) {
-                              skipNameCommitRef.current = false;
-                              return;
-                            }
-                            void commitListName(sp);
-                          }}
-                        />
-                      ) : (
-                        <button
-                          type="button"
-                          className="speaker-name-edit-btn"
-                          aria-label={`${sp.name} の話者名を編集`}
-                          title="クリックして話者名を編集"
-                          disabled={profileBusy}
-                          onClick={() => beginNameEdit(sp)}
-                        >
-                          {sp.name}
-                        </button>
-                      )}
-                      <span className="profile-kind-badge">
-                        {SPEAKER_KIND_LABEL[sp.kind] ?? sp.kind}
-                      </span>
-                      <input
-                        className="speaker-realname-input"
-                        aria-label={`${sp.name} の話者本名`}
-                        title="話者本名（俳優・声優名）"
-                        value={listRealNameDrafts[sp.embedPath] ?? speakerRealName(sp)}
-                        disabled={profileBusy}
-                        placeholder="本名"
-                        onChange={(e) => setListRealNameDrafts((prev) => ({
-                          ...prev,
-                          [sp.embedPath]: e.target.value,
-                        }))}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") {
-                            e.preventDefault();
-                            (e.target as HTMLInputElement).blur();
-                          }
-                        }}
-                        onBlur={() => commitListRealName(sp)}
-                      />
-                      <select
-                        className="speaker-meta-select"
-                        aria-label={`${sp.name} の性別`}
-                        value={sp.gender ?? ""}
-                        disabled={profileBusy}
-                        onChange={(e) => void saveSpeakerMeta(sp, { gender: e.target.value || null })}
-                      >
-                        {GENDER_OPTIONS.map((o) => (
-                          <option key={o.value || "none"} value={o.value}>{o.label}</option>
-                        ))}
-                      </select>
-                      <select
-                        className="speaker-meta-select"
-                        aria-label={`${sp.name} の年齢帯`}
-                        value={sp.ageRange ?? ""}
-                        disabled={profileBusy}
-                        onChange={(e) => void saveSpeakerMeta(sp, { ageRange: e.target.value || null })}
-                      >
-                        {AGE_OPTIONS.map((o) => (
-                          <option key={o.value || "none"} value={o.value}>{o.label}</option>
-                        ))}
-                      </select>
-                      {speakerTags(sp).map((tag) => (
-                        <span key={tag} className="speaker-tag-chip">
-                          {tag}
-                          <button
-                            type="button"
-                            disabled={profileBusy}
-                            title={`${tag} を削除`}
-                            onClick={() => void saveSpeakerMeta(sp, {
-                              tags: speakerTags(sp).filter((t) => t !== tag),
-                            })}
-                          >×</button>
-                        </span>
-                      ))}
-                      <input
-                        className="speaker-tag-input"
-                        aria-label={`${sp.name} にタグを追加`}
-                        value={listTagDrafts[sp.embedPath] ?? ""}
-                        disabled={profileBusy}
-                        placeholder="タグ追加"
-                        onChange={(e) => setListTagDrafts((prev) => ({
-                          ...prev,
-                          [sp.embedPath]: e.target.value,
-                        }))}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter" || e.key === ",") {
-                            e.preventDefault();
-                            addListTag(sp);
-                          }
-                        }}
-                        onBlur={() => addListTag(sp)}
-                      />
-                      <span className="profile-list-detail"
-                        title={
-                          sp.kind === "ref"
-                            ? (sp.refWavs?.join(", ") ?? sp.refWav ?? "")
-                            : sp.kind === "caption"
-                              ? (sp.caption ?? "")
-                              : sp.embedPath
-                        }>
-                        {sp.kind === "ref"
-                          ? sp.refWavs && sp.refWavs.length > 1
-                            ? `${sp.refWavs.length}ファイル`
-                            : (sp.refWav ?? "")
-                          : sp.kind === "caption"
-                            ? (sp.caption ?? "")
-                            : ""}
-                      </span>
-                    </div>
-                    <div className="row profile-list-actions">
-                      {(sp.kind === "ref" || sp.kind === "caption") && (
-                        <button type="button" disabled={profileBusy}
-                          onClick={() => beginEditProfile(sp)}>編集</button>
-                      )}
-                      <button type="button" className="danger" disabled={profileBusy}
-                        onClick={() => requestDeleteSpeaker(sp)}>削除</button>
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
+            {!listAsideOpen && (
+              <>
+                <div className="speaker-list-toolbar">
+                  <SpeakerSortPanel availableTags={availableTags} />
+                </div>
+                {listSearchField}
+                <div className="profile-list profile-list-scrollable">
+                  {profileListBody}
+                </div>
+              </>
+            )}
+            {listAsideOpen && (
+              <p className="hint speaker-list-docked-hint">
+                登録話者一覧は右側パネルに表示中です
+              </p>
+            )}
           </div>
         )}
       </section>
@@ -916,7 +1044,7 @@ export function SpeakerView({ speakers, onSpeakersChanged, isV4 }: Props) {
         {!blendCollapsed && (
           <div className="panel-body form-stack">
             <BlendTernaryPlot
-              options={speakerOptions}
+              speakers={embedSpeakers}
               embedA={embedA}
               embedB={embedB}
               embedC={embedC}
@@ -932,12 +1060,37 @@ export function SpeakerView({ speakers, onSpeakersChanged, isV4 }: Props) {
             <label>
               出力名
               <input value={blendName} onChange={(e) => setBlendName(e.target.value)}
-                placeholder="空欄なら自動命名" />
+                placeholder="空欄なら自動命名" disabled={blendBusy} />
+            </label>
+            <label>
+              合成チェック用セリフ
+              <textarea
+                className="blend-preview-text"
+                value={previewText}
+                onChange={(e) => persistPreviewText(e.target.value)}
+                placeholder="任意のセリフを入力"
+                rows={2}
+                disabled={blendBusy}
+              />
+              <span className="hint">保存前に任意のセリフで合成し、声を確認できます。</span>
             </label>
             <div className="row">
-              <button type="button" className="primary" onClick={doBlend}>ブレンド保存</button>
+              <button type="button" disabled={blendBusy} onClick={() => void doPreviewSynth()}>
+                {blendBusy ? "処理中…" : "合成チェック"}
+              </button>
+              <button type="button" className="primary" disabled={blendBusy} onClick={() => void doBlend()}>
+                ブレンド保存
+              </button>
               <span className="status-text">{blendMsg}</span>
             </div>
+            {previewAudioUrl && (
+              <audio
+                ref={previewAudioRef}
+                className="blend-preview-audio"
+                controls
+                src={previewAudioUrl}
+              />
+            )}
           </div>
         )}
       </section>
@@ -961,6 +1114,35 @@ export function SpeakerView({ speakers, onSpeakersChanged, isV4 }: Props) {
             </div>
           </div>
         </div>
+      )}
+      </div>
+
+      {listAsideOpen && (
+        <aside className="panel speaker-list-aside" aria-label="登録話者一覧">
+          <header className="panel-header">
+            <h3>登録話者一覧</h3>
+            <button
+              type="button"
+              className="speaker-sort-expand-btn active"
+              aria-label="一覧サイドパネルを閉じる"
+              onClick={() => setListAsideOpen(false)}
+            >
+              閉じる
+              <span className="chevron" aria-hidden>
+                ✕
+              </span>
+            </button>
+          </header>
+          <div className="panel-body speaker-list-aside-body">
+            <div className="speaker-list-toolbar">
+              <SpeakerSortPanel availableTags={availableTags} />
+            </div>
+            {listSearchField}
+            <div className="profile-list profile-list-aside-scroll">
+              {profileListBody}
+            </div>
+          </div>
+        </aside>
       )}
     </div>
   );

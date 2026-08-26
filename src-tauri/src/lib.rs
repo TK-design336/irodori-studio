@@ -25,7 +25,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 use train::{
     cancel_train_job, clear_resume_info, get_resume_info, run_alkana_suggest, run_blend,
-    start_train_job, TrainResumeInfo, TrainState,
+    run_blend_to, start_train_job, TrainResumeInfo, TrainState,
 };
 use worker::OptWorkerSimple;
 
@@ -186,6 +186,7 @@ fn start_training(
     vocal_model: Option<String>,
     job_dir: Option<String>,
     review_mode: Option<String>,
+    slice_method: Option<String>,
 ) -> Result<(), String> {
     let settings = state.settings.lock().clone();
     start_train_job(
@@ -199,6 +200,7 @@ fn start_training(
         vocal_model,
         job_dir,
         review_mode,
+        slice_method,
         state.train.clone(),
     )
 }
@@ -227,8 +229,22 @@ fn save_slice_review_exclusions_cmd(
 }
 
 #[tauri::command]
-fn complete_slice_review_cmd(job_dir: String) -> Result<(), String> {
+fn complete_slice_review_cmd(job_dir: String) -> Result<u64, String> {
     train::complete_slice_review(&job_dir)
+}
+
+#[tauri::command]
+fn load_slice_autofix_log_cmd(job_dir: String) -> Result<serde_json::Value, String> {
+    train::load_slice_autofix_log(&job_dir)
+}
+
+#[tauri::command]
+fn run_slice_autofix_cmd(
+    state: tauri::State<'_, AppState>,
+    job_dir: String,
+) -> Result<serde_json::Value, String> {
+    let settings = state.settings.lock().clone();
+    train::run_slice_autofix(&job_dir, &settings)
 }
 
 #[tauri::command]
@@ -345,6 +361,7 @@ fn blend_embeddings(
     weight_b: Option<f64>,
     weight_c: Option<f64>,
     alpha: Option<f64>,
+    preview: Option<bool>,
 ) -> Result<String, String> {
     let settings = state.settings.lock().clone();
     let (wa, wb, wc) = if let (Some(a), Some(b)) = (weight_a, weight_b) {
@@ -358,7 +375,14 @@ fn blend_embeddings(
         return Err("weightA/weightB または alpha が必要です".into());
     };
     let c = embed_c.as_deref().filter(|s| !s.is_empty());
-    run_blend(&settings, &embed_a, &embed_b, c, wa, wb, wc, &output_name)
+    if preview.unwrap_or(false) {
+        let out_path = studio_cache_dir()
+            .join("blend_preview")
+            .join("preview.speaker.safetensors");
+        run_blend_to(&settings, &embed_a, &embed_b, c, wa, wb, wc, &out_path)
+    } else {
+        run_blend(&settings, &embed_a, &embed_b, c, wa, wb, wc, &output_name)
+    }
 }
 
 #[tauri::command]
@@ -805,36 +829,92 @@ fn run_ffmpeg_af(
     run_ffmpeg_export(settings, src, dest, Some(filter), &[])
 }
 
-/// Export audio applying volume + speed (atempo, pitch-preserving) via ffmpeg.
+/// Keep numeric targets in sync with `src/lib/audioFx.ts`.
+fn build_post_af(
+    volume: f64,
+    speed: f64,
+    fx: &project::AudioFx,
+    playback: bool,
+) -> String {
+    let fx = fx.clamped();
+    let speed = speed.clamp(0.5, 2.0);
+    let mut filters: Vec<String> = Vec::new();
+
+    if fx.denoise > 0.001 {
+        let nr = 4.0 + 16.0 * fx.denoise;
+        filters.push(format!("afftdn=nr={nr:.2}:nf=-55"));
+    }
+
+    if (speed - 1.0).abs() >= 0.001 {
+        filters.push(format!("atempo={speed}"));
+    }
+
+    if playback {
+        return filters.join(",");
+    }
+
+    if fx.highpass > 0.001 {
+        let hz = 40.0 + 110.0 * fx.highpass;
+        filters.push(format!("highpass=f={hz:.1}:poles=2"));
+    }
+    if fx.muffle > 0.001 {
+        let g = -8.0 * fx.muffle;
+        filters.push(format!("lowshelf=f=320:t=q:w=0.7:g={g:.2}"));
+    }
+    if fx.clarity > 0.001 {
+        let g = 6.0 * fx.clarity;
+        filters.push(format!("equalizer=f=3200:t=q:w=1.1:g={g:.2}"));
+    }
+    if fx.air > 0.001 {
+        let g = 5.0 * fx.air;
+        filters.push(format!("highshelf=f=9000:t=q:w=0.7:g={g:.2}"));
+    }
+    if fx.deesser > 0.001 {
+        let i = 0.12 + 0.75 * fx.deesser;
+        let m = 0.25 + 0.6 * fx.deesser;
+        filters.push(format!("deesser=i={i:.3}:m={m:.3}:f=0.5:s=o"));
+    }
+    if fx.flatten > 0.001 {
+        let thr_db = -6.0 - 18.0 * fx.flatten;
+        let thr_lin = 10f64.powf(thr_db / 20.0);
+        let ratio = 1.0 + 11.0 * fx.flatten;
+        let makeup = 8.0 * fx.flatten * (0.45 + 0.55 * fx.flatten);
+        filters.push(format!(
+            "acompressor=threshold={thr_lin:.5}:ratio={ratio:.2}:attack=4:release=120:makeup={makeup:.2}:knee=6"
+        ));
+    }
+    if (volume - 1.0).abs() >= 0.001 {
+        filters.push(format!("volume={volume}"));
+    }
+    let may_boost =
+        volume > 1.001 || fx.clarity > 0.001 || fx.air > 0.001 || fx.flatten > 0.001;
+    if may_boost {
+        filters.push("alimiter=limit=0.99:attack=5:release=50".into());
+    }
+
+    filters.join(",")
+}
+
+/// Export audio applying volume + speed + post-FX via ffmpeg.
 pub(crate) fn export_wav_adjusted_inner(
     settings: &AppSettings,
     src: String,
     dest: String,
     volume: f64,
     speed: f64,
+    audio_fx: &project::AudioFx,
     format: ExportAudioFormat,
     bitrate_kbps: Option<u32>,
 ) -> Result<(), String> {
     let dest = ensure_audio_ext(&dest, format);
     let vol_ok = (volume - 1.0).abs() < 0.001;
     let spd_ok = (speed - 1.0).abs() < 0.001;
-    if vol_ok && spd_ok && format == ExportAudioFormat::Wav {
+    if vol_ok && spd_ok && audio_fx.is_identity() && format == ExportAudioFormat::Wav {
         return copy_file(src, dest);
     }
 
-    let speed = speed.clamp(0.5, 2.0);
-    let mut filters = Vec::new();
-    if !vol_ok {
-        filters.push(format!("volume={volume}"));
-    }
-    if !spd_ok {
-        filters.push(format!("atempo={speed}"));
-    }
-    let af = if filters.is_empty() {
-        None
-    } else {
-        Some(filters.join(","))
-    };
+    let af = build_post_af(volume, speed, audio_fx, false);
+    let af = if af.is_empty() { None } else { Some(af) };
     run_ffmpeg_export(
         settings,
         &src,
@@ -851,12 +931,14 @@ fn export_wav_adjusted(
     dest: String,
     volume: f64,
     speed: f64,
+    audio_fx: Option<project::AudioFx>,
     format: Option<String>,
     bitrate_kbps: Option<u32>,
 ) -> Result<(), String> {
     let settings = state.settings.lock().clone();
     let fmt = resolve_export_format(format.as_deref(), &dest);
-    export_wav_adjusted_inner(&settings, src, dest, volume, speed, fmt, bitrate_kbps)
+    let fx = audio_fx.unwrap_or_default();
+    export_wav_adjusted_inner(&settings, src, dest, volume, speed, &fx, fmt, bitrate_kbps)
 }
 
 #[derive(serde::Deserialize)]
@@ -865,6 +947,8 @@ pub(crate) struct WavExportSeg {
     pub src: String,
     pub volume: f64,
     pub speed: f64,
+    #[serde(default)]
+    pub audio_fx: project::AudioFx,
 }
 
 /// Concatenate adjusted audio with optional silence between segments.
@@ -922,6 +1006,7 @@ pub(crate) fn export_wavs_concatenated_inner(
             path.display().to_string(),
             seg.volume,
             seg.speed,
+            &seg.audio_fx,
             ExportAudioFormat::Wav,
             None,
         ) {
@@ -1007,27 +1092,27 @@ pub(crate) fn export_wavs_concatenated_inner(
     Ok(())
 }
 
-/// Pitch-preserving speed adjust into a temp file for playback (volume left to WebAudio).
+/// Pitch-preserving speed + denoise into a temp file for playback (EQ left to WebAudio).
 #[tauri::command]
 fn prepare_playback_wav(
     state: tauri::State<'_, AppState>,
     src: String,
     speed: f64,
+    denoise: Option<f64>,
 ) -> Result<String, String> {
     let settings = state.settings.lock().clone();
     let speed = speed.clamp(0.5, 2.0);
-    if (speed - 1.0).abs() < 0.001 {
+    let denoise = denoise.unwrap_or(0.0);
+    let mut fx = project::AudioFx::default();
+    fx.denoise = denoise;
+    if (speed - 1.0).abs() < 0.001 && fx.denoise.abs() < 0.001 {
         return Ok(src);
     }
     let dest = studio_cache_dir()
         .join("playback")
         .join(format!("play_{}.wav", uuid::Uuid::new_v4()));
-    run_ffmpeg_af(
-        &settings,
-        &src,
-        &dest.display().to_string(),
-        &format!("atempo={speed}"),
-    )?;
+    let af = build_post_af(1.0, speed, &fx, true);
+    run_ffmpeg_af(&settings, &src, &dest.display().to_string(), &af)?;
     Ok(dest.display().to_string())
 }
 
@@ -1278,6 +1363,8 @@ pub fn run() {
             load_slice_review_log_cmd,
             save_slice_review_exclusions_cmd,
             complete_slice_review_cmd,
+            load_slice_autofix_log_cmd,
+            run_slice_autofix_cmd,
             list_vocal_separator_models,
             blend_embeddings,
             suggest_katakana,

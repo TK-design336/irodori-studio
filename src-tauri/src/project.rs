@@ -92,6 +92,74 @@ pub struct ProjectLine {
     pub generated_cfg_scale_caption: Option<f64>,
     pub volume: f64,
     pub speed: f64,
+    /// Post-generation tone / denoise. Missing in old projects → all off.
+    #[serde(default)]
+    pub audio_fx: AudioFx,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioFx {
+    #[serde(default)]
+    pub highpass: f64,
+    #[serde(default)]
+    pub muffle: f64,
+    #[serde(default)]
+    pub clarity: f64,
+    #[serde(default)]
+    pub air: f64,
+    #[serde(default)]
+    pub flatten: f64,
+    #[serde(default)]
+    pub deesser: f64,
+    #[serde(default)]
+    pub denoise: f64,
+}
+
+impl Default for AudioFx {
+    fn default() -> Self {
+        Self {
+            highpass: 0.0,
+            muffle: 0.0,
+            clarity: 0.0,
+            air: 0.0,
+            flatten: 0.0,
+            deesser: 0.0,
+            denoise: 0.0,
+        }
+    }
+}
+
+fn clamp01(x: f64) -> f64 {
+    if x.is_finite() {
+        x.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+impl AudioFx {
+    pub fn is_identity(&self) -> bool {
+        self.highpass.abs() < 0.001
+            && self.muffle.abs() < 0.001
+            && self.clarity.abs() < 0.001
+            && self.air.abs() < 0.001
+            && self.flatten.abs() < 0.001
+            && self.deesser.abs() < 0.001
+            && self.denoise.abs() < 0.001
+    }
+
+    pub fn clamped(&self) -> Self {
+        Self {
+            highpass: clamp01(self.highpass),
+            muffle: clamp01(self.muffle),
+            clarity: clamp01(self.clarity),
+            air: clamp01(self.air),
+            flatten: clamp01(self.flatten),
+            deesser: clamp01(self.deesser),
+            denoise: clamp01(self.denoise),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

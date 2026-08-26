@@ -313,6 +313,56 @@ pub fn ensure_alkana(settings: &AppSettings) -> Result<(), String> {
     ensure_packages(&python, "from alkana import get_kana", &["alkana"])
 }
 
+/// Silero VAD (ONNX CPU) for raw-audio slicing. Pins torch so pip does not
+/// replace the Irodori CUDA build when silero-vad pulls torchaudio.
+pub fn ensure_silero_vad(python: &PathBuf) -> Result<(), String> {
+    let check = "from silero_vad import load_silero_vad, get_speech_timestamps";
+    if python_ok(python, check) {
+        return Ok(());
+    }
+
+    eprintln!("[irodori-studio] installing silero-vad (ONNX CPU)…");
+    let before = read_torch_identity(python);
+    if let Some((ver, cuda)) = &before {
+        eprintln!("[irodori-studio] torch before silero-vad: {ver} (cuda={cuda})");
+    }
+
+    ensure_packages(python, "import numpy", &["numpy"])?;
+    ensure_packages(python, "import onnxruntime", &["onnxruntime"])?;
+    ensure_packages_best_effort(python, "import packaging", &["packaging"]);
+
+    let mut install_pkgs: Vec<String> = vec!["silero-vad".into()];
+    if let Some((ver, _)) = &before {
+        install_pkgs.push(format!("torch=={ver}"));
+    }
+    let pkgs_ref: Vec<&str> = install_pkgs.iter().map(|s| s.as_str()).collect();
+    pip_install(python, &pkgs_ref, &[])?;
+
+    if let Some((before_ver, before_cuda)) = before {
+        if let Some((after_ver, after_cuda)) = read_torch_identity(python) {
+            if after_ver != before_ver || after_cuda != before_cuda {
+                eprintln!(
+                    "[irodori-studio] WARNING: torch changed {before_ver}/{before_cuda} → {after_ver}/{after_cuda} after silero-vad; restoring"
+                );
+                if let Err(e) = restore_torch(python, &before_ver, &before_cuda) {
+                    eprintln!("[irodori-studio] WARNING: torch restore failed: {e}");
+                    return Err(format!(
+                        "silero-vad 導入後に torch が変わり、復元にも失敗しました: {e}"
+                    ));
+                }
+            }
+        }
+    }
+
+    if !python_ok(python, check) {
+        return Err(format!(
+            "silero-vad の import に失敗しました（{}）。onnxruntime と torch を確認してください",
+            python.display()
+        ));
+    }
+    Ok(())
+}
+
 pub fn ensure_asr_python_deps(settings: &AppSettings) -> Result<(), String> {
     let python = resolve_python(settings)?;
     // CPU-only Whisper (ctranslate2). Do not install CUDA builds.

@@ -1,12 +1,13 @@
-import { useCallback, useId, useMemo, useRef } from "react";
-import { BoundedSelect, type SelectOption } from "./BoundedSelect";
+import { useCallback, useId, useRef } from "react";
+import { SpeakerSelect } from "./SpeakerSelect";
+import type { SpeakerInfo } from "../types";
 
 export type BlendWeights = { a: number; b: number; c: number };
 
 type Pt = { x: number; y: number };
 
 type Props = {
-  options: SelectOption[];
+  speakers: SpeakerInfo[];
   embedA: string;
   embedB: string;
   embedC: string;
@@ -203,7 +204,7 @@ function tickAngle(from: Pt, to: Pt): number {
 }
 
 export function BlendTernaryPlot({
-  options,
+  speakers,
   embedA,
   embedB,
   embedC,
@@ -222,10 +223,6 @@ export function BlendTernaryPlot({
   const hasC = Boolean(embedC);
   const pct = formatBlendPercents(weights, hasC);
   const point = mix(clampBlendWeights(weights, hasC));
-  const cOptions = useMemo(
-    () => [{ value: "", label: "なし（2話者）" }, ...options.filter((o) => o.value !== "")],
-    [options],
-  );
 
   const applyClient = useCallback(
     (clientX: number, clientY: number) => {
@@ -373,11 +370,14 @@ export function BlendTernaryPlot({
               {hasC ? `${pct.c}%` : "—"}
             </span>
           </div>
-          <BoundedSelect
+          <SpeakerSelect
+            speakers={speakers}
             value={embedC}
-            options={cOptions}
             onChange={onEmbedC}
+            emptyLabel="なし（2話者）"
             placeholder="なし（2話者）"
+            searchable
+            searchPlaceholder="話者を検索…"
             className="blend-ternary-select"
             aria-label="話者 C"
           />
@@ -521,11 +521,14 @@ export function BlendTernaryPlot({
               {pct.b}%
             </span>
           </div>
-          <BoundedSelect
+          <SpeakerSelect
+            speakers={speakers}
             value={embedB}
-            options={options}
             onChange={onEmbedB}
+            emptyLabel="選択…"
             placeholder="選択…"
+            searchable
+            searchPlaceholder="話者を検索…"
             className="blend-ternary-select"
             aria-label="話者 B"
           />
@@ -541,11 +544,14 @@ export function BlendTernaryPlot({
               {pct.a}%
             </span>
           </div>
-          <BoundedSelect
+          <SpeakerSelect
+            speakers={speakers}
             value={embedA}
-            options={options}
             onChange={onEmbedA}
+            emptyLabel="選択…"
             placeholder="選択…"
+            searchable
+            searchPlaceholder="話者を検索…"
             className="blend-ternary-select"
             aria-label="話者 A"
           />
