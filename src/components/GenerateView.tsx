@@ -29,6 +29,7 @@ import {
   lineCfgScaleCaption,
   DEFAULT_CFG_SCALE_CAPTION,
   asrCerWarnThreshold,
+  generateCompactLinesOf,
   samplingEqualIgnoringSeed,
   normalizeLineVariants,
   syncLineWavPath,
@@ -469,6 +470,23 @@ function isDirty(
   return variants.some((v) => isVariantDirty(line, v, speakers));
 }
 
+/** Line-level 要再生成: every held WAV is stale. Mixed lines stay on per-track stale UI. */
+function allHeldAudioDirty(
+  line: ProjectLine,
+  speakers: SpeakerInfo[],
+): boolean {
+  const variants = normalizeLineVariants(line);
+  if (variants.length === 0) {
+    if (!line.wavPath) return false;
+    return isVariantDirty(
+      line,
+      { id: line.id, seed: 0, wavPath: line.wavPath },
+      speakers,
+    );
+  }
+  return variants.every((v) => isVariantDirty(line, v, speakers));
+}
+
 /** Persist a novel reading to the reading dict only if it is not already a candidate. */
 async function persistNovelReadingDict(
   specs: {
@@ -602,6 +620,10 @@ type AsrLineResult = {
   /** Line changed / regenerated since last verify */
   needsReverify?: boolean;
 };
+
+function asrIsAlert(result: AsrLineResult): boolean {
+  return !!(result.needsReverify || result.error || result.warn);
+}
 
 function AsrBadge({ result }: { result: AsrLineResult }) {
   if (result.needsReverify) {
@@ -5822,7 +5844,7 @@ export function GenerateView({
             <div
               className={`line-list ${draggingIds.length ? "is-reordering" : ""}${
                 rangeSelecting ? " is-selecting" : ""
-              }`}
+              }${generateCompactLinesOf(settings) ? " compact-lines" : ""}`}
               ref={lineListRef}
             >
               {displayLines.map((line, i) => {
@@ -5835,8 +5857,8 @@ export function GenerateView({
                   lineVariants.length > 0 &&
                   !!line.wavPath &&
                   wavPathMatchesLine(line);
-                const lineIsDirty = isDirty(line, speakers);
-                const dirtyGroups = lineIsDirty
+                const lineNeedsRegen = allHeldAudioDirty(line, speakers);
+                const dirtyGroups = lineNeedsRegen
                   ? lineDirtyGroups(line, speakers)
                   : [];
                 const showLineSeek =
@@ -5853,6 +5875,9 @@ export function GenerateView({
                   lineVariants.length > 1 &&
                   keptVariantIds.length > 0 &&
                   keptVariantIds.length < lineVariants.length;
+                const compactUnselected =
+                  generateCompactLinesOf(settings) && !isSelectedLine;
+                const asrResult = asrByLine[line.id];
                 return (
                   <div
                     key={line.id}
@@ -5862,7 +5887,7 @@ export function GenerateView({
                       selectedId === line.id ? "active" : ""
                     } ${generating ? "generating" : ""} ${
                       draggingIds.includes(line.id) ? "dragging" : ""
-                    }`}
+                    }${compactUnselected ? " compact-unselected" : ""}`}
                     onPointerDown={(e) => onLinePointerDown(e, line.id, i)}
                       onClick={() => {
                       if (lineGestureConsumedRef.current) {
@@ -5875,6 +5900,7 @@ export function GenerateView({
                     }}
                   >
                     {generating ? <GenRing /> : null}
+                    <div className="line-item-body">
                     <div className="line-meta">
                       <span
                         className="drag-handle"
@@ -5909,6 +5935,7 @@ export function GenerateView({
                           });
                         }}
                       />
+                      <div className="line-meta-trail">
                       <SpeakerApplyMenu
                         lineNumber={i + 1}
                         disabled={busy}
@@ -5916,7 +5943,17 @@ export function GenerateView({
                         onApplyParity={() => applySpeakerToParity(line, i)}
                         onApplyFromHere={() => applySpeakerFromHere(line, i)}
                       />
-                      {lineVariants.length > 1 &&
+                      <div className="line-meta-status">
+                      {lineNeedsRegen && (
+                        <span className="badge dirty asr-badge">
+                          要再生成
+                          <DirtyDiffTooltip groups={dirtyGroups} />
+                        </span>
+                      )}
+                      {asrResult && asrIsAlert(asrResult) && (
+                          <AsrBadge result={asrResult} />
+                        )}
+                      {lineVariants.length > 0 &&
                         (canCullOthers ? (
                           <button
                             type="button"
@@ -5939,25 +5976,15 @@ export function GenerateView({
                             {lineVariants.length}本保持中
                           </span>
                         ))}
-                      {line.wavPath &&
-                        wavPathMatchesLine(line) &&
-                        !lineIsDirty && (
-                        <span className="badge">WAV</span>
-                      )}
-                      {line.wavPath &&
-                        (!wavPathMatchesLine(line) || lineIsDirty) && (
-                        <span className="badge dirty asr-badge">
-                          要再生成
-                          <DirtyDiffTooltip groups={dirtyGroups} />
-                        </span>
-                      )}
-                      {asrByLine[line.id] && (
-                        <AsrBadge result={asrByLine[line.id]} />
-                      )}
+                      {asrResult && !asrIsAlert(asrResult) && (
+                          <AsrBadge result={asrResult} />
+                        )}
+                      </div>
+                      <div className="line-meta-hover">
                       <div className="line-actions">
                         <button
                           type="button"
-                          className={`line-btn${
+                          className={`line-btn line-btn-play${
                             isSelectedLine && !hasKeptAudio && !generating
                               ? " action-aura"
                               : ""
@@ -6022,7 +6049,7 @@ export function GenerateView({
                         </button>
                         <button
                           type="button"
-                          className="line-btn danger"
+                          className="line-btn line-btn-delete danger"
                           title="削除"
                           onClick={(e) => {
                             e.stopPropagation();
@@ -6031,6 +6058,8 @@ export function GenerateView({
                         >
                           <IconTrash />
                         </button>
+                      </div>
+                      </div>
                       </div>
                     </div>
                     <AutoTextarea
@@ -6239,6 +6268,7 @@ export function GenerateView({
                         })}
                       </div>
                     ) : null}
+                    </div>
                   </div>
                 );
               })}

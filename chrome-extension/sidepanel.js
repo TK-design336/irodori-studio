@@ -184,6 +184,28 @@ function downloadBlob(buf, mime, filename) {
   URL.revokeObjectURL(url);
 }
 
+/** Page title shown as 読み上げ中: 「…」 — prefer live status, then last extract. */
+function concatPageTitle() {
+  const live = String(lastPlayerStatus?.title || "").trim();
+  if (live) return live;
+  return String(lastExtract?.title || "").trim();
+}
+
+const CONCAT_NAME_MAX = 80;
+
+function concatDownloadName(title, format) {
+  const ext = String(format || "wav").replace(/[^a-z0-9]/gi, "") || "wav";
+  let name = String(title || "")
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[. ]+$/g, "");
+  if (name.length > CONCAT_NAME_MAX) {
+    name = name.slice(0, CONCAT_NAME_MAX).trim().replace(/[. ]+$/g, "");
+  }
+  return `${name || "irodori"}.${ext}`;
+}
+
 async function loadSettings() {
   const stored = await chrome.storage.local.get(Object.keys(DEFAULTS));
   els.baseUrl.value = stored.baseUrl || DEFAULTS.baseUrl;
@@ -607,7 +629,7 @@ async function downloadJobConcat(jobId, format, title) {
     body: { silenceMs: 300, format },
     expectBinary: true,
   });
-  downloadBlob(buf, mime, `${(title || "irodori").slice(0, 40)}.${format}`);
+  downloadBlob(buf, mime, concatDownloadName(title, format));
 }
 
 async function concatSave() {
@@ -639,7 +661,7 @@ async function concatSave() {
   const speaker = els.speaker.value;
   if (!speaker) throw new Error("話者を選択してください");
   const format = els.concatFormat.value || "wav";
-  const title = lastExtract.title;
+  const title = concatPageTitle();
 
   // During reading: reuse session job audio (no re-synth of finished lines)
   const sessionJobId = lastPlayerStatus?.jobId;

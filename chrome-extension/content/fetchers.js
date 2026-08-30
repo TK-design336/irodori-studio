@@ -125,6 +125,9 @@
 
   function stripSpeech(text) {
     const DECOR = "[-–—―─━=_＊*☆★●○◆◇■□▪▫※~～♡♥♪♫#＃▲▼△▽]";
+    // Geometry / dingbats / emoji TTS tends to read as words. Keep in sync
+    // with chrome-extension/lib/sanitizeSpeech.js.
+    const NOISY = /[\u25A0-\u25FF\u2600-\u26FF\u2700-\u27BF\u2B00-\u2BFF※＊＃〓]/g;
     let t = String(text || "")
       .replace(/^\uFEFF/, "")
       .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
@@ -138,6 +141,9 @@
       .replace(/!\[[^\]]*\]\([^)]+\)/g, " ")
       .replace(/［(?:挿絵|画像|図)］|【(?:挿絵|画像|図)】|\[(?:挿絵|画像|図|image|img|pic)\]/gi, " ")
       .replace(/［(?:広告|ＡＤ|AD|PR|ＰＲ)］|【(?:広告|ＡＤ|AD|PR|ＰＲ)】|\[(?:PR|AD|広告)\]/gi, " ")
+      .replace(/\p{Extended_Pictographic}/gu, "")
+      .replace(/[\uFE0E\uFE0F]/g, "")
+      .replace(NOISY, "")
       .replace(/\r\n/g, "\n")
       .replace(/\r/g, "\n")
       .replace(/-{3,}/g, " ")
@@ -417,6 +423,24 @@
     }
   }
 
+  async function fetchPlain(url) {
+    try {
+      const res = await fetch(url, { credentials: "include", redirect: "follow" });
+      const contentType = res.headers.get("content-type") || "";
+      const text = await res.text();
+      return { ok: res.ok, status: res.status, contentType, text };
+    } catch {
+      return { ok: false, status: 0, contentType: "", text: "" };
+    }
+  }
+
+  function looksLikeHtmlDocument(text, contentType) {
+    const ct = String(contentType || "").toLowerCase();
+    if (ct.includes("text/html")) return true;
+    const head = String(text || "").slice(0, 256).trim();
+    return /^<!DOCTYPE html/i.test(head) || /^<html[\s>]/i.test(head);
+  }
+
   async function collectPages(startDoc, startUrl, extractFn) {
     const seen = new Set([absUrl(startUrl)]);
     const parts = [];
@@ -454,6 +478,8 @@
       contentSelector: partial.contentSelector || null,
       pagesFetched: partial.pagesFetched || 1,
       family: partial.family || null,
+      noFallback: !!partial.noFallback,
+      error: partial.error || null,
     };
   }
 
@@ -1108,6 +1134,117 @@
     });
   }
 
+  /* ---------- Google Docs: canvas has no text; use same-origin export ---------- */
+
+  function parseGoogleDocument(url) {
+    let u;
+    try {
+      u = new URL(url || location.href);
+    } catch {
+      return null;
+    }
+    const host = u.hostname.replace(/^www\./i, "").toLowerCase();
+    if (host !== "docs.google.com") return null;
+    const m = u.pathname.match(
+      /^\/(?:a\/[^/]+\/)?document\/(?:u\/(\d+)\/)?d\/(?!e\/)([a-zA-Z0-9_-]{10,})(?:\/([^/?#]*))?/i,
+    );
+    if (!m) return null;
+    const action = String(m[3] || "").toLowerCase();
+    if (/^(pub|pubhtml)$/.test(action)) return null;
+    return { userIndex: m[1] || null, id: m[2], action };
+  }
+
+  function googleDocTitle(doc) {
+    const input = firstEl(doc, ["input.docs-title-input", 'input[class*="docs-title"]']);
+    if (input) {
+      const v = String(input.value || "").trim();
+      if (v) return v;
+    }
+    const label = firstEl(doc, [".docs-title-inner", ".docs-title-input-label-inner"]);
+    if (label) {
+      const v = String(label.textContent || "").replace(/\s+/g, " ").trim();
+      if (v) return v;
+    }
+    const raw = String((doc && doc.title) || "").trim();
+    return (
+      raw.replace(/\s*[-–—|｜]\s*Google\s*(ドキュメント|Docs|Documents?)\s*$/i, "").trim() || raw
+    );
+  }
+
+  function googleDocExportUrls(info) {
+    const origin = location.origin || "https://docs.google.com";
+    const path =
+      info.userIndex != null
+        ? `/document/u/${info.userIndex}/d/${info.id}`
+        : `/document/d/${info.id}`;
+    return [
+      `${origin}${path}/export?format=txt`,
+      `${origin}/feeds/download/documents/export/Export?id=${encodeURIComponent(info.id)}&exportFormat=txt`,
+    ];
+  }
+
+  function googleDocExportError(status, sawHtml, networkError) {
+    if (status === 401 || status === 403) {
+      return "この Google ドキュメントは書き出せません。コピー禁止の共有設定か、閲覧権限がない可能性があります";
+    }
+    if (sawHtml) {
+      return "この Google ドキュメントは書き出せません。ログイン状態か、コピー禁止の共有設定を確認してください";
+    }
+    if (networkError) {
+      return "Google ドキュメントの書き出しに失敗しました";
+    }
+    return "Google ドキュメントの本文を取得できませんでした";
+  }
+
+  async function extractGoogleDocs(ctx) {
+    const url = ctx.url || location.href;
+    const info = parseGoogleDocument(url);
+    if (!info) return null;
+    const title = googleDocTitle(ctx.document);
+    const fail = (error) =>
+      result({
+        title,
+        text: "",
+        source: "fetcher:gdocs:export",
+        contentSelector: "__none__",
+        family: "gdocs",
+        noFallback: true,
+        confident: true,
+        error,
+      });
+
+    let lastStatus = 0;
+    let sawHtml = false;
+    let networkError = false;
+    for (const exportUrl of googleDocExportUrls(info)) {
+      const got = await fetchPlain(exportUrl);
+      lastStatus = got.status;
+      if (!got.ok && got.status === 0) {
+        networkError = true;
+        continue;
+      }
+      if (!got.ok) continue;
+      if (looksLikeHtmlDocument(got.text, got.contentType)) {
+        sawHtml = true;
+        continue;
+      }
+      const text = stripSpeech(got.text);
+      if (!text) {
+        return fail("このドキュメントに読み上げる本文がありません");
+      }
+      return result({
+        title,
+        text,
+        source: "fetcher:gdocs:export",
+        contentSelector: "__none__",
+        family: "gdocs",
+        noFallback: true,
+        confident: true,
+      });
+    }
+    return fail(googleDocExportError(lastStatus, sawHtml, networkError));
+  }
+
   /* ---------- registry ---------- */
 
   function familyOf(url) {
@@ -1119,6 +1256,7 @@
         return "";
       }
     })();
+    if (parseGoogleDocument(url)) return "gdocs";
     if (h.includes("wikipedia.org") && /\/wiki\//.test(path)) return "wikipedia";
     if (h.endsWith("aozora.gr.jp") && /\/cards\//.test(path)) return "aozora";
     if (novelSiteFor(url)) return "novel";
@@ -1154,6 +1292,7 @@
     const kind = familyOf(url);
     if (!kind) return null;
     const bag = { url, document: (ctx && ctx.document) || document, profile: ctx && ctx.profile };
+    if (kind === "gdocs") return extractGoogleDocs(bag);
     if (kind === "wikipedia") return extractWikipedia(bag);
     if (kind === "aozora") return extractAozora(bag);
     if (kind === "novel") return extractNovel(bag);
@@ -1174,5 +1313,6 @@
     applyRuby,
     stripSpeech,
     uniqueTopNodes,
+    parseGoogleDocument,
   };
 })();

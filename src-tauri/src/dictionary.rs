@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -57,6 +58,46 @@ pub struct Dictionaries {
     /// Deprecated: merged into `reading` on load.
     #[serde(default)]
     pub homograph: Vec<HomographEntry>,
+    /// Seeded version of default symbol→empty replace entries.
+    #[serde(default)]
+    pub replace_defaults_version: u32,
+}
+
+const REPLACE_DEFAULTS_VERSION: u32 = 1;
+
+/// Decorative symbols TTS tends to read as words. Keep in sync with
+/// `DEFAULT_SYMBOL_REPLACE_FROMS` in src/lib/dictionaries.ts.
+fn default_symbol_replace_entries() -> Vec<ReplaceEntry> {
+    const SYMBOLS: &[&str] = &[
+        "■", "□", "▪", "▫", "●", "○", "◆", "◇", "★", "☆", "▲", "▼", "△", "▽", "※", "♪",
+        "♫", "♡", "♥", "◎", "〓", "＊", "＃",
+    ];
+    SYMBOLS
+        .iter()
+        .map(|from| ReplaceEntry {
+            id: format!("default-sym-{from}"),
+            from: (*from).to_string(),
+            to: String::new(),
+            enabled: true,
+            auto_replace: false,
+        })
+        .collect()
+}
+
+/// Add missing default symbol→empty replace rows once per version bump.
+fn merge_default_symbol_replaces(d: &mut Dictionaries) -> bool {
+    if d.replace_defaults_version >= REPLACE_DEFAULTS_VERSION {
+        return false;
+    }
+    let existing: HashSet<String> = d.replace.iter().map(|e| e.from.clone()).collect();
+    for e in default_symbol_replace_entries() {
+        if e.from.is_empty() || existing.contains(&e.from) {
+            continue;
+        }
+        d.replace.push(e);
+    }
+    d.replace_defaults_version = REPLACE_DEFAULTS_VERSION;
+    true
 }
 
 pub fn split_readings(raw: &str) -> Vec<String> {
@@ -150,7 +191,9 @@ pub fn load_dictionaries() -> Dictionaries {
     } else {
         Dictionaries::default()
     };
-    if migrate_homograph_into_reading(&mut d) {
+    let mut mutated = migrate_homograph_into_reading(&mut d);
+    mutated = merge_default_symbol_replaces(&mut d) || mutated;
+    if mutated {
         let _ = save_dictionaries(&d);
     }
     d

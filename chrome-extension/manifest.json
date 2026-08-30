@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Irodori Studio Reader",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "ページ本文を Irodori Studio で連続読み上げ",
   "permissions": [
     "sidePanel",

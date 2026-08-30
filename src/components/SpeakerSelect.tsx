@@ -1,14 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { BoundedSelect } from "./BoundedSelect";
 import { SpeakerSortPanel } from "./SpeakerSortPanel";
-import { useSpeakerSort } from "./SpeakerSortContext";
+import { SpeakerSortProvider, useSpeakerSort } from "./SpeakerSortContext";
 import type { SpeakerInfo } from "../types";
 import { speakerOptionLabel } from "../types";
-import {
-  collectSpeakerTags,
-  sortAndFilterSpeakers,
-  speakerSortMeta,
-} from "../lib/speakerSort";
+import { sortAndFilterSpeakers, speakerSortMeta } from "../lib/speakerSort";
 
 type Props = {
   speakers: SpeakerInfo[];
@@ -26,7 +22,15 @@ type Props = {
   onClick?: (e: React.MouseEvent) => void;
 };
 
-export function SpeakerSelect({
+export function SpeakerSelect(props: Props) {
+  return (
+    <SpeakerSortProvider persist={false}>
+      <SpeakerSelectInner {...props} />
+    </SpeakerSortProvider>
+  );
+}
+
+function SpeakerSelectInner({
   speakers,
   value,
   onChange,
@@ -45,13 +49,10 @@ export function SpeakerSelect({
   const [menuOpen, setMenuOpen] = useState(false);
 
   useEffect(() => {
-    if (!menuOpen) setSortFlyoutOpen(false);
-  }, [menuOpen]);
-
-  const availableTags = useMemo(
-    () => collectSpeakerTags(speakers),
-    [speakers],
-  );
+    if (menuOpen) return;
+    setSortFlyoutOpen(false);
+    sort.resetSort();
+  }, [menuOpen, sort.resetSort]);
 
   const options = useMemo(() => {
     const sorted = sortAndFilterSpeakers(
@@ -123,7 +124,7 @@ export function SpeakerSelect({
           ✕
         </button>
       </div>
-      <SpeakerSortPanel compact availableTags={availableTags} />
+      <SpeakerSortPanel compact speakers={speakers} />
     </div>
   ) : null;
 

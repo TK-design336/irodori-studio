@@ -20,6 +20,7 @@ import {
   DEFAULT_SLICE_AUTO_FIX,
   DEFAULT_VOCAL_SEPARATOR_MODEL,
   sliceReviewSettings,
+  generateCompactLinesOf,
 } from "../types";
 import {
   DEFAULT_EXPORT_FILENAME_PARTS,
@@ -334,10 +335,16 @@ export function SettingsView({
           ),
           accentLight: normalizeAccentLight(next.accentLight),
           accentDark: normalizeAccentDark(next.accentDark),
+          generateCompactLines: generateCompactLinesOf(next),
         },
       });
-      setDraft(saved);
-      onSaved(saved);
+      // Keep the flag even if an older backend omits it from the round-trip.
+      const merged: AppSettings = {
+        ...saved,
+        generateCompactLines: generateCompactLinesOf(next),
+      };
+      setDraft(merged);
+      onSaved(merged);
       setMsg(okMsg);
       onValidate();
     } catch (e) {
@@ -762,6 +769,29 @@ export function SettingsView({
                 : ""}
             </p>
           </div>
+          <label>
+            <input
+              type="checkbox"
+              checked={generateCompactLinesOf(draft)}
+              disabled={busy}
+              onChange={(e) => {
+                const checked = e.target.checked;
+                const next = { ...draft, generateCompactLines: checked };
+                setDraft(next);
+                void persist(
+                  next,
+                  checked
+                    ? "コンパクト表示をオンにしました"
+                    : "コンパクト表示をオフにしました",
+                );
+              }}
+            />
+            生成のコンパクト表示
+          </label>
+          <p className="hint">
+            切り替えた時点で保存されます（既定はオン）。非選択の行を番号・本文・話者の1行にまとめます。選択中の行は従来どおりで、ホバーすると
+            保持件数や操作ボタンなどが話者の右から現れます。
+          </p>
           <div className="row">
             <button
               type="button"

@@ -168,6 +168,8 @@
       contentSelector: extra.contentSelector || null,
       pagesFetched: extra.pagesFetched || 1,
       family: extra.family || null,
+      noFallback: !!extra.noFallback,
+      error: extra.error || null,
     };
   }
 
@@ -187,6 +189,27 @@
       } catch (e) {
         fetched = null;
       }
+    }
+
+    if (
+      !fetched &&
+      F &&
+      typeof F.parseGoogleDocument === "function" &&
+      F.parseGoogleDocument(url)
+    ) {
+      fetched = {
+        title: document.title || "",
+        text: "",
+        source: "fetcher:gdocs:export",
+        family: "gdocs",
+        noFallback: true,
+        contentSelector: "__none__",
+        error: "Google ドキュメントの本文を取得できませんでした",
+      };
+    }
+
+    if (fetched && fetched.noFallback) {
+      return pack(url, fetched.title, fetched.text, fetched);
     }
 
     if (fetched && fetched.confident && fetched.text && fetched.text.length >= 80) {

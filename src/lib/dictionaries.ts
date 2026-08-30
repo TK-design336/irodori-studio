@@ -24,11 +24,60 @@ export type Dictionaries = {
   reading: ReadingDictEntry[];
   /** @deprecated migrated into reading */
   homograph?: HomographEntry[];
+  /**
+   * Seeded version of default symbol→empty replace entries.
+   * Bump in lockstep with `REPLACE_DEFAULTS_VERSION` in dictionary.rs.
+   */
+  replaceDefaultsVersion?: number;
 };
+
+/**
+ * Decorative symbols that TTS tends to read as words (くろしかく, ほし, …).
+ * Default 一括置換 candidates with empty `to`. Keep in sync with
+ * `default_symbol_replace_entries` in src-tauri/src/dictionary.rs.
+ */
+export const DEFAULT_SYMBOL_REPLACE_FROMS = [
+  "■",
+  "□",
+  "▪",
+  "▫",
+  "●",
+  "○",
+  "◆",
+  "◇",
+  "★",
+  "☆",
+  "▲",
+  "▼",
+  "△",
+  "▽",
+  "※",
+  "♪",
+  "♫",
+  "♡",
+  "♥",
+  "◎",
+  "〓",
+  "＊",
+  "＃",
+] as const;
+
+export const REPLACE_DEFAULTS_VERSION = 1;
+
+export function defaultSymbolReplaceEntries(): ReplaceEntry[] {
+  return DEFAULT_SYMBOL_REPLACE_FROMS.map((from) => ({
+    id: `default-sym-${from}`,
+    from,
+    to: "",
+    enabled: true,
+    autoReplace: false,
+  }));
+}
 
 export const emptyDictionaries = (): Dictionaries => ({
   replace: [],
   reading: [],
+  replaceDefaultsVersion: 0,
 });
 
 export function newDictId(): string {

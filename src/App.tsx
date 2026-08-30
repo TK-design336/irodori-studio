@@ -135,7 +135,11 @@ function App() {
       const saved = await invoke<AppSettings>("set_settings", {
         settings: updated,
       });
-      setSettings(saved);
+      setSettings({
+        ...saved,
+        generateCompactLines:
+          saved.generateCompactLines ?? updated.generateCompactLines,
+      });
     } catch {
       /* keep optimistic UI */
     }

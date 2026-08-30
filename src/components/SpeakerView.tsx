@@ -11,7 +11,7 @@ import { useSpeakerSort } from "./SpeakerSortContext";
 import type { SpeakerInfo } from "../types";
 import { defaultSampling, speakerRealName } from "../types";
 import { noteSpeakerRename } from "../lib/speakerResolve";
-import { sortAndFilterSpeakers, collectSpeakerTags, speakerMatchesQuery } from "../lib/speakerSort";
+import { sortAndFilterSpeakers, speakerMatchesQuery } from "../lib/speakerSort";
 
 type Props = {
   speakers: SpeakerInfo[];
@@ -155,11 +155,6 @@ export function SpeakerView({ speakers, onSpeakersChanged, isV4 }: Props) {
   const searchedSpeakers = useMemo(
     () => visibleSpeakers.filter((sp) => speakerMatchesQuery(sp, listQuery)),
     [visibleSpeakers, listQuery],
-  );
-
-  const availableTags = useMemo(
-    () => collectSpeakerTags(speakers),
-    [speakers],
   );
 
   const nameA = embedSpeakers.find((s) => s.embedPath === embedA)?.name ?? "A";
@@ -1018,7 +1013,7 @@ export function SpeakerView({ speakers, onSpeakersChanged, isV4 }: Props) {
             {!listAsideOpen && (
               <>
                 <div className="speaker-list-toolbar">
-                  <SpeakerSortPanel availableTags={availableTags} />
+                  <SpeakerSortPanel speakers={speakers} />
                 </div>
                 {listSearchField}
                 <div className="profile-list profile-list-scrollable">
@@ -1135,7 +1130,7 @@ export function SpeakerView({ speakers, onSpeakersChanged, isV4 }: Props) {
           </header>
           <div className="panel-body speaker-list-aside-body">
             <div className="speaker-list-toolbar">
-              <SpeakerSortPanel availableTags={availableTags} />
+              <SpeakerSortPanel speakers={speakers} />
             </div>
             {listSearchField}
             <div className="profile-list profile-list-aside-scroll">

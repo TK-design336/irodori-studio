@@ -34,6 +34,7 @@ Phase 2–4: 本文抽出・連続読み上げ・サイト別プロファイル�
 | ニュース | Yahoo!ニュース / NHK | ペイウォール検知を共有 |
 | 長文 | 文春 / 東洋経済 / ダイヤモンド / 現代ビジネス / PRESIDENT | ページ送りを同一オリジン fetch で結合 |
 | ブログ・UGC | note / はてなダイアリー・ブログ / 匿名ダイアリー | note は `/api/v3/notes` を優先 |
+| Google ドキュメント | docs.google.com/document | Canvas 本文は `/export?format=txt` で取得。コピー禁止は不可 |
 | その他 | Wikipedia など | 脚注・関連項目以降は切る |
 
 有料記事は公開範囲だけ読み上げ、警告を出す。

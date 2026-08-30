@@ -1,19 +1,24 @@
-import { useEffect, useRef, useState } from "react";
-import { KIND_FILTERS, SORT_BUTTONS } from "../lib/speakerSort";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  collectSpeakerTagCounts,
+  KIND_FILTERS,
+  SORT_BUTTONS,
+} from "../lib/speakerSort";
 import { useSpeakerSort } from "./SpeakerSortContext";
+import type { SpeakerInfo } from "../types";
 
 type Props = {
   className?: string;
   /** Compact layout for dropdown flyouts */
   compact?: boolean;
-  /** All known tags (for the tag filter dropdown). */
-  availableTags: string[];
+  /** Speakers used to list tags and per-tag counts. */
+  speakers: SpeakerInfo[];
 };
 
 export function SpeakerSortPanel({
   className = "",
   compact = false,
-  availableTags,
+  speakers,
 }: Props) {
   const {
     sortKey,
@@ -41,6 +46,14 @@ export function SpeakerSortPanel({
     return () => document.removeEventListener("pointerdown", onPointerDown);
   }, [tagMenuOpen]);
 
+  const tagItems = useMemo(
+    () => collectSpeakerTagCounts(speakers),
+    [speakers],
+  );
+  const availableTags = useMemo(
+    () => tagItems.map((x) => x.tag),
+    [tagItems],
+  );
   const allSelected = areAllTagsSelected(availableTags);
   const tagActive =
     availableTags.length > 0 &&
@@ -108,7 +121,7 @@ export function SpeakerSortPanel({
               {availableTags.length === 0 ? (
                 <p className="hint speaker-tag-filter-empty">タグなし</p>
               ) : (
-                availableTags.map((tag) => {
+                tagItems.map(({ tag, count }) => {
                   const on = isTagSelected(tag, availableTags);
                   return (
                     <button
@@ -122,7 +135,10 @@ export function SpeakerSortPanel({
                       <span className="speaker-tag-filter-check" aria-hidden>
                         {on ? "✓" : ""}
                       </span>
-                      {tag}
+                      <span className="speaker-tag-filter-label">
+                        {tag}
+                        <span className="speaker-tag-filter-count"> ({count})</span>
+                      </span>
                     </button>
                   );
                 })

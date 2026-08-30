@@ -91,12 +91,23 @@ export function speakerMatchesQuery(sp: SpeakerInfo, query: string): boolean {
   return false;
 }
 
-export function collectSpeakerTags(speakers: SpeakerInfo[]): string[] {
-  const set = new Set<string>();
+export function collectSpeakerTagCounts(
+  speakers: SpeakerInfo[],
+): { tag: string; count: number }[] {
+  const counts = new Map<string, number>();
   for (const s of speakers) {
-    for (const t of speakerTags(s)) set.add(t);
+    const unique = new Set(speakerTags(s));
+    for (const t of unique) {
+      counts.set(t, (counts.get(t) ?? 0) + 1);
+    }
   }
-  return [...set].sort((a, b) => a.localeCompare(b, "ja"));
+  return [...counts.entries()]
+    .sort(([a], [b]) => a.localeCompare(b, "ja"))
+    .map(([tag, count]) => ({ tag, count }));
+}
+
+export function collectSpeakerTags(speakers: SpeakerInfo[]): string[] {
+  return collectSpeakerTagCounts(speakers).map((x) => x.tag);
 }
 
 function cmpOptionalOrder(

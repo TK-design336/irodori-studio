@@ -18,6 +18,20 @@ const AD_PLACEHOLDER =
 const DECOR_CLASS = "[-–—―─━=_＊*☆★●○◆◇■□▪▫※~～♡♥♪♫#＃▲▼△▽]";
 
 /**
+ * Geometry / dingbats / emoji that TTS tends to read as words
+ * (くろしかく, ほし, …). Keep in sync with fetchers.js `stripSpeech`.
+ * Does not include linguistic punctuation (。・…ー―) or ASCII - = * #.
+ */
+const NOISY_SYMBOLS = /[\u25A0-\u25FF\u2600-\u26FF\u2700-\u27BF\u2B00-\u2BFF※＊＃〓]/g;
+
+function stripNoisySymbols(t) {
+  return t
+    .replace(/\p{Extended_Pictographic}/gu, "")
+    .replace(/[\uFE0E\uFE0F]/g, "")
+    .replace(NOISY_SYMBOLS, "");
+}
+
+/**
  * @param {string} text
  * @returns {string}
  */
@@ -35,6 +49,8 @@ export function sanitizeForSpeech(text) {
     .replace(/!\[[^\]]*\]\([^)]+\)/g, " ")
     .replace(IMAGE_PLACEHOLDER, " ")
     .replace(AD_PLACEHOLDER, " ");
+
+  t = stripNoisySymbols(t);
 
   t = t.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 

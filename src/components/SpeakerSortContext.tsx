@@ -23,9 +23,10 @@ type SpeakerSortContextValue = SpeakerSortState & {
   setSortDir: (dir: SortDir) => void;
   clickSort: (key: SortKey) => void;
   toggleKindFilter: (key: KindFilterKey) => void;
-  /** Toggle one tag. Pass the full available tag list so "all" can expand to concrete set. */
+  /** Toggle one tag. From the "all selected" state, clicking a tag isolates that tag. */
   toggleTagFilter: (tag: string, allTags: string[]) => void;
   selectAllTags: () => void;
+  resetSort: () => void;
   isTagSelected: (tag: string, allTags: string[]) => boolean;
   areAllTagsSelected: (allTags: string[]) => boolean;
   sortDirMark: (key: SortKey) => string;
@@ -43,15 +44,19 @@ function isSortDir(v: unknown): v is SortDir {
   return v === "asc" || v === "desc";
 }
 
+function defaultSortState(): SpeakerSortState {
+  return {
+    ...DEFAULT_SPEAKER_SORT,
+    kindFilter: { ...DEFAULT_KIND_FILTER },
+    tagFilter: null,
+  };
+}
+
 function loadStored(): SpeakerSortState {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) {
-      return {
-        ...DEFAULT_SPEAKER_SORT,
-        kindFilter: { ...DEFAULT_KIND_FILTER },
-        tagFilter: null,
-      };
+      return defaultSortState();
     }
     const parsed = JSON.parse(raw) as Partial<SpeakerSortState> & {
       sortKey?: string;
@@ -79,24 +84,29 @@ function loadStored(): SpeakerSortState {
       tagFilter,
     };
   } catch {
-    return {
-      ...DEFAULT_SPEAKER_SORT,
-      kindFilter: { ...DEFAULT_KIND_FILTER },
-      tagFilter: null,
-    };
+    return defaultSortState();
   }
 }
 
-export function SpeakerSortProvider({ children }: { children: ReactNode }) {
-  const [state, setState] = useState<SpeakerSortState>(loadStored);
+export function SpeakerSortProvider({
+  children,
+  persist = true,
+}: {
+  children: ReactNode;
+  persist?: boolean;
+}) {
+  const [state, setState] = useState<SpeakerSortState>(() =>
+    persist ? loadStored() : defaultSortState(),
+  );
 
   useEffect(() => {
+    if (!persist) return;
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     } catch {
       /* */
     }
-  }, [state]);
+  }, [state, persist]);
 
   const setSortKey = useCallback((key: SortKey) => {
     setState((prev) => ({ ...prev, sortKey: key }));
@@ -129,8 +139,21 @@ export function SpeakerSortProvider({ children }: { children: ReactNode }) {
     setState((prev) => ({ ...prev, tagFilter: null }));
   }, []);
 
+  const resetSort = useCallback(() => {
+    setState(defaultSortState());
+  }, []);
+
   const toggleTagFilter = useCallback((tag: string, allTags: string[]) => {
     setState((prev) => {
+      const allSelected =
+        prev.tagFilter === null ||
+        (allTags.length > 0 &&
+          prev.tagFilter.length === allTags.length &&
+          allTags.every((t) => prev.tagFilter!.includes(t)));
+      // From "all selected", clicking a tag shows only that tag.
+      if (allSelected && allTags.length > 1) {
+        return { ...prev, tagFilter: [tag] };
+      }
       const current =
         prev.tagFilter === null ? [...allTags] : [...prev.tagFilter];
       const idx = current.indexOf(tag);
@@ -182,6 +205,7 @@ export function SpeakerSortProvider({ children }: { children: ReactNode }) {
       toggleKindFilter,
       toggleTagFilter,
       selectAllTags,
+      resetSort,
       isTagSelected,
       areAllTagsSelected,
       sortDirMark,
@@ -194,6 +218,7 @@ export function SpeakerSortProvider({ children }: { children: ReactNode }) {
       toggleKindFilter,
       toggleTagFilter,
       selectAllTags,
+      resetSort,
       isTagSelected,
       areAllTagsSelected,
       sortDirMark,

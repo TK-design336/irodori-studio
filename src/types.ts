@@ -165,6 +165,8 @@ export type AppSettings = {
   accentLight?: string;
   /** Dark-mode accent palette id (see `src/lib/accent.ts`). */
   accentDark?: string;
+  /** Generate view: unselected lines use a single-row compact layout. Default ON. */
+  generateCompactLines?: boolean;
   /** Batch play gap / concat-save default (ms). */
   chunkSilenceMs: number;
   /** Max utterance chars in export filenames. */
@@ -232,6 +234,11 @@ export function clampCandidateCount(n: number | null | undefined): number {
 export function asrCerWarnThreshold(settings: AppSettings): number {
   const v = settings.asrCerWarnThreshold;
   return typeof v === "number" && Number.isFinite(v) ? v : 0.15;
+}
+
+/** Unselected generate lines use compact layout. Missing flag = ON. */
+export function generateCompactLinesOf(settings: AppSettings): boolean {
+  return settings.generateCompactLines !== false;
 }
 
 export function activePaths(settings: AppSettings): VersionPathSettings {

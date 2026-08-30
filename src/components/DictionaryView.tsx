@@ -115,8 +115,8 @@ export function DictionaryView() {
         {!replaceCollapsed && (
         <div className="panel-body">
           <p className="hint">
-            左のチェックは一括語句置換の対象。右のチェックは入力時の自動置換（既定 OFF）。長い
-            from を優先します。
+            左のチェックは一括語句置換の対象。右のチェックは入力時の自動置換（既定
+            OFF）。長い from を優先します。■ などの装飾記号は、初回時に変換先が空の候補として入ります（一括置換で削除）。不要なら行を削除できます。
           </p>
           {dicts.replace.length === 0 && (
             <p className="hint">（空）</p>

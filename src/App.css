@@ -1505,6 +1505,17 @@ input[type="range"] {
   font-size: 0.75rem;
 }
 
+.speaker-tag-filter-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.speaker-tag-filter-count {
+  opacity: 0.62;
+  font-variant-numeric: tabular-nums;
+}
+
 .speaker-tag-filter-empty {
   margin: 0.25rem 0.4rem;
 }
@@ -2713,6 +2724,18 @@ input[type="range"] {
   user-select: none;
 }
 
+.line-item-body {
+  display: grid;
+  grid-template-columns: auto auto auto minmax(0, 1fr);
+  grid-template-areas:
+    "handle idx speaker trail"
+    "text text text text";
+  column-gap: 0.45rem;
+  row-gap: 0.3rem;
+  align-items: center;
+  min-width: 0;
+}
+
 .line-item:has(.asr-badge:hover) {
   z-index: 5;
 }
@@ -2783,12 +2806,41 @@ input[type="range"] {
 }
 
 .line-meta {
-  display: flex;
-  gap: 0.45rem;
-  align-items: center;
-  margin-bottom: 0.3rem;
+  display: contents;
   color: var(--muted);
   font-size: 0.8rem;
+}
+
+.line-item .drag-handle {
+  grid-area: handle;
+  font-size: 0.8rem;
+}
+
+.line-item .line-idx {
+  grid-area: idx;
+  font-size: 0.8rem;
+}
+
+.line-item .bounded-select-trigger.speaker-select {
+  grid-area: speaker;
+}
+
+.line-meta-trail {
+  grid-area: trail;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+  width: 100%;
+}
+
+.line-item .line-text-wrap {
+  grid-area: text;
+  min-width: 0;
+}
+
+.line-item .variant-seek-stack {
+  grid-column: 1 / -1;
 }
 
 .drag-handle {
@@ -3400,6 +3452,138 @@ button.badge.variant-keep-action:hover:not(:disabled) {
   display: flex;
   gap: 0.3rem;
   overflow: visible;
+}
+
+.line-list.compact-lines {
+  gap: 0.28rem;
+  overflow-x: hidden;
+}
+
+.line-item.compact-unselected {
+  padding: 0.16rem 0.45rem;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.line-item.compact-unselected .line-item-body {
+  grid-template-columns: auto auto minmax(0, 1fr) auto auto;
+  grid-template-areas: "handle idx text speaker trail";
+  column-gap: 0.35rem;
+  row-gap: 0;
+}
+
+.line-item.compact-unselected .drag-handle {
+  padding: 0.1rem 0.2rem;
+}
+
+.line-item.compact-unselected .line-text-wrap {
+  min-width: 0;
+  overflow: visible;
+}
+
+.line-item.compact-unselected .line-text {
+  min-width: 0;
+}
+
+.line-item.compact-unselected .line-text-display {
+  box-sizing: content-box;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+  height: auto;
+  min-height: 1.45em;
+  min-width: 0;
+  padding: 0.25rem 0.4rem 0.38rem;
+  line-height: 1.45;
+}
+
+.line-item.compact-unselected .line-text-display:has(
+  .annotation-mark:not(.annotation-mark--applied)
+) {
+  padding-bottom: 0.5rem;
+}
+
+.line-item.compact-unselected .line-text-display:has(.annotation-mark--applied) {
+  padding-top: 0.85rem;
+}
+
+.line-item.compact-unselected .annotation-rt {
+  font-size: 0.55em;
+  line-height: 1;
+}
+
+.line-item.compact-unselected .bounded-select-trigger.speaker-select {
+  min-width: 0;
+  max-width: 9rem;
+  width: max-content;
+  justify-self: end;
+}
+
+.line-item:not(.compact-unselected) .line-meta-status,
+.line-item:not(.compact-unselected) .line-meta-hover {
+  display: contents;
+}
+
+.line-item.compact-unselected .line-meta-trail {
+  width: auto;
+  max-width: 100%;
+  min-width: 0;
+  gap: 0.3rem;
+  overflow: visible;
+}
+
+.line-item.compact-unselected .line-meta-status {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  flex-shrink: 0;
+}
+
+.line-item.compact-unselected .line-meta-status:not(:has(.badge)) {
+  display: none;
+}
+
+.line-item.compact-unselected .line-meta-hover {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 0;
+  opacity: 0;
+  overflow: hidden;
+  pointer-events: none;
+  white-space: nowrap;
+  transition: max-width 160ms ease, opacity 120ms ease;
+}
+
+.line-item.compact-unselected:hover .line-meta-hover,
+.line-item.compact-unselected:focus-within .line-meta-hover {
+  max-width: 5.5rem;
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.line-item.compact-unselected .speaker-apply,
+.line-item.compact-unselected .line-actions .line-btn:not(.line-btn-play):not(.line-btn-delete) {
+  display: none;
+}
+
+.line-item.compact-unselected .line-actions {
+  margin-left: 0;
+}
+
+.line-item.compact-unselected .line-actions .line-btn {
+  width: 1.5rem;
+  height: 1.5rem;
+  font-size: 0.75rem;
+}
+
+.line-item.compact-unselected .variant-seek-stack {
+  display: none;
 }
 
 .line-btn {

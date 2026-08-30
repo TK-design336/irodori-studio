@@ -50,6 +50,9 @@ pub struct AppSettings {
     /// Dark-mode accent palette id (`teal` / `orange` / …).
     #[serde(default = "default_accent_dark")]
     pub accent_dark: String,
+    /// Generate view: unselected lines use a single-row compact layout.
+    #[serde(default = "default_true")]
+    pub generate_compact_lines: bool,
     /// Silence between chunks on batch play / default for concat export (ms).
     #[serde(default = "default_chunk_silence_ms")]
     pub chunk_silence_ms: u32,
@@ -756,6 +759,7 @@ impl Default for AppSettings {
             theme: default_theme(),
             accent_light: default_accent_light(),
             accent_dark: default_accent_dark(),
+            generate_compact_lines: true,
             chunk_silence_ms: default_chunk_silence_ms(),
             utterance_max_chars: default_utterance_max_chars(),
             export_filename_parts: default_export_filename_parts(),
