@@ -11,7 +11,10 @@ import { DocumentImportPreviewDialog, type ImportMode } from "./DocumentImportPr
 
 type Props = {
   speakers: SpeakerInfo[];
-  onConfirm: (lines: ImportedLine[]) => void;
+  onConfirm: (
+    lines: ImportedLine[],
+    opts?: { replace?: boolean },
+  ) => void;
   onCancel: () => void;
   initialFile?: File;
 };
@@ -22,6 +25,7 @@ export function BulkAddDialog({ speakers, onConfirm, onCancel, initialFile }: Pr
   const [mode, setMode] = useState<SplitMode>("strict");
   const [packLimit, setPackLimit] = useState("80");
   const [speakerDetect, setSpeakerDetect] = useState(true);
+  const [replaceExisting, setReplaceExisting] = useState(false);
   const [importDoc, setImportDoc] = useState<ParsedDoc | null>(null);
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
@@ -190,6 +194,14 @@ export function BulkAddDialog({ speakers, onConfirm, onCancel, initialFile }: Pr
                 />
                 話者識別
               </label>
+              <label className="bulk-add-speaker-toggle">
+                <input
+                  type="checkbox"
+                  checked={replaceExisting}
+                  onChange={(e) => setReplaceExisting(e.target.checked)}
+                />
+                既存行を置き換える
+              </label>
             </div>
 
             {unmatched.length > 0 && (
@@ -229,7 +241,7 @@ export function BulkAddDialog({ speakers, onConfirm, onCancel, initialFile }: Pr
               type="button"
               className="primary"
               disabled={preview.length === 0}
-              onClick={() => onConfirm(preview)}
+              onClick={() => onConfirm(preview, { replace: replaceExisting })}
             >
               確定（{preview.length} 行追加）
             </button>

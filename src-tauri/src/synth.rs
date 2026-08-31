@@ -1,11 +1,163 @@
 //! Shared TTS synthesize path used by Tauri commands and the local HTTP API.
 
+use crate::dictionary::apply_dict_replacements;
 use crate::settings::{studio_python_dir, AppSettings};
 use crate::speakers::SpeakerInfo;
+use crate::split_text::{normalize_max_chars_from_settings, prepare_chunks};
 use crate::worker::OptWorkerSimple;
+use crate::{
+    export_wav_adjusted_inner, export_wavs_concatenated_inner, studio_cache_dir, ExportAudioFormat,
+    WavExportSeg,
+};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::path::Path;
+
+#[derive(Debug, Clone)]
+pub struct UtteranceSynthOpts {
+    pub split: bool,
+    pub max_chars: usize,
+    pub speed: f64,
+    pub volume: f64,
+    pub silence_ms: u32,
+}
+
+impl UtteranceSynthOpts {
+    pub fn from_settings(settings: &AppSettings, split: bool) -> Self {
+        Self {
+            split,
+            max_chars: normalize_max_chars_from_settings(settings.http_max_chars),
+            speed: 1.0,
+            volume: 1.0,
+            silence_ms: settings.chunk_silence_ms,
+        }
+    }
+
+    pub fn clamped(mut self) -> Self {
+        self.speed = self.speed.clamp(0.5, 2.0);
+        self.volume = self.volume.clamp(0.0, 4.0);
+        self
+    }
+}
+
+/// Dictionary replace → optional pack split → synthesize chunk(s) → concat with FX.
+pub fn synthesize_utterance_to_path(
+    settings: &AppSettings,
+    worker: &Mutex<OptWorkerSimple>,
+    text: &str,
+    speaker: &SpeakerInfo,
+    dest_wav: &Path,
+    opts: UtteranceSynthOpts,
+) -> Result<(), String> {
+    let opts = opts.clamped();
+    let replaced = apply_dict_replacements(text);
+    let chunks = prepare_chunks(&replaced, opts.split, opts.max_chars);
+    if chunks.is_empty() {
+        return Err("text が空です".into());
+    }
+
+    let work_dir = studio_cache_dir()
+        .join("http_synth")
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&work_dir).map_err(|e| e.to_string())?;
+
+    let result = synthesize_chunks_inner(settings, worker, &chunks, speaker, &work_dir, opts, dest_wav);
+    let _ = std::fs::remove_dir_all(&work_dir);
+    result
+}
+
+fn synthesize_chunks_inner(
+    settings: &AppSettings,
+    worker: &Mutex<OptWorkerSimple>,
+    chunks: &[String],
+    speaker: &SpeakerInfo,
+    work_dir: &Path,
+    opts: UtteranceSynthOpts,
+    dest_wav: &Path,
+) -> Result<(), String> {
+    let silence_secs = opts.silence_ms as f64 / 1000.0;
+    let dest_str = dest_wav.display().to_string();
+
+    if chunks.len() == 1 {
+        let chunk_path = work_dir.join("0000.wav");
+        let chunk_str = chunk_path.display().to_string();
+        let args = args_for_speaker(&chunks[0], speaker, chunk_str)?;
+        synthesize_with_worker(settings, worker, args)?;
+        let vol_ok = (opts.volume - 1.0).abs() < 0.001;
+        let spd_ok = (opts.speed - 1.0).abs() < 0.001;
+        if vol_ok && spd_ok {
+            std::fs::copy(&chunk_path, dest_wav).map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        return export_wav_adjusted_inner(
+            settings,
+            chunk_path.display().to_string(),
+            dest_str,
+            opts.volume,
+            opts.speed,
+            &Default::default(),
+            ExportAudioFormat::Wav,
+            None,
+        );
+    }
+
+    let mut seg_paths: Vec<String> = Vec::with_capacity(chunks.len());
+    for (i, chunk) in chunks.iter().enumerate() {
+        let chunk_path = work_dir.join(format!("{i:04}.wav"));
+        let chunk_str = chunk_path.display().to_string();
+        let args = args_for_speaker(chunk, speaker, chunk_str)?;
+        synthesize_with_worker(settings, worker, args)?;
+        seg_paths.push(chunk_path.display().to_string());
+    }
+
+    let segments: Vec<WavExportSeg> = seg_paths
+        .iter()
+        .map(|p| WavExportSeg {
+            src: p.clone(),
+            volume: opts.volume,
+            speed: opts.speed,
+            audio_fx: Default::default(),
+        })
+        .collect();
+
+    export_wavs_concatenated_inner(
+        settings,
+        segments,
+        silence_secs,
+        dest_str,
+        Some("wav".to_string()),
+        None,
+    )
+}
+
+/// Synthesize pre-split chunks (no further pack split). Applies speed/volume on concat.
+pub fn synthesize_chunk_list_to_path(
+    settings: &AppSettings,
+    worker: &Mutex<OptWorkerSimple>,
+    chunks: &[String],
+    speaker: &SpeakerInfo,
+    dest_wav: &Path,
+    opts: UtteranceSynthOpts,
+) -> Result<(), String> {
+    let opts = opts.clamped();
+    let non_empty: Vec<String> = chunks
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if non_empty.is_empty() {
+        return Err("text が空です".into());
+    }
+    let work_dir = studio_cache_dir()
+        .join("http_synth")
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&work_dir).map_err(|e| e.to_string())?;
+    let result =
+        synthesize_chunks_inner(settings, worker, &non_empty, speaker, &work_dir, opts, dest_wav);
+    let _ = std::fs::remove_dir_all(&work_dir);
+    result
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]

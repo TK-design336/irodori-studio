@@ -7,7 +7,8 @@ import { PlaybackController } from "./playbackQueue.js";
 import { closeOffscreen } from "./offscreenDoc.js";
 import { apiFetch } from "./studioApi.js";
 import { extractPage, injectHighlight, waitTabComplete } from "./pageExtract.js";
-import { clampChunkChars, DEFAULT_CHUNK_CHARS } from "./splitText.js";
+import { clampChunkChars, DEFAULT_CHUNK_CHARS, splitForSpeech, sanitizeForSpeech, hasSpeakable } from "./splitText.js";
+import { clampSilenceMs } from "./playbackSettings.js";
 
 let controller = null;
 let lastStatus = null;
@@ -108,6 +109,10 @@ export async function playerSetGain(gain) {
   if (controller) await controller.setGain(gain);
 }
 
+export function playerSetSilenceMs(ms) {
+  if (controller) controller.setSilenceMs(clampSilenceMs(ms));
+}
+
 export async function playerChangeSpeaker(speakerId) {
   if (controller) await controller.changeSpeaker(speakerId);
 }
@@ -136,6 +141,7 @@ async function loadPlaySettings() {
     "highlightColor",
     "chunkChars",
     "autoNextEpisode",
+    "silenceMs",
   ]);
   return {
     speakerId: stored.speakerId || "",
@@ -144,6 +150,7 @@ async function loadPlaySettings() {
     highlightColor: stored.highlightColor || "#facc15",
     chunkChars: clampChunkChars(stored.chunkChars ?? DEFAULT_CHUNK_CHARS),
     autoNext: stored.autoNextEpisode !== false,
+    silenceMs: clampSilenceMs(stored.silenceMs),
   };
 }
 
@@ -173,6 +180,8 @@ export async function playerStart(opts) {
     speed: opts.speed ?? 1,
     volume: opts.volume ?? 0.8,
     episodesRead: opts.episodesRead || 1,
+    silenceMs: clampSilenceMs(opts.silenceMs),
+    chunkChars: opts.chunkChars ?? DEFAULT_CHUNK_CHARS,
   };
 
   if (controller) {
@@ -201,6 +210,8 @@ export async function playerStart(opts) {
     speed: sessionOpts.speed,
     volume: sessionOpts.volume,
     episodesRead: sessionOpts.episodesRead,
+    silenceMs: sessionOpts.silenceMs,
+    chunkChars: sessionOpts.chunkChars,
   });
 
   void (async () => {
@@ -220,6 +231,7 @@ export async function playerStart(opts) {
 
 async function onSessionDone(result, opts, gen) {
   if (!result?.done) return;
+  if (controller) void controller.cacheAllJobLines();
   const { autoNextEpisode } = await chrome.storage.local.get("autoNextEpisode");
   const autoNext = autoNextEpisode !== false;
   if (autoNext && opts.nextEpisodeUrl && opts.tabId != null) {
@@ -259,6 +271,8 @@ async function continueNextEpisode(opts, gen) {
       volume: opts.volume ?? settings.volume,
       episodesRead: (opts.episodesRead || 1) + 1,
       highlightColor: opts.highlightColor || settings.highlightColor,
+      silenceMs: opts.silenceMs ?? settings.silenceMs,
+      chunkChars: opts.chunkChars ?? settings.chunkChars,
     });
   } catch (e) {
     if (gen !== sessionGen) return;
@@ -285,6 +299,45 @@ export async function playerReadTab(opts) {
     volume: opts.volume ?? settings.volume,
     episodesRead: 1,
     highlightColor: opts.highlightColor || settings.highlightColor,
+    silenceMs: opts.silenceMs ?? settings.silenceMs,
+    chunkChars: opts.chunkChars ?? settings.chunkChars,
+  });
+}
+
+/** Read selected text with the same chunk + jobs path as page reading. */
+export async function playerReadText(opts) {
+  const settings = await loadPlaySettings();
+  const cleaned = sanitizeForSpeech(opts.text || "");
+  if (!cleaned || !hasSpeakable(cleaned)) {
+    throw new Error("読み上げるテキストがありません");
+  }
+  const chunkChars = clampChunkChars(opts.chunkChars ?? settings.chunkChars);
+  const chunks = splitForSpeech(cleaned, chunkChars);
+  if (!chunks.length) throw new Error("読み上げるテキストがありません");
+
+  let tabId = opts.tabId ?? null;
+  if (tabId == null) {
+    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    tabId = tab?.id ?? null;
+  }
+
+  return playerStart({
+    title: opts.title || "選択範囲",
+    url: opts.url || "selection://",
+    chunks,
+    text: cleaned,
+    tabId,
+    nextEpisodeUrl: null,
+    contentSelector: null,
+    paywall: false,
+    pagesFetched: 1,
+    speakerId: opts.speakerId || settings.speakerId,
+    speed: opts.speed ?? settings.speed,
+    volume: opts.volume ?? settings.volume,
+    episodesRead: 1,
+    highlightColor: opts.highlightColor || settings.highlightColor,
+    silenceMs: opts.silenceMs ?? settings.silenceMs,
+    chunkChars,
   });
 }
 
@@ -353,5 +406,7 @@ async function playNextQueueItem(gen, ctx) {
     volume,
     episodesRead: 1,
     highlightColor,
+    silenceMs: ctx?.silenceMs ?? playOpts?.silenceMs ?? settings.silenceMs,
+    chunkChars,
   });
 }

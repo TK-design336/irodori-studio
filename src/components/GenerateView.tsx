@@ -963,9 +963,13 @@ function AutoTextarea({
     const maxRows = focused ? 12 : 4;
     // border-box: height includes padding + border
     const maxHeight = maxRows * lineHeight + pad + borderY;
+    // Drop min-height during measure so CSS floor doesn't inflate scrollHeight
+    const prevMin = el.style.minHeight;
+    el.style.minHeight = "0px";
     el.style.height = "0px";
     // scrollHeight includes padding, not border — add border for border-box
     const needed = el.scrollHeight + borderY;
+    el.style.minHeight = prevMin;
     el.style.height = `${Math.min(needed, maxHeight)}px`;
   }, [focused]);
 
@@ -1142,7 +1146,16 @@ function AutoTextarea({
       }}
       onSelect={rememberCaret}
       onKeyUp={rememberCaret}
+      onPointerDown={(e) => {
+        if (e.button !== 0 || !isLineSelectModifier(e)) return;
+        // Already editing: keep native Shift-click caret/range in the textarea.
+        if (focused && e.shiftKey && !e.ctrlKey && !e.metaKey) return;
+        e.preventDefault();
+      }}
       onClick={(e) => {
+        if (isLineSelectModifier(e) && !(focused && e.shiftKey && !e.ctrlKey && !e.metaKey)) {
+          return;
+        }
         e.stopPropagation();
         rememberCaret();
       }}
@@ -1193,11 +1206,34 @@ function elCaretAtStart(el: HTMLTextAreaElement) {
 
 const SELECT_DRAG_THRESHOLD_PX = 6;
 
+function isLineSelectModifier(e: {
+  ctrlKey: boolean;
+  metaKey: boolean;
+  shiftKey: boolean;
+}): boolean {
+  return e.ctrlKey || e.metaKey || e.shiftKey;
+}
+
+function isLineTextTarget(target: EventTarget | null): boolean {
+  return target instanceof Element && !!target.closest(".line-text-wrap");
+}
+
 function isInteractiveLineTarget(target: EventTarget | null): boolean {
   if (!(target instanceof Element)) return false;
   return !!target.closest(
     "textarea, button, input, select, a, .drag-handle, .bounded-select-trigger, .bounded-select-menu, .line-text-wrap, .seek-bar, .variant-seek-stack, .speaker-apply",
   );
+}
+
+/** Skip row multi-select for real controls; Ctrl/Shift on the text field is selection. */
+function shouldSkipLinePointerSelection(e: ReactPointerEvent): boolean {
+  if (!isInteractiveLineTarget(e.target)) return false;
+  if (!isLineSelectModifier(e) || !isLineTextTarget(e.target)) return true;
+  const textarea =
+    e.target instanceof Element ? e.target.closest("textarea") : null;
+  if (!textarea || document.activeElement !== textarea) return false;
+  // Already editing this field: keep native Shift-click caret/range.
+  return e.shiftKey && !e.ctrlKey && !e.metaKey;
 }
 
 function sameIdOrder(a: string[], b: string[]): boolean {
@@ -1639,6 +1675,11 @@ export function GenerateView({
     x: number;
     y: number;
   } | null>(null);
+  const [lineSelectionContextMenu, setLineSelectionContextMenu] = useState<{
+    x: number;
+    y: number;
+    count: number;
+  } | null>(null);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [emojiInsert, setEmojiInsert] = useState<{
     nonce: number;
@@ -1972,14 +2013,6 @@ export function GenerateView({
   /** v4 only: per-line style caption for 参照音源 speakers. */
   const showLineCaption =
     isIrodoriV4(settings) && usesStyleCaption(selectedSpeaker);
-
-  const captionOpen = showLineCaption && !captionCollapsed;
-  const paramsPanelClass = [
-    "params-panel",
-    captionOpen && !samplingCollapsed ? "equalize-sc" : "",
-  ]
-    .filter(Boolean)
-    .join(" ");
 
   /** Apply project mutations to memory immediately; serialize disk saves only. */
   const persist = useCallback(
@@ -2617,6 +2650,29 @@ export function GenerateView({
     };
   }, [linePlayContextMenu]);
 
+  useEffect(() => {
+    if (!lineSelectionContextMenu) return;
+    const close = () => setLineSelectionContextMenu(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    const t = window.setTimeout(() => {
+      document.addEventListener("mousedown", close);
+      document.addEventListener("keydown", onKey);
+      window.addEventListener("blur", close);
+      window.addEventListener("resize", close);
+      window.addEventListener("scroll", close, true);
+    }, 0);
+    return () => {
+      window.clearTimeout(t);
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", onKey);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("scroll", close, true);
+    };
+  }, [lineSelectionContextMenu]);
+
   const askConfirm = (message: string, onYes: () => void) => {
     setConfirm({ message, onYes });
   };
@@ -2653,7 +2709,27 @@ export function GenerateView({
     onSelectedId(line.id);
   };
 
-  const addLinesFromTexts = async (imported: ImportedLine[]) => {
+  const addLinesFromTexts = async (
+    imported: ImportedLine[],
+    { replace = false }: { replace?: boolean } = {},
+  ) => {
+    if (!projectRef.current || imported.length === 0) return;
+    if (replace && projectRef.current.lines.length > 0) {
+      askConfirm(
+        `既存の ${projectRef.current.lines.length} 行を置き換えて ${imported.length} 行にします。よろしいですか？`,
+        () => {
+          void doAddLinesFromTexts(imported, true);
+        },
+      );
+      return;
+    }
+    await doAddLinesFromTexts(imported, replace);
+  };
+
+  const doAddLinesFromTexts = async (
+    imported: ImportedLine[],
+    replace: boolean,
+  ) => {
     if (!projectRef.current || imported.length === 0) return;
     const lines = projectRef.current.lines;
     const prev = lines.length > 0 ? lines[lines.length - 1] : null;
@@ -2694,16 +2770,24 @@ export function GenerateView({
         audioFx: { ...fx },
       };
     });
+    if (replace) {
+      cancelBatchPlayback({ stopAudio: true });
+      lineDraftsRef.current.clear();
+    }
     await persist((prevProj) => ({
       ...prevProj,
-      lines: [...prevProj.lines, ...created],
+      lines: replace ? created : [...prevProj.lines, ...created],
     }));
     onSelectedId(created[0].id);
     const uniq = [...new Set(unmatched)];
     setStatus(
       uniq.length > 0
-        ? `${created.length} 行を追加しました（未マッチ話者: ${uniq.join(", ")}）`
-        : `${created.length} 行を追加しました`,
+        ? replace
+          ? `${created.length} 行に置き換えました（未マッチ話者: ${uniq.join(", ")}）`
+          : `${created.length} 行を追加しました（未マッチ話者: ${uniq.join(", ")}）`
+        : replace
+          ? `${created.length} 行に置き換えました`
+          : `${created.length} 行を追加しました`,
     );
     setBulkAddOpen(false);
   };
@@ -3412,6 +3496,50 @@ export function GenerateView({
     if (selectedId === id) onSelectedId(next?.lines[0]?.id ?? null);
   };
 
+  const removeLines = async (ids: string[]) => {
+    const unique = [...new Set(ids)].filter((id) =>
+      projectRef.current?.lines.some((l) => l.id === id),
+    );
+    if (unique.length === 0) return;
+    if (unique.some((id) => playerRef.current?.activeLineId === id)) {
+      cancelBatchPlayback({ stopAudio: true });
+    } else {
+      cancelBatchPlayback();
+    }
+    const idSet = new Set(unique);
+    await persist((prev) => ({
+      ...prev,
+      lines: prev.lines.filter((l) => !idSet.has(l.id)),
+    }));
+    for (const id of unique) lineDraftsRef.current.delete(id);
+    const name = projectRef.current?.name;
+    if (name) {
+      const remaining = projectRef.current?.lines.map((l) => l.id) ?? [];
+      setSelectedIdsByProject((prev) => ({
+        ...prev,
+        [name]: remaining.filter((id) => selectedIdsRef.current.includes(id)),
+      }));
+      if (selectedId && idSet.has(selectedId)) {
+        onSelectedId(remaining[0] ?? null);
+      }
+    }
+  };
+
+  const deleteMultiSelectedLines = () => {
+    const ids = selectedIdsRef.current;
+    if (ids.length < 2) return;
+    const lines = projectRef.current?.lines ?? [];
+    const targets = lines.filter((l) => ids.includes(l.id));
+    if (targets.length < 2) return;
+    const hasAudio = targets.some((l) => l.wavPath);
+    const msg = hasAudio
+      ? `${targets.length} 行を削除しますか？（生成済みの音声も削除されます）`
+      : `${targets.length} 行を削除しますか？`;
+    askConfirm(msg, () => {
+      void removeLines(targets.map((l) => l.id));
+    });
+  };
+
   const deleteLine = async (id: string) => {
     const line = projectRef.current?.lines.find((l) => l.id === id);
     if (!line) return;
@@ -3693,7 +3821,7 @@ export function GenerateView({
     index: number,
   ) => {
     if (e.button !== 0) return;
-    if (isInteractiveLineTarget(e.target)) return;
+    if (shouldSkipLinePointerSelection(e)) return;
     if (dragRef.current) return;
     e.preventDefault();
     lineGestureConsumedRef.current = true;
@@ -4856,7 +4984,13 @@ export function GenerateView({
   const runPipelinePlaybackLoop = async (
     gen: number,
     queue: ReturnType<typeof createPipelinePlaybackQueue>,
-    opts: { statusPrefix: string; total?: number },
+    opts: {
+      statusPrefix: string;
+      total?: number;
+      /** Finish the already-loaded clip before consuming the queue. */
+      continueAfterCurrent?: boolean;
+      playedOffset?: number;
+    },
   ) => {
     const player = playerRef.current;
     if (!player) return;
@@ -4866,8 +5000,15 @@ export function GenerateView({
     setBatchPlayActive(true);
     const silenceMs = Math.max(0, Number(settings.chunkSilenceMs) || 0);
     let playedAny = false;
-    let played = 0;
+    let played = opts.playedOffset ?? 0;
     try {
+      if (opts.continueAfterCurrent) {
+        if (player.isPlaying) {
+          await player.waitUntilInactive();
+          if (gen !== batchPlayGenRef.current) return;
+        }
+        playedAny = true;
+      }
       while (true) {
         if (gen !== batchPlayGenRef.current) return;
         const item = await queue.next();
@@ -5089,12 +5230,58 @@ export function GenerateView({
     syncPanelFromLine(line);
 
     const variants = normalizeLineVariants(line);
+    const activeThisLine =
+      player.activeLineId === line.id && player.hasBuffer;
     if (
-      player.activeLineId === line.id &&
-      player.hasBuffer &&
-      (variants.length <= 1 || batchPlayActiveRef.current)
+      activeThisLine &&
+      (player.isPlaying ||
+        variants.length <= 1 ||
+        batchPlayActiveRef.current)
     ) {
       player.togglePause();
+      return;
+    }
+
+    const pausedMidway =
+      activeThisLine && player.getCurrentTime() > 0.02;
+    if (pausedMidway && variants.length > 1) {
+      const activeVariantId = player.activeVariantId;
+      const startIdx = variants.findIndex((v) => v.id === activeVariantId);
+      const remaining =
+        startIdx >= 0 ? variants.slice(startIdx + 1) : [];
+
+      cancelBatchPlayback({ keepActive: true });
+      const gen = batchPlayGenRef.current;
+      if (remaining.length > 0) {
+        batchPlayActiveRef.current = true;
+        setBatchPlayActive(true);
+      }
+      player.resume();
+      if (remaining.length === 0) return;
+
+      playGenRef.current += 1;
+      const queue = createPipelinePlaybackQueue();
+      const playbackPromise = runPipelinePlaybackLoop(gen, queue, {
+        statusPrefix: "再生中…",
+        total: variants.length,
+        continueAfterCurrent: true,
+        playedOffset: startIdx >= 0 ? startIdx + 1 : 0,
+      });
+      for (const variant of remaining) {
+        const exists = await invoke<boolean>("file_exists", {
+          path: variant.wavPath,
+        });
+        if (gen !== batchPlayGenRef.current) return;
+        if (exists) {
+          queue.push({
+            line,
+            wavPath: variant.wavPath,
+            variantId: variant.id,
+          });
+        }
+      }
+      queue.close();
+      await playbackPromise;
       return;
     }
 
@@ -5889,6 +6076,18 @@ export function GenerateView({
                       draggingIds.includes(line.id) ? "dragging" : ""
                     }${compactUnselected ? " compact-unselected" : ""}`}
                     onPointerDown={(e) => onLinePointerDown(e, line.id, i)}
+                    onContextMenu={(e) => {
+                      if (isInteractiveLineTarget(e.target)) return;
+                      const ids = selectedIdsRef.current;
+                      if (ids.length < 2 || !ids.includes(line.id)) return;
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setLineSelectionContextMenu({
+                        x: e.clientX,
+                        y: e.clientY,
+                        count: ids.length,
+                      });
+                    }}
                       onClick={() => {
                       if (lineGestureConsumedRef.current) {
                         lineGestureConsumedRef.current = false;
@@ -6301,7 +6500,7 @@ export function GenerateView({
         </div>
       </main>
 
-      <aside className={paramsPanelClass}>
+      <aside className="params-panel">
         <SamplingPanel
           value={panelSampling}
           onChange={onPanelSampling}
@@ -6348,7 +6547,9 @@ export function GenerateView({
       {bulkAddOpen && (
         <BulkAddDialog
           speakers={speakers}
-          onConfirm={(lines) => void addLinesFromTexts(lines)}
+          onConfirm={(lines, opts) =>
+            void addLinesFromTexts(lines, { replace: opts?.replace })
+          }
           onCancel={() => {
             setBulkAddOpen(false);
             setBulkAddInitialFile(undefined);
@@ -6800,6 +7001,40 @@ export function GenerateView({
                 </>
               );
             })()}
+          </div>,
+          document.body,
+        )}
+
+      {lineSelectionContextMenu &&
+        createPortal(
+          <div
+            className="project-tab-context-menu line-play-context-menu"
+            role="menu"
+            style={{
+              left: Math.max(
+                8,
+                Math.min(lineSelectionContextMenu.x, window.innerWidth - 260),
+              ),
+              top: Math.max(
+                8,
+                Math.min(lineSelectionContextMenu.y, window.innerHeight - 56),
+              ),
+            }}
+            onContextMenu={(e) => e.preventDefault()}
+          >
+            <button
+              type="button"
+              role="menuitem"
+              className="danger"
+              disabled={busy || batchSaving || gateBusy}
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={() => {
+                setLineSelectionContextMenu(null);
+                deleteMultiSelectedLines();
+              }}
+            >
+              選択行を削除（{lineSelectionContextMenu.count} 行）
+            </button>
           </div>,
           document.body,
         )}

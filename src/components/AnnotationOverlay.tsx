@@ -153,6 +153,7 @@ export function AnnotationOverlay({
           title={`${label} — 読み: ${r.reading}（クリックで取消）`}
           onMouseDown={(e) => e.preventDefault()}
           onClick={(e) => {
+            if (e.ctrlKey || e.metaKey || e.shiftKey) return;
             e.stopPropagation();
             onUndo(r.id);
           }}
@@ -173,6 +174,7 @@ export function AnnotationOverlay({
         onMouseLeave={scheduleHide}
         onMouseDown={(e) => e.preventDefault()}
         onClick={(e) => {
+          if (e.ctrlKey || e.metaKey || e.shiftKey) return;
           e.stopPropagation();
           openPopover(a, e.currentTarget);
         }}
@@ -186,7 +188,12 @@ export function AnnotationOverlay({
     <>
       <div
         className="line-text line-text-display"
+        onPointerDown={(e) => {
+          if (e.button !== 0) return;
+          if (e.ctrlKey || e.metaKey || e.shiftKey) e.preventDefault();
+        }}
         onClick={(e) => {
+          if (e.ctrlKey || e.metaKey || e.shiftKey) return;
           e.stopPropagation();
           onFocusEdit();
         }}

@@ -13,8 +13,10 @@ import {
   playerSeek,
   playerSetRate,
   playerSetGain,
+  playerSetSilenceMs,
   playerChangeSpeaker,
   playerReadTab,
+  playerReadText,
   playerPlayQueue,
   getPlayerSnapshot,
   recoverOffscreenSession,
@@ -91,7 +93,20 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     const text = (info.selectionText || "").trim();
     if (!text) return;
     await openSidePanel(tab);
-    await pingSidePanel({ type: "READ_TEXT", text });
+    try {
+      await ensureOffscreen();
+      await playerReadText({
+        text,
+        title: "選択範囲",
+        url: tab?.url ? `selection://${tab.url}` : "selection://",
+        tabId: tab?.id ?? null,
+      });
+    } catch (e) {
+      await pingSidePanel({
+        type: "PLAYER_ERROR",
+        error: String(e?.message || e),
+      });
+    }
     return;
   }
   if (info.menuItemId === "irodori-read-page") {
@@ -140,6 +155,7 @@ const PLAYER_TYPES = new Set([
   "PLAYER_SEEK",
   "PLAYER_SET_RATE",
   "PLAYER_SET_GAIN",
+  "PLAYER_SET_SILENCE_MS",
   "PLAYER_CHANGE_SPEAKER",
   "PLAYER_READ_TAB",
   "PLAYER_PLAY_QUEUE",
@@ -169,6 +185,9 @@ function handlePlayer(msg) {
       return playerSetRate(msg.rate);
     case "PLAYER_SET_GAIN":
       return playerSetGain(msg.gain);
+    case "PLAYER_SET_SILENCE_MS":
+      playerSetSilenceMs(msg.silenceMs);
+      return { ok: true };
     case "PLAYER_CHANGE_SPEAKER":
       return playerChangeSpeaker(msg.speakerId);
     case "PLAYER_READ_TAB":
@@ -228,7 +247,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const needsDoc =
       msg.type !== "PLAYER_GET_STATE" &&
       msg.type !== "PLAYER_STOP" &&
-      msg.type !== "PLAYER_ADD_READ_LATER";
+      msg.type !== "PLAYER_ADD_READ_LATER" &&
+      msg.type !== "PLAYER_SET_SILENCE_MS";
     const run = async () => {
       if (needsDoc) await ensureOffscreen();
       const result = await handlePlayer(msg);

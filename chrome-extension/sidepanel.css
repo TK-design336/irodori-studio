@@ -244,6 +244,12 @@ button.danger {
   color: #fff;
 }
 
+button.btn-flash-ok {
+  background: #15803d;
+  border-color: transparent;
+  color: #fff;
+}
+
 button:disabled {
   opacity: 0.55;
   cursor: not-allowed;

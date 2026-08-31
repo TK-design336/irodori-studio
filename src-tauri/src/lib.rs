@@ -5,8 +5,10 @@ mod project;
 mod python_env;
 mod settings;
 mod speakers;
+mod split_text;
 mod synth;
 mod train;
+mod voicevox_compat;
 mod worker;
 
 use parking_lot::Mutex;
@@ -74,6 +76,7 @@ async fn set_settings(
     settings.accent_dark = settings::normalize_accent_dark(&settings.accent_dark);
     settings.http_bind_address = normalize_http_bind_address(&settings.http_bind_address);
     settings.http_cors_origins = normalize_http_cors_origins(settings.http_cors_origins);
+    settings.http_max_chars = settings::normalize_http_max_chars(settings.http_max_chars);
     if settings.http_token.trim().is_empty() {
         settings.http_token = generate_http_token();
     }
@@ -829,6 +832,51 @@ fn run_ffmpeg_af(
     run_ffmpeg_export(settings, src, dest, Some(filter), &[])
 }
 
+fn run_ffmpeg_cmd(
+    settings: &AppSettings,
+    args: &[String],
+    cwd: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let ffmpeg = resolve_ffmpeg(settings).ok_or_else(|| MISSING_FFMPEG_MSG.to_string())?;
+    let mut cmd = std::process::Command::new(ffmpeg);
+    crate::python_env::hide_console(&mut cmd);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    cmd.args(args);
+    let status = cmd.status().map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err(format!("ffmpeg failed: {status}"));
+    }
+    Ok(())
+}
+
+/// Normalize to 48 kHz / mono / s16le so concat demuxer inputs match.
+fn ffmpeg_pcm_mono_48k(
+    settings: &AppSettings,
+    src: &std::path::Path,
+    dest: &std::path::Path,
+) -> Result<(), String> {
+    let src_s = src.display().to_string();
+    let dest_s = dest.display().to_string();
+    run_ffmpeg_cmd(
+        settings,
+        &[
+            "-y".into(),
+            "-i".into(),
+            src_s,
+            "-ar".into(),
+            "48000".into(),
+            "-ac".into(),
+            "1".into(),
+            "-c:a".into(),
+            "pcm_s16le".into(),
+            dest_s,
+        ],
+        None,
+    )
+}
+
 /// Keep numeric targets in sync with `src/lib/audioFx.ts`.
 fn build_post_af(
     volume: f64,
@@ -997,13 +1045,18 @@ pub(crate) fn export_wavs_concatenated_inner(
         let _ = std::fs::remove_dir_all(dir);
     };
 
-    let mut seg_paths: Vec<PathBuf> = Vec::with_capacity(segments.len());
+    // Windows CreateProcess fails with os error 206 when the filter_complex /
+    // argv with hundreds of -i paths exceeds ~32k chars. Normalize each file
+    // with a short command, then concat via a list file (one -i).
+    let mut seg_names: Vec<String> = Vec::with_capacity(segments.len());
     for (i, seg) in segments.iter().enumerate() {
-        let path = tmp_dir.join(format!("seg_{i:04}.wav"));
+        let adj = tmp_dir.join(format!("adj_{i:04}.wav"));
+        let pcm_name = format!("seg_{i:04}.wav");
+        let pcm = tmp_dir.join(&pcm_name);
         if let Err(e) = export_wav_adjusted_inner(
             settings,
             seg.src.clone(),
-            path.display().to_string(),
+            adj.display().to_string(),
             seg.volume,
             seg.speed,
             &seg.audio_fx,
@@ -1013,11 +1066,16 @@ pub(crate) fn export_wavs_concatenated_inner(
             cleanup(&tmp_dir);
             return Err(e);
         }
-        seg_paths.push(path);
+        if let Err(e) = ffmpeg_pcm_mono_48k(settings, &adj, &pcm) {
+            cleanup(&tmp_dir);
+            return Err(e);
+        }
+        let _ = std::fs::remove_file(&adj);
+        seg_names.push(pcm_name);
     }
 
-    if seg_paths.len() == 1 {
-        let src = seg_paths[0].display().to_string();
+    if seg_names.len() == 1 {
+        let src = tmp_dir.join(&seg_names[0]).display().to_string();
         let result = if fmt == ExportAudioFormat::Wav {
             copy_file(src, dest)
         } else {
@@ -1029,27 +1087,42 @@ pub(crate) fn export_wavs_concatenated_inner(
 
     let silence_secs = silence_secs.max(0.0);
     let insert_silence = silence_secs > 0.001;
-    let n = seg_paths.len();
 
-    let mut filter_parts: Vec<String> = Vec::new();
-    let mut concat_labels = String::new();
-    for i in 0..n {
-        filter_parts.push(format!(
-            "[{i}:a]aresample=48000,aformat=sample_fmts=s16:channel_layouts=mono[a{i}]"
-        ));
-        concat_labels.push_str(&format!("[a{i}]"));
-        if insert_silence && i + 1 < n {
-            filter_parts.push(format!(
-                "anullsrc=r=48000:cl=mono,atrim=0:{silence_secs},aformat=sample_fmts=s16:channel_layouts=mono[s{i}]"
-            ));
-            concat_labels.push_str(&format!("[s{i}]"));
+    if insert_silence {
+        let silence_s = format!("{silence_secs:.3}");
+        if let Err(e) = run_ffmpeg_cmd(
+            settings,
+            &[
+                "-y".into(),
+                "-f".into(),
+                "lavfi".into(),
+                "-i".into(),
+                "anullsrc=r=48000:cl=mono".into(),
+                "-t".into(),
+                silence_s,
+                "-c:a".into(),
+                "pcm_s16le".into(),
+                "silence.wav".into(),
+            ],
+            Some(&tmp_dir),
+        ) {
+            cleanup(&tmp_dir);
+            return Err(e);
         }
     }
-    let concat_n = if insert_silence { n * 2 - 1 } else { n };
-    filter_parts.push(format!(
-        "{concat_labels}concat=n={concat_n}:v=0:a=1[out]"
-    ));
-    let filter = filter_parts.join(";");
+
+    let mut list = String::new();
+    for (i, name) in seg_names.iter().enumerate() {
+        list.push_str(&format!("file '{name}'\n"));
+        if insert_silence && i + 1 < seg_names.len() {
+            list.push_str("file 'silence.wav'\n");
+        }
+    }
+    let list_path = tmp_dir.join("concat.txt");
+    if let Err(e) = std::fs::write(&list_path, list) {
+        cleanup(&tmp_dir);
+        return Err(e.to_string());
+    }
 
     if let Some(parent) = std::path::Path::new(&dest).parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -1058,38 +1131,32 @@ pub(crate) fn export_wavs_concatenated_inner(
         }
     }
 
-    let ffmpeg = match resolve_ffmpeg(settings) {
-        Some(p) => p,
-        None => {
-            cleanup(&tmp_dir);
-            return Err(MISSING_FFMPEG_MSG.into());
-        }
-    };
-
-    let mut cmd = std::process::Command::new(ffmpeg);
-    crate::python_env::hide_console(&mut cmd);
-    cmd.arg("-y");
-    for p in &seg_paths {
-        cmd.arg("-i").arg(p);
+    let mut args: Vec<String> = vec![
+        "-y".into(),
+        "-f".into(),
+        "concat".into(),
+        "-safe".into(),
+        "0".into(),
+        "-i".into(),
+        "concat.txt".into(),
+    ];
+    if fmt == ExportAudioFormat::Wav {
+        args.push("-c:a".into());
+        args.push("pcm_s16le".into());
+    } else {
+        args.extend(codec_args.iter().cloned());
     }
-    cmd.args(["-filter_complex", &filter, "-map", "[out]"]);
-    for a in &codec_args {
-        cmd.arg(a);
-    }
-    cmd.arg(&dest);
+    args.push(dest.clone());
 
-    let status = match cmd.status() {
-        Ok(s) => s,
-        Err(e) => {
-            cleanup(&tmp_dir);
-            return Err(e.to_string());
+    let result = run_ffmpeg_cmd(settings, &args, Some(&tmp_dir)).map_err(|e| {
+        if e.contains("os error 206") {
+            format!("連結に失敗しました（パスまたはコマンドが長すぎます）: {e}")
+        } else {
+            format!("ffmpeg concat failed: {e}")
         }
-    };
+    });
     cleanup(&tmp_dir);
-    if !status.success() {
-        return Err(format!("ffmpeg concat failed: {status}"));
-    }
-    Ok(())
+    result
 }
 
 /// Pitch-preserving speed + denoise into a temp file for playback (EQ left to WebAudio).

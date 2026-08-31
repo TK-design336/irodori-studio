@@ -102,6 +102,9 @@ pub struct AppSettings {
     /// When true, allow any `chrome-extension://` Origin.
     #[serde(default = "default_http_allow_chrome_extensions")]
     pub http_allow_chrome_extensions: bool,
+    /// Default max chars per pack chunk for HTTP auto-split (when split=true).
+    #[serde(default = "default_http_max_chars")]
+    pub http_max_chars: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -301,7 +304,7 @@ pub fn normalize_accent_dark(v: &str) -> String {
 }
 
 fn default_chunk_silence_ms() -> u32 {
-    300
+    450
 }
 
 fn default_gacha_count() -> u32 {
@@ -402,6 +405,18 @@ fn default_http_bind_address() -> String {
 
 fn default_http_port() -> u16 {
     18790
+}
+
+fn default_http_max_chars() -> u32 {
+    80
+}
+
+pub fn normalize_http_max_chars(v: u32) -> u32 {
+    if v == 0 {
+        default_http_max_chars()
+    } else {
+        v.clamp(16, 500)
+    }
 }
 
 fn default_http_allow_chrome_extensions() -> bool {
@@ -776,6 +791,7 @@ impl Default for AppSettings {
             http_token: String::new(),
             http_cors_origins: Vec::new(),
             http_allow_chrome_extensions: default_http_allow_chrome_extensions(),
+            http_max_chars: default_http_max_chars(),
         }
     }
 }

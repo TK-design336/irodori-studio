@@ -54,22 +54,28 @@ export function isMissingHostPermissionError(err) {
   return /must request permission|Cannot access contents/i.test(String(err?.message || err || ""));
 }
 
-export async function apiFetch(path, { method = "GET", body, expectBinary = false, config } = {}) {
+export async function apiFetch(path, { method = "GET", body, form, expectBinary = false, config } = {}) {
   const { baseUrl, token } = config || (await loadStudioConfig());
   if (!token) {
     throw new Error("トークンが未設定です（Studio の設定画面からコピーしてください）");
   }
   await ensureHostPermission(baseUrl);
 
+  const headers = { Authorization: `Bearer ${token}` };
+  let payload;
+  if (form) {
+    payload = form;
+  } else if (body) {
+    headers["Content-Type"] = "application/json";
+    payload = JSON.stringify(body);
+  }
+
   let res;
   try {
     res = await fetch(`${baseUrl}${path}`, {
       method,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        ...(body ? { "Content-Type": "application/json" } : {}),
-      },
-      body: body ? JSON.stringify(body) : undefined,
+      headers,
+      body: payload,
     });
   } catch (e) {
     throw new Error(

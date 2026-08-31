@@ -665,17 +665,15 @@ input[type="range"] {
 .line-text-wrap {
   position: relative;
   width: 100%;
+  display: flex;
+  flex-direction: column;
 }
 
 .line-text-display {
+  width: 100%;
   white-space: pre-wrap;
   word-break: break-word;
   cursor: text;
-  min-height: 2.1rem;
-  padding: 0.35rem 0.5rem;
-  line-height: 1.45;
-  border: 1px solid transparent;
-  border-radius: 6px;
 }
 
 .line-text-editing-hidden {
@@ -3483,10 +3481,15 @@ button.badge.variant-keep-action:hover:not(:disabled) {
 
 .line-item.compact-unselected .line-text {
   min-width: 0;
+  /* One line + equal padding + border so text sits in the middle of the box */
+  min-height: calc(1.45em + 0.44rem + 2px);
+  padding: 0.22rem 0.4rem;
+  border-radius: 6px;
 }
 
 .line-item.compact-unselected .line-text-display {
-  box-sizing: content-box;
+  box-sizing: border-box;
+  width: 100%;
   white-space: pre-wrap;
   word-break: break-word;
   overflow: hidden;
@@ -3494,16 +3497,13 @@ button.badge.variant-keep-action:hover:not(:disabled) {
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 4;
   height: auto;
-  min-height: 1.45em;
   min-width: 0;
-  padding: 0.25rem 0.4rem 0.38rem;
-  line-height: 1.45;
 }
 
 .line-item.compact-unselected .line-text-display:has(
   .annotation-mark:not(.annotation-mark--applied)
 ) {
-  padding-bottom: 0.5rem;
+  padding-bottom: 0.45rem;
 }
 
 .line-item.compact-unselected .line-text-display:has(.annotation-mark--applied) {
@@ -3611,11 +3611,16 @@ button.badge.variant-keep-action:hover:not(:disabled) {
 }
 
 .line-text {
+  display: block;
+  width: 100%;
   resize: none;
   overflow: hidden;
   line-height: 1.45;
   min-height: 2.1rem;
   padding: 0.35rem 0.5rem;
+  background: var(--bg-input);
+  border: 1px solid var(--line);
+  border-radius: 8px;
 }
 
 .status-bar {
@@ -3639,10 +3644,9 @@ button.badge.variant-keep-action:hover:not(:disabled) {
 /*
   params-panel height model
   -------------------------
-  - Audio Adjustment → 常に中身の高さ (shrink / grow しない)
-  - Sampling 展開 → 残りの高さを使う (中はスクロール)
-  - Sampling + Caption 両方展開 → 残りを等分 (equalize-sc)
-  - Caption 単独 (Sampling 畳み) → 中身の高さのみ。余白で伸ばさない
+  折りたたみ: ヘッダー高さのみ
+  1つだけ展開: 中身の高さ (余白で伸ばさない。溢れたら縮めて中でスクロール)
+  2つ以上展開: 残り高さを等分 (2つなら 1/2、3つなら 1/3)
 */
 .params-panel {
   display: flex;
@@ -3661,26 +3665,16 @@ button.badge.variant-keep-action:hover:not(:disabled) {
   overflow: hidden;
 }
 
-/* Audio: 内容高さを確保。縮めてボタンが消えないようにする */
-.params-panel > .audio-panel:not(.collapsed) {
-  flex: 0 0 auto;
-  overflow: visible;
-  min-height: auto;
-}
-
-/* Sampling 展開: 残り高さを吸収 */
-.params-panel > .sampling-panel:not(.collapsed) {
-  flex: 1 1 0;
+.params-panel > .sampling-panel:not(.collapsed),
+.params-panel > .audio-panel:not(.collapsed),
+.params-panel > .caption-panel:not(.collapsed) {
+  flex: 0 1 auto;
   min-height: 0;
   overflow: hidden;
 }
 
-/* Sampling + Caption: 残りを等分 */
-.params-panel.equalize-sc > .sampling-panel:not(.collapsed),
-.params-panel.equalize-sc > .caption-panel:not(.collapsed) {
+.params-panel:has(> :not(.collapsed) ~ :not(.collapsed)) > :not(.collapsed) {
   flex: 1 1 0;
-  min-height: 0;
-  overflow: hidden;
 }
 
 .sampling-panel .panel-header,
@@ -3696,6 +3690,7 @@ button.badge.variant-keep-action:hover:not(:disabled) {
 }
 
 .sampling-panel .panel-body,
+.audio-panel .panel-body,
 .caption-panel .panel-body {
   overflow: auto;
   flex: 1 1 auto;
@@ -3706,8 +3701,6 @@ button.badge.variant-keep-action:hover:not(:disabled) {
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
-  flex: none;
-  overflow: visible;
 }
 
 .audio-fx-section {
@@ -4652,19 +4645,28 @@ button.badge.variant-keep-action:hover:not(:disabled) {
 .slice-review-row {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
+  align-items: flex-start;
   gap: 0.35rem 0.5rem;
-  padding: 0.35rem 0.5rem;
+  padding: 0.4rem 0.5rem;
   box-sizing: border-box;
+  height: auto;
   border-bottom: 1px solid var(--border, #3333);
+}
+
+.slice-review-row > .row {
+  flex-shrink: 0;
+  align-items: center;
+  align-self: center;
+  margin-left: auto;
 }
 
 .slice-review-row.playing {
   background: color-mix(in srgb, var(--accent, #7c5cff) 18%, transparent);
 }
 
-.slice-review-row.flagged {
-  outline: 1px solid color-mix(in srgb, #e85d5d 50%, transparent);
+.slice-review-row.flagged,
+.slice-review-row:has(+ .slice-review-row.flagged) {
+  border-bottom-color: color-mix(in srgb, #e85d5d 80%, var(--border, #333));
 }
 
 .slice-review-row.excluded {
@@ -4689,6 +4691,7 @@ button.badge.variant-keep-action:hover:not(:disabled) {
 .slice-review-play {
   flex-shrink: 0;
   min-width: 2rem;
+  align-self: center;
 }
 
 .slice-review-meta {
@@ -4711,6 +4714,7 @@ button.badge.variant-keep-action:hover:not(:disabled) {
   flex-wrap: wrap;
   gap: 0.22rem;
   margin-top: 0.12rem;
+  line-height: 1.3;
 }
 
 .slice-review-op {

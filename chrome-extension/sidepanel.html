@@ -126,6 +126,15 @@
           <input id="chunkChars" type="number" min="16" max="120" step="1" value="60" />
         </label>
 
+        <h3 class="settings-h">文章間の無音</h3>
+        <p class="hint">
+          再生時と連結保存の両方に入ります。
+        </p>
+        <label>
+          無音時間（ms）
+          <input id="silenceMs" type="number" min="0" max="5000" step="50" value="450" />
+        </label>
+
         <h3 class="settings-h">表示</h3>
         <label class="color-field">
           <span>読み上げ中のハイライト色</span>
@@ -138,7 +147,7 @@
 
         <h3 class="settings-h">音声キャッシュ</h3>
         <p class="hint">
-          同じ文章・話者で再読み上げするとき、再合成せずに使う一時保存です。容量を空けたいときだけ消してください。
+          ページごとに音声を保存します。読み上げ後も「全体を連結して保存」できます。容量を空けたいときだけ消してください。
         </p>
         <div class="row">
           <button id="btnClearCache" type="button">キャッシュをクリア</button>

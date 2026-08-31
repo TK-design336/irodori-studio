@@ -202,6 +202,8 @@ export type AppSettings = {
   httpCorsOrigins?: string[];
   /** Allow any chrome-extension:// Origin. */
   httpAllowChromeExtensions?: boolean;
+  /** Default max chars per pack chunk for HTTP auto-split (when split=true). */
+  httpMaxChars?: number;
 };
 
 /** Runtime status of the local HTTP API server. */

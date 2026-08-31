@@ -1,6 +1,12 @@
-import { clampChunkChars, DEFAULT_CHUNK_CHARS, sanitizeForSpeech, hasSpeakable } from "./lib/splitText.js";
+import { clampChunkChars, DEFAULT_CHUNK_CHARS, splitForSpeech, sanitizeForSpeech, hasSpeakable } from "./lib/splitText.js";
 import { getAllProfiles } from "./lib/profiles.js";
-import { clearCache, cacheStats } from "./lib/cache.js";
+import {
+  clearCache,
+  cacheStats,
+  loadCachedPageAudio,
+  putPageAudio,
+  beginPageCache,
+} from "./lib/cache.js";
 import {
   apiFetch as studioApiFetch,
   ALL_PAGE_ORIGINS,
@@ -13,6 +19,10 @@ import {
   injectHighlight,
   ensureTabPermission,
 } from "./lib/pageExtract.js";
+import {
+  DEFAULT_SILENCE_MS,
+  clampSilenceMs,
+} from "./lib/playbackSettings.js";
 
 const DEFAULTS = {
   baseUrl: "http://127.0.0.1:18790",
@@ -23,6 +33,7 @@ const DEFAULTS = {
   autoNextEpisode: true,
   highlightColor: "#facc15",
   chunkChars: DEFAULT_CHUNK_CHARS,
+  silenceMs: DEFAULT_SILENCE_MS,
   siteSpeakers: {},
   readLater: [],
 };
@@ -60,6 +71,7 @@ const els = {
   hlColor: document.getElementById("hlColor"),
   hlColorPreview: document.getElementById("hlColorPreview"),
   chunkChars: document.getElementById("chunkChars"),
+  silenceMs: document.getElementById("silenceMs"),
   btnClearCache: document.getElementById("btnClearCache"),
   btnCopyText: document.getElementById("btnCopyText"),
   cacheStatus: document.getElementById("cacheStatus"),
@@ -164,6 +176,17 @@ function persistChunkChars() {
   void chrome.storage.local.set({ chunkChars: n });
 }
 
+function getSilenceMs() {
+  return clampSilenceMs(els.silenceMs?.value ?? DEFAULT_SILENCE_MS);
+}
+
+function persistSilenceMs() {
+  const n = getSilenceMs();
+  if (els.silenceMs) els.silenceMs.value = String(n);
+  void chrome.storage.local.set({ silenceMs: n });
+  void playerSend({ type: "PLAYER_SET_SILENCE_MS", silenceMs: n });
+}
+
 function openSettings() {
   els.settingsOverlay.hidden = false;
   els.settingsOverlay.classList.remove("hidden");
@@ -215,6 +238,7 @@ async function loadSettings() {
   els.autoNextEpisode.checked = stored.autoNextEpisode !== false;
   els.hlColor.value = stored.highlightColor || DEFAULTS.highlightColor;
   els.chunkChars.value = clampChunkChars(stored.chunkChars ?? DEFAULTS.chunkChars);
+  els.silenceMs.value = clampSilenceMs(stored.silenceMs ?? DEFAULTS.silenceMs);
   els.rateLabel.textContent = `${Number(els.rate.value).toFixed(2)}x`;
   els.volLabel.textContent = `${Math.round(Number(els.volume.value) * 100)}%`;
   updateHlPreview();
@@ -241,6 +265,7 @@ async function saveSettings() {
     autoNextEpisode: els.autoNextEpisode.checked,
     highlightColor: els.hlColor.value,
     chunkChars: getChunkChars(),
+    silenceMs: getSilenceMs(),
   });
   setStatus(els.connStatus, "接続設定を保存しました", "ok");
   return { baseUrl, token, speakerId };
@@ -459,6 +484,25 @@ async function restorePlayerFromHost() {
   }
 }
 
+async function startReadingFromText(text, { title = "選択範囲" } = {}) {
+  const cleaned = sanitizeForSpeech(text);
+  if (!cleaned || !hasSpeakable(cleaned)) throw new Error("読み上げるテキストがありません");
+  const chunks = splitForSpeech(cleaned, getChunkChars());
+  if (!chunks.length) throw new Error("読み上げるテキストがありません");
+  const tab = await activeTab();
+  await startReading({
+    title,
+    url: `selection://${tab.url}`,
+    tabId: tab.id,
+    chunks,
+    text: cleaned,
+    paywall: false,
+    pagesFetched: 1,
+    nextEpisodeUrl: null,
+    contentSelector: null,
+  });
+}
+
 async function startReading(extract, { episodesRead = 1 } = {}) {
   const speaker = await pickSpeakerForUrl(extract.url);
   if (!speaker) throw new Error("話者を選択してください");
@@ -501,6 +545,8 @@ async function startReading(extract, { episodesRead = 1 } = {}) {
     paywall: !!extract.paywall,
     pagesFetched: extract.pagesFetched || 1,
     highlightColor: els.hlColor.value,
+    silenceMs: getSilenceMs(),
+    chunkChars: getChunkChars(),
   });
   if (res?.ok === false) {
     setReadingUi(false);
@@ -598,6 +644,7 @@ async function playReadLaterQueue() {
     volume: Number(els.volume.value),
     highlightColor: els.hlColor.value,
     chunkChars: getChunkChars(),
+    silenceMs: getSilenceMs(),
   });
   if (res?.ok === false) {
     setReadingUi(false);
@@ -626,10 +673,80 @@ async function waitJobComplete(jobId) {
 async function downloadJobConcat(jobId, format, title) {
   const { buf, mime } = await apiFetch(`/v1/jobs/${jobId}/concat`, {
     method: "POST",
-    body: { silenceMs: 300, format },
+    body: { silenceMs: getSilenceMs(), format },
     expectBinary: true,
   });
   downloadBlob(buf, mime, concatDownloadName(title, format));
+}
+
+async function cacheJobLinesToPage(jobId, { url, title, speakerId, chunkChars, chunks }) {
+  try {
+    await beginPageCache({ url, title, speakerId, chunkChars, chunks });
+    const st = await apiFetch(`/v1/jobs/${jobId}`);
+    const lines = st.lines || [];
+    for (let i = 0; i < chunks.length; i++) {
+      const line = lines[i];
+      if (!line || (line.status !== "done" && !line.ready)) continue;
+      const { buf } = await apiFetch(`/v1/jobs/${jobId}/lines/${i}`, {
+        expectBinary: true,
+      });
+      await putPageAudio({
+        url,
+        title,
+        speakerId,
+        chunkChars,
+        index: i,
+        text: chunks[i],
+        blob: new Blob([buf], { type: "audio/wav" }),
+      });
+    }
+  } catch (_) {
+    /* cache is best-effort */
+  }
+}
+
+async function concatFromBlobs(blobs, format, title) {
+  const fd = new FormData();
+  fd.append("silenceMs", String(getSilenceMs()));
+  fd.append("format", format);
+  for (let i = 0; i < blobs.length; i++) {
+    fd.append("files", blobs[i], `${String(i).padStart(4, "0")}.wav`);
+  }
+  const { buf, mime } = await apiFetch("/v1/concat-files", {
+    method: "POST",
+    form: fd,
+    expectBinary: true,
+  });
+  downloadBlob(buf, mime, concatDownloadName(title, format));
+}
+
+async function fillMissingFromJob(missing, blobs, chunks, { url, title, speaker }) {
+  const lines = missing.map((i) => ({ text: chunks[i], speaker }));
+  const job = await apiFetch("/v1/jobs", {
+    method: "POST",
+    body: { lines, format: "wav", split: false },
+  });
+  concatJobId = job.jobId;
+  await waitJobComplete(job.jobId);
+  if (concatAbort) throw new Error("合成を停止しました");
+  const chunkChars = getChunkChars();
+  for (let k = 0; k < missing.length; k++) {
+    const i = missing[k];
+    const { buf } = await apiFetch(`/v1/jobs/${job.jobId}/lines/${k}`, {
+      expectBinary: true,
+    });
+    const blob = new Blob([buf], { type: "audio/wav" });
+    blobs[i] = blob;
+    await putPageAudio({
+      url,
+      title,
+      speakerId: speaker,
+      chunkChars,
+      index: i,
+      text: chunks[i],
+      blob,
+    });
+  }
 }
 
 async function concatSave() {
@@ -649,7 +766,6 @@ async function concatSave() {
   if (concatBusy) return;
 
   if (!lastExtract?.chunks?.length) {
-    // Allow extract-on-demand when idle
     await ensureSiteAccess();
     const tab = await activeTab();
     lastExtract = await extractPage(tab);
@@ -662,16 +778,27 @@ async function concatSave() {
   if (!speaker) throw new Error("話者を選択してください");
   const format = els.concatFormat.value || "wav";
   const title = concatPageTitle();
+  const url = lastExtract.url || "";
+  const chunks = lastExtract.chunks;
+  const chunkChars = getChunkChars();
 
-  // During reading: reuse session job audio (no re-synth of finished lines)
-  const sessionJobId = lastPlayerStatus?.jobId;
-  if (isReadingUi && sessionJobId) {
-    setStatus(els.playStatus, "読み上げ済み音声を連結中…");
-    concatBusy = true;
-    concatAbort = false;
-    concatJobId = sessionJobId;
-    updateConcatButton();
-    try {
+  concatBusy = true;
+  concatAbort = false;
+  updateConcatButton();
+
+  try {
+    const cached = await loadCachedPageAudio({ url, speakerId: speaker, chunks });
+    if (cached.missing.length === 0) {
+      setStatus(els.playStatus, "キャッシュから連結しています…");
+      await concatFromBlobs(cached.blobs, format, title);
+      setStatus(els.playStatus, "連結ファイルを保存しました", "ok");
+      return;
+    }
+
+    const sessionJobId = lastPlayerStatus?.jobId;
+    if (isReadingUi && sessionJobId) {
+      setStatus(els.playStatus, "読み上げ済み音声を連結中…");
+      concatJobId = sessionJobId;
       while (true) {
         if (concatAbort || lastPlayerStatus?.stopped) {
           throw new Error("停止されました");
@@ -687,36 +814,61 @@ async function concatSave() {
         await new Promise((r) => setTimeout(r, 400));
       }
       await downloadJobConcat(sessionJobId, format, title);
+      void cacheJobLinesToPage(sessionJobId, {
+        url,
+        title,
+        speakerId: speaker,
+        chunkChars,
+        chunks,
+      });
       setStatus(els.playStatus, "連結ファイルを保存しました", "ok");
-    } finally {
-      concatBusy = false;
-      concatJobId = null;
-      updateConcatButton();
+      return;
     }
-    return;
-  }
 
-  // Idle: independent job, button becomes stop
-  concatBusy = true;
-  concatAbort = false;
-  updateConcatButton();
-  setStatus(els.playStatus, "連結用に合成を開始…");
-  try {
-    const lines = lastExtract.chunks.map((text) => ({ text, speaker }));
-    const job = await apiFetch("/v1/jobs", {
-      method: "POST",
-      body: { lines, format: "wav" },
+    setStatus(
+      els.playStatus,
+      cached.missing.length < chunks.length
+        ? `未キャッシュ ${cached.missing.length} 文を合成しています…`
+        : "連結用に合成を開始…",
+    );
+    await beginPageCache({ url, title, speakerId: speaker, chunkChars, chunks });
+
+    if (cached.missing.length === chunks.length) {
+      const lines = chunks.map((text) => ({ text, speaker }));
+      const job = await apiFetch("/v1/jobs", {
+        method: "POST",
+        body: { lines, format: "wav", split: false },
+      });
+      concatJobId = job.jobId;
+      await waitJobComplete(job.jobId);
+      if (concatAbort) throw new Error("合成を停止しました");
+      await downloadJobConcat(job.jobId, format, title);
+      void cacheJobLinesToPage(job.jobId, {
+        url,
+        title,
+        speakerId: speaker,
+        chunkChars,
+        chunks,
+      });
+      setStatus(els.playStatus, "連結ファイルを保存しました", "ok");
+      return;
+    }
+
+    await fillMissingFromJob(cached.missing, cached.blobs, chunks, {
+      url,
+      title,
+      speaker,
     });
-    concatJobId = job.jobId;
-    await waitJobComplete(job.jobId);
     if (concatAbort) throw new Error("合成を停止しました");
-    await downloadJobConcat(job.jobId, format, title);
+    setStatus(els.playStatus, "キャッシュから連結しています…");
+    await concatFromBlobs(cached.blobs, format, title);
     setStatus(els.playStatus, "連結ファイルを保存しました", "ok");
   } finally {
     concatBusy = false;
     concatJobId = null;
     concatAbort = false;
     updateConcatButton();
+    void refreshCacheStatus();
   }
 }
 
@@ -725,7 +877,8 @@ async function refreshCacheStatus() {
     const st = await cacheStats();
     const mb = (st.bytes / (1024 * 1024)).toFixed(1);
     const max = (st.maxBytes / (1024 * 1024)).toFixed(0);
-    els.cacheStatus.textContent = `キャッシュ: ${st.count} 件 / ${mb} MB（上限 ${max} MB）`;
+    const pages = st.pageCount ? ` / ${st.pageCount} ページ` : "";
+    els.cacheStatus.textContent = `キャッシュ: ${st.count} 件${pages} / ${mb} MB（上限 ${max} MB）`;
   } catch {
     els.cacheStatus.textContent = "";
   }
@@ -880,6 +1033,7 @@ els.hlColor.addEventListener("input", () => {
   void chrome.storage.local.set({ highlightColor: els.hlColor.value });
 });
 els.chunkChars.addEventListener("change", persistChunkChars);
+els.silenceMs.addEventListener("change", persistSilenceMs);
 els.hlColor.addEventListener("change", () => {
   updateHlPreview();
   void chrome.storage.local.set({ highlightColor: els.hlColor.value });
@@ -891,14 +1045,38 @@ els.btnClearCache.addEventListener("click", () => {
     setStatus(els.cacheStatus, "キャッシュをクリアしました", "ok");
   })();
 });
+const COPY_LABEL = "本文をコピー（Studio 用）";
+let copyFlashTimer = 0;
+
+function flashCopyButton(label, kind = "ok") {
+  const btn = els.btnCopyText;
+  btn.textContent = label;
+  btn.classList.toggle("btn-flash-ok", kind === "ok");
+  clearTimeout(copyFlashTimer);
+  copyFlashTimer = setTimeout(() => {
+    btn.textContent = COPY_LABEL;
+    btn.classList.remove("btn-flash-ok");
+  }, 1800);
+}
+
 els.btnCopyText.addEventListener("click", () => {
   void (async () => {
     if (!lastExtract?.text) {
-      setStatus(els.playStatus, "コピーする本文がありません", "err");
+      els.btnCopyText.textContent = "本文を取得中…";
+      try {
+        await ensureSiteAccess();
+        const tab = await activeTab();
+        lastExtract = await extractPage(tab);
+      } catch (_) {
+        /* fall through */
+      }
+    }
+    if (!lastExtract?.text) {
+      flashCopyButton("本文がありません", "err");
       return;
     }
     await navigator.clipboard.writeText(lastExtract.text);
-    setStatus(els.playStatus, "本文をクリップボードにコピーしました", "ok");
+    flashCopyButton("コピーしました");
   })();
 });
 els.btnSaveProfiles.addEventListener("click", () => {
@@ -917,7 +1095,7 @@ els.btnSaveProfiles.addEventListener("click", () => {
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg?.type === "READ_TEXT" && typeof msg.text === "string") {
-    void synthesizeAndPlay(msg.text).catch((e) =>
+    void startReadingFromText(msg.text).catch((e) =>
       setStatus(els.playStatus, String(e.message || e), "err"),
     );
   }

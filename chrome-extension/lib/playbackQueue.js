@@ -3,8 +3,10 @@
  * Service worker owns the session; talks to offscreen via chrome.runtime.
  */
 
-import { cacheKey, getCached, putCached } from "./cache.js";
+import { cacheKey, getCached, putPageAudio, beginPageCache, rememberPageChunk } from "./cache.js";
 import { ensureOffscreen } from "./offscreenDoc.js";
+import { DEFAULT_CHUNK_CHARS } from "./splitText.js";
+import { clampSilenceMs, DEFAULT_SILENCE_MS } from "./playbackSettings.js";
 
 const PREFETCH = 3;
 const CHARS_PER_SEC = 8;
@@ -23,6 +25,8 @@ export class PlaybackController {
     this.speakerId = "";
     this.speed = 1;
     this.volume = 0.8;
+    this.silenceMs = DEFAULT_SILENCE_MS;
+    this.chunkChars = DEFAULT_CHUNK_CHARS;
     this.jobId = null;
     this._jobOffset = 0;
     this.index = 0;
@@ -85,7 +89,7 @@ export class PlaybackController {
     });
   }
 
-  async start({ title, url, chunks, speakerId, speed, volume, episodesRead }) {
+  async start({ title, url, chunks, speakerId, speed, volume, episodesRead, silenceMs, chunkChars }) {
     await this.stop(false);
     this.aborted = false;
     this.title = title || "";
@@ -94,6 +98,8 @@ export class PlaybackController {
     this.speakerId = speakerId;
     this.speed = speed || 1;
     this.volume = volume ?? 0.8;
+    this.silenceMs = clampSilenceMs(silenceMs);
+    this.chunkChars = chunkChars ?? DEFAULT_CHUNK_CHARS;
     this.index = 0;
     this._jobOffset = 0;
     this.durations = new Array(this.chunks.length).fill(null);
@@ -104,6 +110,14 @@ export class PlaybackController {
     this.episodesRead = episodesRead || 1;
 
     if (this.chunks.length === 0) throw new Error("読み上げる本文がありません");
+
+    void beginPageCache({
+      url: this.url,
+      title: this.title,
+      speakerId: this.speakerId,
+      chunkChars: this.chunkChars,
+      chunks: this.chunks,
+    }).catch(() => {});
 
     const lines = this.chunks.map((text) => ({
       text,
@@ -117,7 +131,7 @@ export class PlaybackController {
       });
       const job = await this.apiFetch("/v1/jobs", {
         method: "POST",
-        body: { lines, format: "wav" },
+        body: { lines, format: "wav", split: false },
       });
       this.jobId = job.jobId;
       this.emit();
@@ -164,6 +178,11 @@ export class PlaybackController {
         // seek/skip adjusted index already
         continue;
       }
+      if (this.index + 1 < this.chunks.length) {
+        await this.waitSilenceMs(this.silenceMs);
+      }
+      if (this.aborted) break;
+      if (this._skipToken !== playToken) continue;
       this.index += 1;
       this.emit();
     }
@@ -196,6 +215,18 @@ export class PlaybackController {
       speed: 1,
     });
     let blob = await getCached(key);
+    if (blob) {
+      void rememberPageChunk({
+        url: this.url,
+        title: this.title,
+        speakerId: this.speakerId,
+        chunkChars: this.chunkChars,
+        index: i,
+        text,
+        audioKey: key,
+        blobSize: blob.size || 0,
+      });
+    }
     if (!blob) {
       if (!this.jobId) return false;
       const jobLine = i - this._jobOffset;
@@ -219,7 +250,15 @@ export class PlaybackController {
         { expectBinary: true },
       );
       blob = new Blob([buf], { type: "audio/wav" });
-      void putCached(key, blob);
+      void putPageAudio({
+        url: this.url,
+        title: this.title,
+        speakerId: this.speakerId,
+        chunkChars: this.chunkChars,
+        index: i,
+        text,
+        blob,
+      });
       try {
         const st = await this.apiFetch(`/v1/jobs/${this.jobId}`);
         const line = (st.lines || [])[jobLine];
@@ -255,6 +294,26 @@ export class PlaybackController {
       await sleep(300);
     }
     return false;
+  }
+
+  async waitSilenceMs(ms) {
+    const total = Math.max(0, Number(ms) || 0);
+    if (total <= 0) return;
+    const token = this._skipToken;
+    let left = total;
+    let t = Date.now();
+    while (left > 0) {
+      if (this.aborted || this._skipToken !== token) return;
+      if (this.paused) {
+        await sleep(50);
+        t = Date.now();
+        continue;
+      }
+      await sleep(Math.min(50, left));
+      const now = Date.now();
+      left -= now - t;
+      t = now;
+    }
   }
 
   async playChunk(i) {
@@ -399,6 +458,54 @@ export class PlaybackController {
     await this.sendOffscreen({ type: "OFFSCREEN_SET_GAIN", gain });
   }
 
+  setSilenceMs(ms) {
+    this.silenceMs = clampSilenceMs(ms);
+  }
+
+  async cacheAllJobLines() {
+    const jobId = this.jobId;
+    const chunks = [...this.chunks];
+    const url = this.url;
+    const title = this.title;
+    const speakerId = this.speakerId;
+    const chunkChars = this.chunkChars;
+    const jobOffset = this._jobOffset;
+    if (!jobId || !chunks.length) return;
+    try {
+      const st = await this.apiFetch(`/v1/jobs/${jobId}`);
+      const lines = st.lines || [];
+      for (let i = 0; i < chunks.length; i++) {
+        const jobLine = i - jobOffset;
+        if (jobLine < 0) continue;
+        const line = lines[jobLine];
+        if (!line || (line.status !== "done" && !line.ready)) continue;
+        const text = chunks[i];
+        const key = await cacheKey({
+          url,
+          text,
+          speakerId,
+          speed: 1,
+        });
+        if (await getCached(key)) continue;
+        const { buf } = await this.apiFetch(`/v1/jobs/${jobId}/lines/${jobLine}`, {
+          expectBinary: true,
+        });
+        const blob = new Blob([buf], { type: "audio/wav" });
+        await putPageAudio({
+          url,
+          title,
+          speakerId,
+          chunkChars,
+          index: i,
+          text,
+          blob,
+        });
+      }
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
   async changeSpeaker(speakerId) {
     this.speakerId = speakerId;
     if (!this.playing) return;
@@ -417,7 +524,7 @@ export class PlaybackController {
     if (lines.length === 0) return;
     const job = await this.apiFetch("/v1/jobs", {
       method: "POST",
-      body: { lines, format: "wav" },
+      body: { lines, format: "wav", split: false },
     });
     this.jobId = job.jobId;
     this._jobOffset = this.index;

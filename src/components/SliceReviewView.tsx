@@ -292,15 +292,16 @@ export function SliceReviewView({
     getScrollElement: () => listParentRef.current,
     estimateSize: (index) => {
       const row = filtered[index];
-      const extra = row?.autoFix?.changed ? 22 : 0;
-      return (row && loadedFile === row.file && playDur > 0 ? 78 : 52) + extra;
+      const extra = row?.autoFix?.changed ? 36 : 0;
+      return (row && loadedFile === row.file && playDur > 0 ? 96 : 56) + extra;
     },
     overscan: 12,
+    getItemKey: (index) => filtered[index]?.file ?? index,
   });
 
   useEffect(() => {
     virtualizer.measure();
-  }, [loadedFile, playDur, exclusions, virtualizer]);
+  }, [filtered, loadedFile, playDur, exclusions, virtualizer]);
 
   const clearAudioElement = useCallback(() => {
     const a = audioRef.current;
@@ -535,6 +536,32 @@ export function SliceReviewView({
     void persistExclusions(next);
   }, [exclusions, persistExclusions, readOnly]);
 
+  const isActiveFlagged = useCallback((file: string) => {
+    const meta = exclusionsRef.current[file];
+    return !!meta?.flagged && !meta?.excluded;
+  }, []);
+
+  const jumpToFlagged = useCallback(
+    (dir: 1 | -1) => {
+      const list = filteredRef.current;
+      if (list.length === 0) return;
+      const file = loadedFileRef.current;
+      const fromFile = file
+        ? list.findIndex((r) => r.file === file)
+        : -1;
+      const cursor = fromFile >= 0 ? fromFile : playIdxRef.current;
+      for (let n = 1; n <= list.length; n++) {
+        const i = (cursor + dir * n + list.length * n) % list.length;
+        const row = list[i];
+        if (row && isActiveFlagged(row.file)) {
+          void playAt(i);
+          return;
+        }
+      }
+    },
+    [isActiveFlagged, playAt],
+  );
+
   const flagAllInTab = useCallback(() => {
     if (readOnly || tab === "all") return;
     const next = { ...exclusions };
@@ -627,11 +654,17 @@ export function SliceReviewView({
         ev.preventDefault();
         const row = list[cursorIdx()];
         if (row) toggleFlag(row.file);
+      } else if (ev.key === "[" || ev.key === "［") {
+        ev.preventDefault();
+        jumpToFlagged(-1);
+      } else if (ev.key === "]" || ev.key === "］") {
+        ev.preventDefault();
+        jumpToFlagged(1);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [playAt, toggleFlag, toggleRowPlay]);
+  }, [jumpToFlagged, playAt, toggleFlag, toggleRowPlay]);
 
   useEffect(() => () => stopAudio(), [stopAudio]);
 
@@ -646,6 +679,13 @@ export function SliceReviewView({
         (s) => exclusions[s.file]?.flagged && !exclusions[s.file]?.excluded,
       ).length,
     [slices, exclusions],
+  );
+  const flaggedInViewCount = useMemo(
+    () =>
+      filtered.filter(
+        (s) => exclusions[s.file]?.flagged && !exclusions[s.file]?.excluded,
+      ).length,
+    [filtered, exclusions],
   );
   const autoFixedCount = useMemo(
     () => slices.filter((s) => s.autoFix?.changed).length,
@@ -748,7 +788,7 @@ export function SliceReviewView({
       <header className="panel-header">
         <h3>スライスレビュー</h3>
         <span className="hint">
-          Space=再生/停止 · ←→=前後 · Enter=フラグ · Auto Fix ON/OFF=処理前後
+          Space=再生/停止 · ←→=前後 · [ ]=フラグ済み前後 · Enter=フラグ · Auto Fix ON/OFF=処理前後
         </span>
       </header>
       <div className="panel-body form-stack">
@@ -888,6 +928,22 @@ export function SliceReviewView({
           >
             停止
           </button>
+          <button
+            type="button"
+            disabled={flaggedInViewCount === 0}
+            onClick={() => jumpToFlagged(-1)}
+            title="現在位置より前のフラグ済みスライスへ（[）"
+          >
+            前のフラグ済みへ
+          </button>
+          <button
+            type="button"
+            disabled={flaggedInViewCount === 0}
+            onClick={() => jumpToFlagged(1)}
+            title="現在位置より次のフラグ済みスライスへ（]）"
+          >
+            次のフラグ済みへ
+          </button>
           <label className="row" style={{ gap: 6, alignItems: "center" }}>
             速度
             <select
@@ -966,7 +1022,6 @@ export function SliceReviewView({
             <>
               <button
                 type="button"
-                className={autoFixOffCount === autoFixedCount ? "chip active" : "chip"}
                 disabled={busy || autoFixOffCount === autoFixedCount}
                 onClick={() => setAllAutoFixOff(true)}
                 title="Auto Fix 済みをすべて処理前に戻します（続行時に学習へ反映）"
@@ -975,7 +1030,6 @@ export function SliceReviewView({
               </button>
               <button
                 type="button"
-                className={autoFixOffCount === 0 ? "chip active" : "chip"}
                 disabled={busy || autoFixOffCount === 0}
                 onClick={() => setAllAutoFixOff(false)}
                 title="すべて Auto Fix 後の音に戻します"
@@ -1012,7 +1066,9 @@ export function SliceReviewView({
                   : 0;
               return (
                 <div
-                  key={`${tab}:${row.file}`}
+                  key={vi.key}
+                  data-index={vi.index}
+                  ref={virtualizer.measureElement}
                   className={[
                     "slice-review-row",
                     active ? "playing" : "",
@@ -1031,7 +1087,6 @@ export function SliceReviewView({
                     top: 0,
                     left: 0,
                     width: "100%",
-                    height: vi.size,
                     transform: `translateY(${vi.start}px)`,
                   }}
                 >

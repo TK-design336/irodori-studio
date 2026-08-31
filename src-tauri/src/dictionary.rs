@@ -207,3 +207,44 @@ pub fn save_dictionaries(dicts: &Dictionaries) -> Result<(), String> {
     let text = serde_json::to_string_pretty(dicts).map_err(|e| e.to_string())?;
     fs::write(&path, text).map_err(|e| e.to_string())
 }
+
+/// Longest-match-first global replace using enabled dictionary entries (HTTP synth).
+pub fn apply_replacements(text: &str, entries: &[ReplaceEntry]) -> String {
+    let mut active: Vec<&ReplaceEntry> = entries
+        .iter()
+        .filter(|e| e.enabled && !e.from.is_empty())
+        .collect();
+    active.sort_by_key(|e| std::cmp::Reverse(e.from.len()));
+    if active.is_empty() {
+        return text.to_string();
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < len {
+        let suffix: String = chars[i..].iter().collect();
+        let mut hit: Option<&ReplaceEntry> = None;
+        for e in &active {
+            if suffix.starts_with(&e.from) {
+                hit = Some(e);
+                break;
+            }
+        }
+        if let Some(e) = hit {
+            out.push_str(&e.to);
+            i += e.from.chars().count();
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Apply all enabled replace entries from loaded dictionaries.
+pub fn apply_dict_replacements(text: &str) -> String {
+    let dicts = load_dictionaries();
+    apply_replacements(text, &dicts.replace)
+}

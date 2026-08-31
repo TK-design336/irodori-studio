@@ -820,7 +820,7 @@ export function SettingsView({
           <label>
             チャンク間無音（ms）
             <span className="hint">
-              一括再生の行間無音、および一括保存（連結）モーダルの初期値に使います。
+              一括再生の行間無音、および一括保存（連結）モーダルの初期値に使います。既定 450ms。
             </span>
             <input
               type="number"
@@ -1056,7 +1056,9 @@ export function SettingsView({
           <div className="panel-body form-stack">
             <p className="hint">
               Chrome 拡張や外部ツールから音声合成を呼び出す API です。既定では
-              127.0.0.1 のみで待ち受けます。すべてのリクエストにトークンが必要です。
+              127.0.0.1 のみで待ち受けます。<code>/v1/*</code> は Bearer
+              トークンが必要です。VOICEVOX 互換（<code>/audio_query</code> など）は
+              ループバックからのみ認証なしで利用できます。
             </p>
             <label className="checkbox-row">
               <input
@@ -1117,10 +1119,50 @@ export function SettingsView({
                   </span>
                 )}
             </div>
+            {httpStatus?.running && httpStatus.port != null && (
+              <div className="hint">
+                <div>
+                  Irodori API:{" "}
+                  <code>
+                    http://{httpStatus.bindAddress}:{httpStatus.port}/v1/
+                  </code>
+                </div>
+                <div>
+                  VOICEVOX 互換:{" "}
+                  <code>
+                    http://{httpStatus.bindAddress}:{httpStatus.port}
+                  </code>
+                  （棒読みちゃん / YMM / LM Studio 等のエンジン URL に指定）
+                </div>
+              </div>
+            )}
+            <label>
+              API 自動分割の上限文字数
+              <span className="hint">
+                <code>split: true</code>（既定の単発合成など）のとき 1 チャンクの最大文字数。Reader
+                の <code>/v1/jobs</code> は <code>split: false</code> 既定。
+              </span>
+              <input
+                type="number"
+                min={16}
+                max={500}
+                step={1}
+                value={draft.httpMaxChars ?? 80}
+                onChange={(e) =>
+                  setShared(
+                    "httpMaxChars",
+                    Math.min(
+                      500,
+                      Math.max(16, Math.floor(Number(e.target.value) || 80)),
+                    ),
+                  )
+                }
+              />
+            </label>
             <label>
               API トークン
               <span className="hint">
-                Authorization: Bearer … として送信します。拡張の設定にコピーしてください。
+                Authorization: Bearer … として <code>/v1/*</code> に送信します。拡張の設定にコピーしてください。
               </span>
               <div className="row http-token-row">
                 <input
