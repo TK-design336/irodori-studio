@@ -4,7 +4,7 @@ use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use cpal::{
@@ -35,6 +35,7 @@ struct ActivePlayback {
 struct OutputShared {
     samples: Vec<f32>,
     pos: AtomicUsize,
+    drain_left: AtomicUsize,
     player: Arc<PlayerInner>,
     done: Arc<(Mutex<bool>, Condvar)>,
     gen: u64,
@@ -79,13 +80,22 @@ impl NativeOutputState {
         let selection = resolve_output_device(device_key)?;
         let (src_rate, mono) = wav_to_mono_f32(path)?;
         let dst_rate = selection.device_info.sample_rate.max(1);
+        let channels = usize::from(selection.stream_config.channels.max(1));
         let resampled = resample_linear(&mono, src_rate.max(1), dst_rate);
         let interleaved = expand_channels(&resampled, selection.stream_config.channels.max(1));
+        // Keep the stream alive after the last audio sample so WASAPI can drain
+        // the hardware buffer. Dropping immediately cuts the tail (virtual cables
+        // and Bluetooth devices often buffer 100ms+).
+        let drain_frames = (dst_rate as usize)
+            .saturating_mul(channels)
+            .saturating_mul(180)
+            / 1000;
 
         let done = Arc::new((Mutex::new(false), Condvar::new()));
         let shared = Arc::new(OutputShared {
             samples: interleaved,
             pos: AtomicUsize::new(0),
+            drain_left: AtomicUsize::new(drain_frames.max(1)),
             player: Arc::clone(&self.inner),
             done: done.clone(),
             gen: my_gen,
@@ -110,10 +120,19 @@ impl NativeOutputState {
             });
         }
 
+        let audio_ms = (resampled.len() as u128).saturating_mul(1000) / u128::from(dst_rate.max(1));
+        let deadline = Instant::now()
+            + Duration::from_millis((audio_ms as u64).saturating_add(180).saturating_add(2500));
+
         loop {
             if self.inner.stop.load(Ordering::SeqCst)
                 || self.inner.gen.load(Ordering::SeqCst) != my_gen
             {
+                break;
+            }
+            if Instant::now() >= deadline {
+                log::warn!("native output playback timed out; ending to resume capture");
+                mark_done(&done);
                 break;
             }
             let (lock, cv) = &*done;
@@ -251,17 +270,22 @@ where
                 }
                 let vol = f32::from_bits(player.volume.load(Ordering::Relaxed));
                 let mut pos = shared.pos.load(Ordering::Relaxed);
+                let mut drain_left = shared.drain_left.load(Ordering::Relaxed);
                 let samples = &shared.samples;
                 for out in data.iter_mut() {
-                    if pos >= samples.len() {
-                        *out = T::from_sample_(0.0);
-                    } else {
+                    if pos < samples.len() {
                         *out = T::from_sample_((samples[pos] * vol).clamp(-1.0, 1.0));
                         pos += 1;
+                    } else {
+                        *out = T::from_sample_(0.0);
+                        if drain_left > 0 {
+                            drain_left -= 1;
+                        }
                     }
                 }
                 shared.pos.store(pos, Ordering::Relaxed);
-                if pos >= samples.len() {
+                shared.drain_left.store(drain_left, Ordering::Relaxed);
+                if pos >= samples.len() && drain_left == 0 {
                     mark_done(&shared.done);
                 }
             },

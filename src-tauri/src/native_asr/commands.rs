@@ -163,3 +163,15 @@ pub async fn native_asr_stop(
     }
     Ok(RecognitionStatus::Idle)
 }
+
+#[tauri::command]
+pub fn native_asr_set_paused(
+    state: tauri::State<'_, NativeAsrAppState>,
+    paused: bool,
+) -> Result<(), String> {
+    let audio_input = state.audio_input.lock().map_err(|e| e.to_string())?;
+    if let Some(running) = audio_input.as_ref() {
+        running.set_paused(paused);
+    }
+    Ok(())
+}

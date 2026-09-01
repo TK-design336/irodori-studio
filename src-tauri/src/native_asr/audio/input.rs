@@ -29,6 +29,7 @@ const INPUT_QUEUE_SIZE: usize = 8;
 
 pub struct RunningAudioInput {
     stop_requested: Arc<AtomicBool>,
+    pause_requested: Arc<AtomicBool>,
     join_handle: Option<JoinHandle<()>>,
 }
 
@@ -69,7 +70,9 @@ impl RunningAudioInput {
         );
 
         let stop_requested = Arc::new(AtomicBool::new(false));
+        let pause_requested = Arc::new(AtomicBool::new(false));
         let worker_stop = stop_requested.clone();
+        let worker_pause = pause_requested.clone();
         let recognition_config = config.clone();
         let join_handle = thread::Builder::new()
             .name("moirai-native-asr-audio".to_string())
@@ -81,6 +84,7 @@ impl RunningAudioInput {
                     &receiver,
                     source_sample_rate,
                     &worker_stop,
+                    &worker_pause,
                     asr_engine_cache,
                     initial_pcm,
                     stream,
@@ -90,12 +94,17 @@ impl RunningAudioInput {
 
         Ok(Self {
             stop_requested,
+            pause_requested,
             join_handle: Some(join_handle),
         })
     }
 
     pub fn stop(mut self) {
         self.stop_inner();
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        self.pause_requested.store(paused, Ordering::SeqCst);
     }
 
     fn stop_inner(&mut self) {
@@ -121,6 +130,7 @@ fn run_audio_worker(
     receiver: &Receiver<InputChunk>,
     source_sample_rate: u32,
     stop_requested: &AtomicBool,
+    pause_requested: &AtomicBool,
     asr_engine_cache: Arc<AsrEngineCache>,
     initial_pcm: Option<Vec<f32>>,
     stream: Stream,
@@ -151,7 +161,15 @@ fn run_audio_worker(
         feed_resampled_pcm(handle, recognition.as_mut(), &pcm);
     }
 
+    let mut pipeline_paused = false;
     while !stop_requested.load(Ordering::Acquire) {
+        let paused = pause_requested.load(Ordering::Acquire);
+        if paused != pipeline_paused {
+            if let Some(recognition) = recognition.as_mut() {
+                recognition.reset_turn();
+            }
+            pipeline_paused = paused;
+        }
         let current_config = runtime_config
             .read()
             .map_or_else(|_| config.clone(), |c| c.clone());
@@ -176,12 +194,18 @@ fn run_audio_worker(
         }
 
         match receiver.recv_timeout(Duration::from_millis(50)) {
-            Ok(chunk) => process_input_chunk(
-                handle,
-                &mut resampler,
-                recognition.as_mut(),
-                &chunk,
-            ),
+            Ok(chunk) => {
+                if paused {
+                    let _ = handle.emit("irodori-asr-input-level", 0.0f32);
+                } else {
+                    process_input_chunk(
+                        handle,
+                        &mut resampler,
+                        recognition.as_mut(),
+                        &chunk,
+                    );
+                }
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }

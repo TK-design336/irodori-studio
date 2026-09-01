@@ -25,6 +25,7 @@ pub struct VadResult {
 pub trait VadEngine: Send {
     fn process(&mut self, samples: &[f32]) -> Result<VadResult>;
     fn set_threshold(&mut self, _threshold: f32) {}
+    fn reset(&mut self) {}
 }
 
 pub struct OnnxRuntimeSileroVadEngine {
@@ -121,5 +122,10 @@ impl VadEngine for OnnxRuntimeSileroVadEngine {
 
     fn set_threshold(&mut self, threshold: f32) {
         self.threshold = threshold;
+    }
+
+    fn reset(&mut self) {
+        self.state.fill(0.0);
+        self.context.fill(0.0);
     }
 }

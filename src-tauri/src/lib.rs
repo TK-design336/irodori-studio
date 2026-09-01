@@ -1664,6 +1664,7 @@ pub fn run() {
             native_asr::commands::native_asr_preload,
             native_asr::commands::native_asr_start,
             native_asr::commands::native_asr_stop,
+            native_asr::commands::native_asr_set_paused,
             native_asr::commands::native_asr_list_devices,
             native_asr::commands::native_asr_get_config,
             native_asr::commands::native_asr_set_config,

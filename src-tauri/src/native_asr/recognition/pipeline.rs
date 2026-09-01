@@ -85,6 +85,11 @@ impl RecognitionPipeline {
         self.vad.set_threshold(config.vad_threshold);
     }
 
+    pub fn reset_turn(&mut self) {
+        self.segment_builder.reset();
+        self.vad.reset();
+    }
+
     pub fn stop(mut self) {
         self.stop_inner();
     }

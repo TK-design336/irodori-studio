@@ -2635,7 +2635,7 @@ input[type="range"] {
 }
 
 .live-queue-pill {
-  background: color-mix(in srgb, var(--accent) 18%, var(--bg-elevated));
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg-elev));
   color: var(--accent-deep);
   border-color: color-mix(in srgb, var(--accent) 35%, var(--line));
 }
@@ -2675,18 +2675,25 @@ input[type="range"] {
 }
 
 .live-history-item {
-  border: 1px solid var(--border-subtle);
+  border: 1px solid var(--line);
   border-radius: 10px;
   padding: 0.45rem 0.55rem;
-  background: var(--bg-elevated);
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  background: var(--bg-elev);
+  transition: border-color 0.15s ease, background-color 0.15s ease;
 }
 
-.live-history-item.status-playing,
-.live-history-item.status-synthesizing,
 .live-history-item.status-queued {
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
+  background: color-mix(in srgb, var(--accent) 5%, var(--bg-elev));
+}
+
+.live-history-item.status-synthesizing {
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-elev));
+  border-color: color-mix(in srgb, var(--accent) 32%, var(--line));
+}
+
+.live-history-item.status-playing {
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-elev));
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
 }
 
 .live-history-top {
@@ -2717,10 +2724,18 @@ input[type="range"] {
   background: color-mix(in srgb, var(--muted) 18%, transparent);
 }
 
-.live-status-pill.queued,
-.live-status-pill.synthesizing,
+.live-status-pill.queued {
+  background: color-mix(in srgb, var(--muted) 16%, transparent);
+  color: var(--muted);
+}
+
+.live-status-pill.synthesizing {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent-deep);
+}
+
 .live-status-pill.playing {
-  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
   color: var(--accent-deep);
 }
 

@@ -147,6 +147,15 @@ export async function synthesizeLiveSegment(opts: {
   return playPath;
 }
 
+export async function deleteLiveWav(path: string | undefined): Promise<void> {
+  if (!path) return;
+  try {
+    await invoke("delete_file", { path });
+  } catch {
+    /* ignore */
+  }
+}
+
 export async function runLiveSegmentPipeline<T>(opts: {
   segmentCount: number;
   produce: (index: number) => Promise<T>;

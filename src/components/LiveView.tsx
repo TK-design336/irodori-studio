@@ -15,8 +15,8 @@ import {
 import {
   liveMaxChars,
   liveTextSegments,
-  runLiveSegmentPipeline,
   synthesizeLiveSegment,
+  deleteLiveWav,
 } from "../lib/liveSynthesis";
 import {
   buildLiveSampling,
@@ -65,6 +65,16 @@ function formatTime(iso: string): string {
     return "";
   }
 }
+
+type LiveReadySegment = {
+  gen: number;
+  itemId: string;
+  text: string;
+  index: number;
+  last: boolean;
+  path?: string;
+  error?: string;
+};
 
 function ParamSlider({
   label,
@@ -141,8 +151,14 @@ export function LiveView({ speakers, settings }: Props) {
   const historyRef = useRef(history);
   const queueRef = useRef<string[]>([]);
   const pendingRef = useRef<Map<string, LiveHistoryItem>>(new Map());
-  const pumpRunningRef = useRef(false);
-  const pumpRef = useRef<() => void>(() => {});
+  const synthesizedRef = useRef<Set<string>>(new Set());
+  const readySegsRef = useRef<LiveReadySegment[]>([]);
+  const segWaitersRef = useRef<Array<() => void>>([]);
+  const synthRunningRef = useRef(false);
+  const playRunningRef = useRef(false);
+  const synthPumpRef = useRef<() => void>(() => {});
+  const playPumpRef = useRef<() => void>(() => {});
+  const micPausedForQueueRef = useRef(false);
   const generationRef = useRef(0);
   const micSessionRef = useRef<LiveMicAsrSession | null>(null);
   const enqueueItemRef = useRef<
@@ -323,29 +339,78 @@ export function LiveView({ speakers, settings }: Props) {
 
   const sampling = useMemo(() => buildLiveSampling(prefs), [prefs]);
 
-  const processItem = useCallback(
+  const notifySeg = useCallback(() => {
+    const waiters = segWaitersRef.current.splice(0);
+    waiters.forEach((w) => w());
+  }, []);
+
+  const waitForSeg = useCallback(() => {
+    if (readySegsRef.current.length > 0) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      segWaitersRef.current.push(resolve);
+    });
+  }, []);
+
+  const discardReadySegs = useCallback(async () => {
+    const segs = readySegsRef.current.splice(0);
+    notifySeg();
+    await Promise.all(segs.map((seg) => deleteLiveWav(seg.path)));
+  }, [notifySeg]);
+
+  const pushReadySeg = useCallback(
+    (seg: LiveReadySegment) => {
+      if (seg.gen !== generationRef.current) {
+        void deleteLiveWav(seg.path);
+        return;
+      }
+      readySegsRef.current.push(seg);
+      notifySeg();
+    },
+    [notifySeg],
+  );
+
+  const dropReadyForItem = useCallback(async (itemId: string) => {
+    const keep: LiveReadySegment[] = [];
+    const drop: LiveReadySegment[] = [];
+    for (const seg of readySegsRef.current) {
+      if (seg.itemId === itemId) drop.push(seg);
+      else keep.push(seg);
+    }
+    readySegsRef.current = keep;
+    await Promise.all(drop.map((seg) => deleteLiveWav(seg.path)));
+  }, []);
+
+  const kickPumps = useCallback(() => {
+    void synthPumpRef.current();
+    void playPumpRef.current();
+  }, []);
+
+  const synthesizeItem = useCallback(
     async (item: LiveHistoryItem, gen: number) => {
       const isActive = () => gen === generationRef.current;
-      const player = playerRef.current;
-      if (!player) throw new Error("プレイヤーが初期化されていません");
-
       updateItem(item.id, { status: "synthesizing" });
-      setStatus(`生成中…「${item.text.slice(0, 20)}」`);
-
-      await invoke("ensure_worker");
-      if (!isActive()) throw new Error("cancelled");
+      if (!playRunningRef.current) {
+        setStatus(`生成中…「${item.text.slice(0, 20)}」`);
+      }
 
       const segments = liveTextSegments(item.text, liveMaxChars(settingsRef.current));
-      if (segments.length === 0) throw new Error("テキストが空です");
+      if (segments.length === 0) {
+        pushReadySeg({
+          gen,
+          itemId: item.id,
+          text: item.text,
+          index: 0,
+          last: true,
+          error: "テキストが空です",
+        });
+        return;
+      }
 
       const speed = prefsRef.current.speed;
-      const volume = prefsRef.current.volume;
-
-      await runLiveSegmentPipeline({
-        segmentCount: segments.length,
-        produce: async (index) => {
-          if (!isActive()) throw new Error("cancelled");
-          return synthesizeLiveSegment({
+      for (let index = 0; index < segments.length; index += 1) {
+        if (!isActive()) throw new Error("cancelled");
+        try {
+          const path = await synthesizeLiveSegment({
             text: segments[index],
             itemId: item.id,
             segmentIndex: index,
@@ -357,83 +422,206 @@ export function LiveView({ speakers, settings }: Props) {
             speed,
             isActive,
           });
-        },
-        consume: async (playPath, index) => {
-          if (!isActive()) throw new Error("cancelled");
-          const micSession = micSessionRef.current;
-          const pauseDuringTts = prefsRef.current.micPauseDuringTts;
-          if (index === 0 && micSession?.listening) {
-            micSession.beginTtsPlayback(item.text, pauseDuringTts);
-          }
-          updateItem(item.id, { status: "playing" });
-          try {
-            await player.playFromWavPath(`${item.id}:${index}`, null, playPath, volume);
-            await player.waitUntilInactive();
-          } finally {
-            try {
-              await invoke("delete_file", { path: playPath });
-            } catch {
-              /* ignore */
-            }
-          }
-        },
-      });
-
-      const micSession = micSessionRef.current;
-      if (micSession?.listening) {
-        micSession.endTtsPlayback(prefsRef.current.micPauseDuringTts);
+          pushReadySeg({
+            gen,
+            itemId: item.id,
+            text: item.text,
+            index,
+            last: index === segments.length - 1,
+            path,
+          });
+        } catch (e) {
+          const msg = String(e);
+          pushReadySeg({
+            gen,
+            itemId: item.id,
+            text: item.text,
+            index,
+            last: true,
+            error: msg === "cancelled" ? "cancelled" : msg,
+          });
+          return;
+        }
       }
     },
-    [updateItem],
+    [pushReadySeg, updateItem],
   );
 
-  const pump = useCallback(async () => {
-    if (pumpRunningRef.current) return;
-    pumpRunningRef.current = true;
+  const synthPump = useCallback(async () => {
+    if (synthRunningRef.current) return;
+    synthRunningRef.current = true;
     const gen = generationRef.current;
     try {
-      while (queueRef.current.length > 0 && gen === generationRef.current) {
-        const id = queueRef.current[0];
+      await invoke("ensure_worker");
+      while (gen === generationRef.current) {
+        const id = queueRef.current.find((qid) => !synthesizedRef.current.has(qid));
+        if (!id) break;
         const item =
           pendingRef.current.get(id) ?? historyRef.current.find((x) => x.id === id);
         if (!item) {
-          queueRef.current.shift();
+          synthesizedRef.current.add(id);
           continue;
         }
         try {
-          await processItem(item, gen);
-          if (gen !== generationRef.current) {
-            updateItem(item.id, { status: "cancelled" });
-          } else {
-            updateItem(item.id, { status: "done", error: undefined });
-            setStatus("再生完了");
-          }
+          await synthesizeItem(item, gen);
         } catch (e) {
           const msg = String(e);
-          if (gen !== generationRef.current || msg === "cancelled") {
-            updateItem(item.id, { status: "cancelled" });
-          } else {
-            updateItem(item.id, { status: "error", error: msg });
-            setStatus(`エラー: ${msg}`);
+          if (gen === generationRef.current && msg !== "cancelled") {
+            pushReadySeg({
+              gen,
+              itemId: item.id,
+              text: item.text,
+              index: 0,
+              last: true,
+              error: msg,
+            });
           }
-        } finally {
-          pendingRef.current.delete(id);
-          queueRef.current.shift();
+        }
+        if (gen === generationRef.current) {
+          synthesizedRef.current.add(id);
         }
       }
     } finally {
-      pumpRunningRef.current = false;
-      if (queueRef.current.length > 0 && gen === generationRef.current) {
-        void pumpRef.current();
+      synthRunningRef.current = false;
+      notifySeg();
+      if (
+        gen === generationRef.current &&
+        queueRef.current.some((id) => !synthesizedRef.current.has(id))
+      ) {
+        void synthPumpRef.current();
       }
     }
-  }, [processItem, updateItem]);
+  }, [notifySeg, pushReadySeg, synthesizeItem]);
+
+  const playPump = useCallback(async () => {
+    if (playRunningRef.current) return;
+    playRunningRef.current = true;
+    const gen = generationRef.current;
+    const player = playerRef.current;
+    const beginMicPause = (spokenText: string) => {
+      const micSession = micSessionRef.current;
+      if (!micSession?.listening || micPausedForQueueRef.current) return;
+      micSession.beginTtsPlayback(spokenText, prefsRef.current.micPauseDuringTts);
+      micPausedForQueueRef.current = true;
+    };
+    const endMicPause = (delayMs?: number) => {
+      if (!micPausedForQueueRef.current) return;
+      micPausedForQueueRef.current = false;
+      const micSession = micSessionRef.current;
+      if (micSession?.listening) {
+        micSession.endTtsPlayback(prefsRef.current.micPauseDuringTts, delayMs);
+      }
+    };
+    try {
+      if (!player) throw new Error("プレイヤーが初期化されていません");
+      while (gen === generationRef.current) {
+        while (readySegsRef.current.length === 0) {
+          const moreSynth =
+            synthRunningRef.current ||
+            queueRef.current.some((id) => !synthesizedRef.current.has(id));
+          if (!moreSynth) {
+            endMicPause();
+            if (queueRef.current.length === 0) setStatus("再生完了");
+            return;
+          }
+          setStatus("次の発話を生成中…");
+          await waitForSeg();
+          if (gen !== generationRef.current) return;
+        }
+        const seg = readySegsRef.current.shift();
+        if (!seg) continue;
+        if (seg.gen !== gen) {
+          await deleteLiveWav(seg.path);
+          continue;
+        }
+        if (!queueRef.current.includes(seg.itemId)) {
+          await deleteLiveWav(seg.path);
+          continue;
+        }
+
+        if (seg.error) {
+          const cancelled = seg.error === "cancelled" || gen !== generationRef.current;
+          updateItem(seg.itemId, {
+            status: cancelled ? "cancelled" : "error",
+            error: cancelled ? undefined : seg.error,
+          });
+          if (!cancelled) setStatus(`エラー: ${seg.error}`);
+          pendingRef.current.delete(seg.itemId);
+          const qi = queueRef.current.indexOf(seg.itemId);
+          if (qi >= 0) queueRef.current.splice(qi, 1);
+          await dropReadyForItem(seg.itemId);
+          continue;
+        }
+
+        if (!seg.path) {
+          updateItem(seg.itemId, { status: "error", error: "生成失敗" });
+          pendingRef.current.delete(seg.itemId);
+          const qi = queueRef.current.indexOf(seg.itemId);
+          if (qi >= 0) queueRef.current.splice(qi, 1);
+          await dropReadyForItem(seg.itemId);
+          continue;
+        }
+
+        beginMicPause(seg.text);
+        if (seg.index === 0) {
+          updateItem(seg.itemId, { status: "playing" });
+        }
+        setStatus(`再生中…「${seg.text.slice(0, 20)}」`);
+        const volume = prefsRef.current.volume;
+        try {
+          await player.playFromWavPath(`${seg.itemId}:${seg.index}`, null, seg.path, volume);
+          await player.waitUntilInactive();
+        } catch (e) {
+          await deleteLiveWav(seg.path);
+          if (gen !== generationRef.current) return;
+          const msg = String(e);
+          updateItem(seg.itemId, { status: "error", error: msg });
+          setStatus(`エラー: ${msg}`);
+          pendingRef.current.delete(seg.itemId);
+          const qi = queueRef.current.indexOf(seg.itemId);
+          if (qi >= 0) queueRef.current.splice(qi, 1);
+          await dropReadyForItem(seg.itemId);
+          continue;
+        }
+        await deleteLiveWav(seg.path);
+        if (gen !== generationRef.current) return;
+        if (seg.last) {
+          updateItem(seg.itemId, { status: "done", error: undefined });
+          pendingRef.current.delete(seg.itemId);
+          const qi = queueRef.current.indexOf(seg.itemId);
+          if (qi >= 0) queueRef.current.splice(qi, 1);
+        }
+      }
+    } catch (e) {
+      if (gen === generationRef.current) {
+        setStatus(`エラー: ${String(e)}`);
+      }
+    } finally {
+      if (gen === generationRef.current) {
+        const morePlay =
+          readySegsRef.current.length > 0 ||
+          synthRunningRef.current ||
+          queueRef.current.some((id) => !synthesizedRef.current.has(id));
+        if (!morePlay) endMicPause();
+      }
+      playRunningRef.current = false;
+      if (gen === generationRef.current && queueRef.current.length > 0) {
+        void playPumpRef.current();
+      }
+    }
+  }, [dropReadyForItem, updateItem, waitForSeg]);
 
   useEffect(() => {
-    pumpRef.current = () => {
-      void pump();
+    synthPumpRef.current = () => {
+      void synthPump();
     };
-  }, [pump]);
+  }, [synthPump]);
+
+  useEffect(() => {
+    playPumpRef.current = () => {
+      void playPump();
+    };
+  }, [playPump]);
 
   const resumeOrphanedQueue = useCallback(() => {
     const queued = historyRef.current.filter((item) => item.status === "queued");
@@ -445,8 +633,8 @@ export function LiveView({ speakers, settings }: Props) {
         queueRef.current.push(item.id);
       }
     }
-    void pumpRef.current();
-  }, []);
+    kickPumps();
+  }, [kickPumps]);
 
   useEffect(() => {
     resumeOrphanedQueue();
@@ -483,10 +671,10 @@ export function LiveView({ speakers, settings }: Props) {
       pendingRef.current.set(item.id, item);
       queueRef.current.push(item.id);
       setStatus(`キューに追加: ${text.slice(0, 24)}${text.length > 24 ? "…" : ""}`);
-      void pumpRef.current();
+      kickPumps();
       return true;
     },
-    [pump],
+    [kickPumps],
   );
 
   enqueueItemRef.current = enqueueItem;
@@ -562,9 +750,12 @@ export function LiveView({ speakers, settings }: Props) {
     generationRef.current += 1;
     queueRef.current = [];
     pendingRef.current.clear();
+    synthesizedRef.current.clear();
+    void discardReadySegs();
     playerRef.current?.stop(true);
+    micPausedForQueueRef.current = false;
     const micSession = micSessionRef.current;
-    if (micSession?.listening && prefsRef.current.micPauseDuringTts && !micSession.capturing) {
+    if (micSession?.listening && prefsRef.current.micPauseDuringTts) {
       micSession.endTtsPlayback(true, 0);
     }
     setHistory((prev) => {
@@ -577,7 +768,7 @@ export function LiveView({ speakers, settings }: Props) {
       return next;
     });
     setStatus("停止しました");
-  }, []);
+  }, [discardReadySegs]);
 
   const clearHistory = useCallback(() => {
     if (historyRef.current.length === 0) return;
@@ -594,11 +785,18 @@ export function LiveView({ speakers, settings }: Props) {
     generationRef.current += 1;
     queueRef.current = [];
     pendingRef.current.clear();
+    synthesizedRef.current.clear();
+    void discardReadySegs();
     playerRef.current?.stop(true);
+    micPausedForQueueRef.current = false;
+    const micSession = micSessionRef.current;
+    if (micSession?.listening && prefsRef.current.micPauseDuringTts) {
+      micSession.endTtsPlayback(true, 0);
+    }
     historyRef.current = [];
     setHistory([]);
     setStatus("履歴を削除しました");
-  }, []);
+  }, [discardReadySegs]);
 
   const replayItem = useCallback(
     (item: LiveHistoryItem) => {

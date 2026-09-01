@@ -269,6 +269,11 @@ impl SegmentBuilder {
         self.config = next_config;
     }
 
+    pub(crate) fn reset(&mut self) {
+        self.state = SegmentBuilderState::new(&self.config);
+        self.pending_previous_segment_id = None;
+    }
+
     fn take_next_segment_id(&mut self) -> u64 {
         let segment_id = self.next_segment_id;
         self.next_segment_id = self.next_segment_id.saturating_add(1);

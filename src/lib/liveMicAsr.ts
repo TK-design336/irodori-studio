@@ -13,7 +13,9 @@ import {
   appendTtsSpokenText,
   isTtsAsrEchoPiece,
   nextTtsEchoGuardUntil,
+  POST_TTS_ASR_PAUSE_RESUME_DELAY_MS,
   POST_TTS_ASR_RESUME_DELAY_MS,
+  POST_TTS_WEB_SPEECH_RESUME_DELAY_MS,
   waitUntilTtsEchoGuardInactive,
 } from "./liveTtsEchoGuard";
 import { LiveWebSpeechAsrSession } from "./liveWebSpeechAsr";
@@ -188,6 +190,13 @@ export class LiveMicAsrSession {
     this.echoTextFilterUntil = 0;
     this.recentSpokenText = "";
     this.clearResumeTimer();
+    if (this.nativeActive) {
+      try {
+        await invoke("native_asr_set_paused", { paused: false });
+      } catch {
+        /* already stopping */
+      }
+    }
     await this.stopCapture();
     this.callbacks.onStatus?.("マイク入力を停止しました");
   }
@@ -204,40 +213,69 @@ export class LiveMicAsrSession {
 
     this.pausedForPlayback = true;
     this.clearResumeTimer();
-    void this.stopCapture();
     this.callbacks.onPartial?.("");
     this.callbacks.onStatus?.("再生中のため認識を一時停止");
+
+    if (this.engine === "native" && this.nativeActive) {
+      void invoke("native_asr_set_paused", { paused: true });
+      return;
+    }
+    void this.stopCapture();
   }
 
   /** TTS 再生終了 */
-  endTtsPlayback(pauseCapture: boolean, delayMs = POST_TTS_ASR_RESUME_DELAY_MS): void {
+  endTtsPlayback(pauseCapture: boolean, delayMs?: number): void {
     if (!this.captureWanted) return;
-    this.echoTextFilterUntil = nextTtsEchoGuardUntil(this.echoTextFilterUntil, delayMs);
+    const resumeDelay =
+      delayMs ??
+      (this.engine === "native" && this.nativeActive
+        ? POST_TTS_ASR_PAUSE_RESUME_DELAY_MS
+        : pauseCapture
+          ? POST_TTS_WEB_SPEECH_RESUME_DELAY_MS
+          : POST_TTS_ASR_RESUME_DELAY_MS);
+    this.echoTextFilterUntil = nextTtsEchoGuardUntil(
+      this.echoTextFilterUntil,
+      pauseCapture ? Math.max(resumeDelay, 800) : POST_TTS_ASR_RESUME_DELAY_MS,
+    );
     if (!pauseCapture) return;
 
-    this.pausedForPlayback = false;
-    this.echoResumeUntil = nextTtsEchoGuardUntil(this.echoResumeUntil, delayMs);
+    this.echoResumeUntil = nextTtsEchoGuardUntil(this.echoResumeUntil, resumeDelay);
     this.clearResumeTimer();
     this.callbacks.onStatus?.("再生終了後に認識を再開します…");
-    this.scheduleResume();
+    this.scheduleResume(resumeDelay);
   }
 
-  private scheduleResume() {
+  private scheduleResume(delayMs = POST_TTS_ASR_RESUME_DELAY_MS) {
     this.clearResumeTimer();
     const run = () => {
       this.resumeTimer = null;
       if (!this.captureWanted) return;
       void waitUntilTtsEchoGuardInactive(
-        () => this.pausedForPlayback || Date.now() < this.echoResumeUntil,
+        () => Date.now() < this.echoResumeUntil,
         () => this.echoResumeUntil,
       ).then(() => {
-        if (!this.captureWanted || this.capturing) return;
+        if (!this.captureWanted) return;
+        if (this.engine === "native" && this.nativeActive) {
+          void invoke("native_asr_set_paused", { paused: false })
+            .then(() => {
+              if (!this.captureWanted) return;
+              this.pausedForPlayback = false;
+              this.callbacks.onStatus?.("話しかけてください");
+            })
+            .catch((error) => {
+              this.pausedForPlayback = false;
+              this.callbacks.onError?.(String(error));
+            });
+          return;
+        }
+        this.pausedForPlayback = false;
+        if (this.capturing) return;
         void this.startCapture().catch((error) => {
           this.callbacks.onError?.(String(error));
         });
       });
     };
-    const waitMs = Math.max(16, this.echoResumeUntil - Date.now());
+    const waitMs = Math.max(16, delayMs, this.echoResumeUntil - Date.now());
     this.resumeTimer = window.setTimeout(run, waitMs);
   }
 }

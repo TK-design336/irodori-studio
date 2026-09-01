@@ -1,5 +1,11 @@
-/** TTS 終了後、スピーカー残響を拾わないよう ASR 再開を遅らせる時間 */
+/** TTS 終了後、スピーカー残響を拾わないよう ASR 再開を遅らせる時間（キャプチャ継続時） */
 export const POST_TTS_ASR_RESUME_DELAY_MS = 1400;
+
+/** 再生中にキャプチャを止めていた場合の再開待ち（パイプラインは維持したまま） */
+export const POST_TTS_ASR_PAUSE_RESUME_DELAY_MS = 60;
+
+/** Web Speech は stop/start になるため、わずかな余韻待ちを残す */
+export const POST_TTS_WEB_SPEECH_RESUME_DELAY_MS = 200;
 
 export function nextTtsEchoGuardUntil(currentUntil: number, delayMs: number): number {
   return Math.max(currentUntil, Date.now() + delayMs);
