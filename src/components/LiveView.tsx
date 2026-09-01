@@ -1,15 +1,16 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { AppSettings, SpeakerInfo } from "../types";
 import { defaultSampling, isIrodoriV4, newLineId, speakerOptionLabel } from "../types";
 import { SpeakerSelect } from "./SpeakerSelect";
 import { LineAudioPlayer } from "../lib/audioPlayer";
 import {
-  audioOutputSinkSupported,
   loadAudioOutputPreference,
   normalizeAudioOutputs,
+  normalizeNativeAudioOutputs,
   saveAudioOutputPreference,
   type AudioOutputStatus,
+  type NativeOutputDeviceInfo,
 } from "../lib/audioOutput";
 import {
   liveMaxChars,
@@ -23,6 +24,7 @@ import {
   loadLivePrefs,
   saveLiveHistory,
   saveLivePrefs,
+  MAX_HISTORY,
   type LiveAsrEngine,
   type LiveEnterKeyMode,
   type LiveHistoryItem,
@@ -121,13 +123,11 @@ export function LiveView({ speakers, settings }: Props) {
   const [status, setStatus] = useState("");
   const [outputDevices, setOutputDevices] = useState<
     Array<{ deviceId: string; label: string }>
-  >([]);
+  >([{ deviceId: "", label: "システム既定" }]);
   const [outputDeviceId, setOutputDeviceId] = useState(
     () => loadAudioOutputPreference().deviceId,
   );
-  const [outputStatus, setOutputStatus] = useState<AudioOutputStatus>(() =>
-    audioOutputSinkSupported() ? "ready" : "unsupported",
-  );
+  const [outputStatus, setOutputStatus] = useState<AudioOutputStatus>("ready");
   const [configCollapsed, setConfigCollapsed] = useState(false);
   const [playbackCollapsed, setPlaybackCollapsed] = useState(false);
   const [micInputDevices, setMicInputDevices] = useState<
@@ -151,6 +151,7 @@ export function LiveView({ speakers, settings }: Props) {
   const speakersRef = useRef(speakers);
   const settingsRef = useRef(settings);
   const prefsRef = useRef(prefs);
+  const historyListRef = useRef<HTMLUListElement | null>(null);
   const playerRef = useRef<LineAudioPlayer | null>(null);
 
   useEffect(() => {
@@ -173,7 +174,9 @@ export function LiveView({ speakers, settings }: Props) {
 
   useEffect(() => {
     if (!playerRef.current) {
-      playerRef.current = new LineAudioPlayer({ onChange: () => {} });
+      const player = new LineAudioPlayer({ onChange: () => {} });
+      player.enableNativeOutput();
+      playerRef.current = player;
     }
     return () => {
       playerRef.current?.stop(true);
@@ -181,13 +184,26 @@ export function LiveView({ speakers, settings }: Props) {
   }, []);
 
   const refreshOutputDevices = useCallback(async () => {
+    setOutputStatus((s) => (s === "switching" ? "switching" : "requesting"));
+    try {
+      const native = await invoke<NativeOutputDeviceInfo[]>("native_audio_list_outputs");
+      const normalized = normalizeNativeAudioOutputs(native);
+      const pref = loadAudioOutputPreference();
+      setOutputDevices(normalized);
+      if (pref.deviceId && !normalized.some((d) => d.deviceId === pref.deviceId)) {
+        setOutputDeviceId("");
+      }
+      setOutputStatus("ready");
+      return;
+    } catch {
+      /* fall through to Web Audio enumeration */
+    }
     if (!navigator.mediaDevices?.enumerateDevices) {
       setOutputDevices(normalizeAudioOutputs());
       setOutputStatus("unsupported");
       return;
     }
     try {
-      setOutputStatus((s) => (s === "switching" ? "switching" : "requesting"));
       let devices = await navigator.mediaDevices.enumerateDevices();
       const hasLabels = devices.some((d) => d.kind === "audiooutput" && d.label);
       if (!hasLabels && navigator.mediaDevices.getUserMedia) {
@@ -207,11 +223,7 @@ export function LiveView({ speakers, settings }: Props) {
           : null,
       );
       setOutputDevices(normalized);
-      if (!audioOutputSinkSupported()) {
-        setOutputStatus("unsupported");
-      } else {
-        setOutputStatus((s) => (s === "locked-default" ? "locked-default" : "ready"));
-      }
+      setOutputStatus((s) => (s === "locked-default" ? "locked-default" : "ready"));
     } catch {
       setOutputDevices(normalizeAudioOutputs());
       setOutputStatus("locked-default");
@@ -288,10 +300,6 @@ export function LiveView({ speakers, settings }: Props) {
     saveAudioOutputPreference({ deviceId, label: label || "システム既定" });
     const player = playerRef.current;
     if (!player) return;
-    if (!audioOutputSinkSupported()) {
-      setOutputStatus("unsupported");
-      return;
-    }
     setOutputStatus("switching");
     try {
       const ok = await player.setOutputDevice(deviceId);
@@ -350,7 +358,7 @@ export function LiveView({ speakers, settings }: Props) {
             isActive,
           });
         },
-        consume: async (bytes, index) => {
+        consume: async (playPath, index) => {
           if (!isActive()) throw new Error("cancelled");
           const micSession = micSessionRef.current;
           const pauseDuringTts = prefsRef.current.micPauseDuringTts;
@@ -358,8 +366,16 @@ export function LiveView({ speakers, settings }: Props) {
             micSession.beginTtsPlayback(item.text, pauseDuringTts);
           }
           updateItem(item.id, { status: "playing" });
-          await player.playFromBytes(`${item.id}:${index}`, null, bytes, volume);
-          await player.waitUntilInactive();
+          try {
+            await player.playFromWavPath(`${item.id}:${index}`, null, playPath, volume);
+            await player.waitUntilInactive();
+          } finally {
+            try {
+              await invoke("delete_file", { path: playPath });
+            } catch {
+              /* ignore */
+            }
+          }
         },
       });
 
@@ -436,6 +452,12 @@ export function LiveView({ speakers, settings }: Props) {
     resumeOrphanedQueue();
   }, [resumeOrphanedQueue]);
 
+  useLayoutEffect(() => {
+    const el = historyListRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [history.length]);
+
   const enqueueItem = useCallback(
     (partial: Pick<LiveHistoryItem, "text" | "speakerEmbedPath" | "caption" | "sampling">) => {
       const text = partial.text.trim();
@@ -454,7 +476,7 @@ export function LiveView({ speakers, settings }: Props) {
         status: "queued",
       };
       setHistory((prev) => {
-        const next = [item, ...prev].slice(0, 120);
+        const next = [...prev, item].slice(-MAX_HISTORY);
         historyRef.current = next;
         return next;
       });
@@ -791,7 +813,9 @@ export function LiveView({ speakers, settings }: Props) {
                   </select>
                   {outputLocked ? (
                     <span className="param-hint">システム既定の出力を使用します</span>
-                  ) : null}
+                  ) : (
+                    <span className="param-hint">仮想ケーブルなど任意の再生デバイスへ直接出力します</span>
+                  )}
                 </label>
                 <label className="param-field">
                   <span className="param-label">音声認識</span>
@@ -896,7 +920,7 @@ export function LiveView({ speakers, settings }: Props) {
                 <p className="hint">下のマイク入力またはテキスト欄から発話を追加してください</p>
               </div>
             ) : (
-              <ul className="live-history-list">
+              <ul ref={historyListRef} className="live-history-list">
                 {history.map((item) => {
                   const sp = speakers.find((s) => s.embedPath === item.speakerEmbedPath);
                   const speakerLabel = sp ? speakerOptionLabel(sp) : "（不明）";
@@ -958,19 +982,19 @@ export function LiveView({ speakers, settings }: Props) {
                 >
                   {micListening ? "停止" : "認識開始"}
                 </button>
-                <div className="live-mic-level" aria-hidden>
-                  <div
-                    className="live-mic-level-fill"
-                    style={{ width: `${Math.round(micLevel * 100)}%` }}
-                  />
+                <div className="live-mic-meter">
+                  <div className="live-mic-level" aria-hidden>
+                    <div
+                      className="live-mic-level-fill"
+                      style={{ width: `${Math.round(micLevel * 100)}%` }}
+                    />
+                  </div>
+                  <div className="live-mic-feedback">
+                    {micPartial ? <span className="live-mic-partial">{micPartial}</span> : null}
+                    {micStatus ? <span className="live-mic-status hint">{micStatus}</span> : null}
+                  </div>
                 </div>
               </div>
-              {micPartial || micStatus ? (
-                <div className="live-mic-feedback">
-                  {micPartial ? <span className="live-mic-partial">{micPartial}</span> : null}
-                  {micStatus ? <span className="live-mic-status hint">{micStatus}</span> : null}
-                </div>
-              ) : null}
             </div>
             <textarea
               id="live-text-input"

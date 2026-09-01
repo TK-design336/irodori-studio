@@ -2,6 +2,7 @@ mod asr;
 mod dictionary;
 mod http_server;
 mod native_asr;
+mod native_output;
 mod project;
 mod python_env;
 mod settings;
@@ -1571,6 +1572,7 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .manage(state)
         .manage(native_asr::NativeAsrAppState::default())
+        .manage(native_output::NativeOutputState::default())
         .setup(|app| {
             match init_studio_resource_paths(app.handle()) {
                 Ok(dir) => {
@@ -1665,6 +1667,10 @@ pub fn run() {
             native_asr::commands::native_asr_list_devices,
             native_asr::commands::native_asr_get_config,
             native_asr::commands::native_asr_set_config,
+            native_output::native_audio_list_outputs,
+            native_output::native_audio_play_path,
+            native_output::native_audio_set_volume,
+            native_output::native_audio_stop,
             wav_duration_secs,
             write_text_file,
         ])

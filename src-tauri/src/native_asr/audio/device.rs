@@ -44,6 +44,47 @@ pub fn collect_input_devices() -> Vec<DeviceInfo> {
     devices
 }
 
+pub fn collect_output_devices() -> Vec<DeviceInfo> {
+    let mut devices = Vec::new();
+    for host_id in available_non_asio_hosts() {
+        let Ok(host) = cpal::host_from_id(host_id) else {
+            continue;
+        };
+        let Ok(output_devices) = host.output_devices() else {
+            continue;
+        };
+
+        for device in output_devices {
+            let Some(device_info) = output_device_info(host_id, &device) else {
+                continue;
+            };
+            devices.push(device_info);
+        }
+    }
+
+    devices
+}
+
+pub(crate) struct OutputDeviceSelection {
+    pub device: Device,
+    pub stream_config: StreamConfig,
+    pub sample_format: SampleFormat,
+    pub device_info: DeviceInfo,
+}
+
+/// `device_key` is `""` (system default) or `"host::id"`.
+pub(crate) fn resolve_output_device(device_key: &str) -> Result<OutputDeviceSelection> {
+    let key = device_key.trim();
+    if key.is_empty() {
+        return default_output_device();
+    }
+    let (host, id) = key.split_once("::").map_or((None, key), |(h, i)| (Some(h), i));
+    if let Some(selected) = find_output_device(host, id)? {
+        return Ok(selected);
+    }
+    default_output_device()
+}
+
 pub(crate) fn selected_input_device(config: &NativeAsrConfig) -> Result<InputDeviceSelection> {
     if let (Some(host), Some(id)) = (
         config.input_device_host.as_deref(),
@@ -114,6 +155,65 @@ fn device_info(host_id: HostId, device: &Device) -> Option<DeviceInfo> {
         channels: stream_config.channels,
         sample_rate: stream_config.sample_rate,
     })
+}
+
+fn output_device_info(host_id: HostId, device: &Device) -> Option<DeviceInfo> {
+    let default_config = device.default_output_config().ok()?;
+    let stream_config = default_config.config();
+    Some(DeviceInfo {
+        id: device_id(device),
+        host: host_name_from_id(host_id),
+        display_name: device_name(device),
+        channels: stream_config.channels,
+        sample_rate: stream_config.sample_rate,
+    })
+}
+
+fn find_output_device(host_name: Option<&str>, device_id: &str) -> Result<Option<OutputDeviceSelection>> {
+    for host_id in available_non_asio_hosts() {
+        if host_name.is_some_and(|name| host_name_from_id(host_id) != name) {
+            continue;
+        }
+        let host = cpal::host_from_id(host_id)?;
+        let output_devices = host.output_devices()?;
+        for device in output_devices {
+            let Some(info) = output_device_info(host_id, &device) else {
+                continue;
+            };
+            if info.id == device_id {
+                let default_config = device.default_output_config()?;
+                return Ok(Some(OutputDeviceSelection {
+                    device,
+                    stream_config: default_config.config(),
+                    sample_format: default_config.sample_format(),
+                    device_info: info,
+                }));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+pub(crate) fn default_output_device() -> Result<OutputDeviceSelection> {
+    for host_id in available_non_asio_hosts() {
+        let host = cpal::host_from_id(host_id)?;
+        let Some(device) = host.default_output_device() else {
+            continue;
+        };
+        let Some(device_info) = output_device_info(host_id, &device) else {
+            continue;
+        };
+        let default_config = device.default_output_config()?;
+        return Ok(OutputDeviceSelection {
+            device,
+            stream_config: default_config.config(),
+            sample_format: default_config.sample_format(),
+            device_info,
+        });
+    }
+
+    bail!("再生デバイスがありません")
 }
 
 fn available_non_asio_hosts() -> impl Iterator<Item = HostId> {

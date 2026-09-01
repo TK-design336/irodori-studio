@@ -2530,8 +2530,8 @@ input[type="range"] {
   display: grid;
   grid-template-columns: minmax(20rem, 24rem) minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr) auto;
-  gap: 0.65rem;
-  padding: 0.65rem;
+  gap: 0.45rem;
+  padding: 0.5rem;
 }
 
 .live-side {
@@ -2590,15 +2590,21 @@ input[type="range"] {
 }
 
 .live-history-header {
-  gap: 0.75rem;
+  gap: 0.5rem;
+  padding: 0.38rem 0.7rem;
 }
 
 .live-history-header-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.4rem 0.65rem;
+  gap: 0.35rem 0.55rem;
   align-items: center;
   justify-content: flex-end;
+  flex-shrink: 0;
+}
+
+.live-history-header-actions .hint {
+  margin: 0;
 }
 
 .live-clear-history-btn {
@@ -2608,13 +2614,24 @@ input[type="range"] {
 
 .live-history-title {
   display: flex;
-  flex-direction: column;
-  gap: 0.15rem;
+  flex-direction: row;
+  align-items: baseline;
+  gap: 0.55rem;
   min-width: 0;
+  flex: 1;
 }
 
 .live-history-title h3 {
   margin: 0;
+  flex-shrink: 0;
+}
+
+.live-history-title .hint {
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .live-queue-pill {
@@ -2629,6 +2646,7 @@ input[type="range"] {
   overflow: hidden;
   display: flex;
   flex-direction: column;
+  padding: 0.4rem 0.55rem;
 }
 
 .live-history-empty {
@@ -2638,7 +2656,7 @@ input[type="range"] {
   text-align: center;
   gap: 0.35rem;
   color: var(--muted);
-  padding: 2rem 1rem;
+  padding: 1rem 0.75rem;
 }
 
 .live-history-empty p {
@@ -2742,11 +2760,15 @@ input[type="range"] {
 }
 
 .live-compose-field {
-  margin-bottom: 0.45rem;
+  margin-bottom: 0.35rem;
 }
 
 .live-compose {
   grid-column: 2;
+}
+
+.live-compose > .panel-body {
+  padding: 0.45rem 0.65rem;
 }
 
 .live-text-input {
@@ -2777,15 +2799,15 @@ input[type="range"] {
 }
 
 .live-mic-panel-compact {
-  margin-bottom: 0.4rem;
-  padding: 0.4rem 0.65rem;
-  gap: 0.25rem;
+  margin-bottom: 0.3rem;
+  padding: 0.28rem 0.5rem;
+  gap: 0;
 }
 
 .live-mic-toolbar {
   display: flex;
   align-items: center;
-  gap: 0.55rem;
+  gap: 0.5rem;
   flex-wrap: wrap;
 }
 
@@ -2800,24 +2822,37 @@ input[type="range"] {
   font-size: 0.88rem;
 }
 
-.live-mic-toolbar .live-mic-level {
-  flex: 1 1 6rem;
-  min-width: 4rem;
-  margin-left: 0.35rem;
-  height: 0.3rem;
+.live-mic-meter {
+  flex: 1 1 8rem;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0.5rem;
 }
 
-.live-mic-feedback {
+.live-mic-toolbar .live-mic-level {
+  width: 100%;
+  height: 0.35rem;
+  flex: none;
+  margin: 0;
+}
+
+.live-mic-toolbar .live-mic-feedback {
   display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 0.35rem 0.65rem;
-  min-height: 0;
+  min-width: 0;
+  min-height: 1.05em;
+  align-items: center;
+  gap: 0.35rem 0.55rem;
   line-height: 1.3;
 }
 
-.live-mic-feedback .live-mic-partial,
-.live-mic-feedback .live-mic-status {
+.live-mic-toolbar .live-mic-partial,
+.live-mic-toolbar .live-mic-status {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 0.8rem;
 }
 

@@ -99,7 +99,7 @@ export async function synthesizeLiveSegment(opts: {
   caption: string;
   speed: number;
   isActive: () => boolean;
-}): Promise<Uint8Array> {
+}): Promise<string> {
   const sp = speakerOf(opts.speakers, opts.speakerEmbedPath);
   if (!sp) throw new Error("話者が見つかりません");
 
@@ -136,21 +136,15 @@ export async function synthesizeLiveSegment(opts: {
     clipEdit: null,
   });
 
-  const bytes = await invoke<number[]>("read_file_bytes", { path: playPath });
-  if (!opts.isActive()) throw new Error("cancelled");
-
-  try {
-    await invoke("delete_file", { path: outPath });
-  } catch {
-    /* ignore */
-  }
-  try {
-    await invoke("delete_file", { path: playPath });
-  } catch {
-    /* ignore */
+  if (playPath !== outPath) {
+    try {
+      await invoke("delete_file", { path: outPath });
+    } catch {
+      /* ignore */
+    }
   }
 
-  return new Uint8Array(bytes);
+  return playPath;
 }
 
 export async function runLiveSegmentPipeline<T>(opts: {

@@ -69,6 +69,30 @@ export function normalizeAudioOutputs(
   return outputs;
 }
 
+export type NativeOutputDeviceInfo = {
+  id: string;
+  host: string;
+  display_name: string;
+};
+
+export function normalizeNativeAudioOutputs(
+  devices: NativeOutputDeviceInfo[] = [],
+): Array<{ deviceId: string; label: string }> {
+  const outputs = [{ ...DEFAULT_AUDIO_OUTPUT }];
+  const seen = new Set(["", "default"]);
+  for (const device of devices) {
+    if (!device.id) continue;
+    const deviceId = `${device.host}::${device.id}`;
+    if (seen.has(deviceId)) continue;
+    seen.add(deviceId);
+    outputs.push({
+      deviceId,
+      label: device.display_name?.trim() || `音声出力 ${outputs.length}`,
+    });
+  }
+  return outputs;
+}
+
 export type AudioOutputStatus =
   | "ready"
   | "requesting"

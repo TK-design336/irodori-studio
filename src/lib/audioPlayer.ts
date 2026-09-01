@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import type { AudioFx } from "../types";
 import { defaultAudioFx } from "../types";
 import { applyAudioFxToNodes } from "./audioFx";
@@ -44,9 +45,16 @@ export class LineAudioPlayer {
   private silenceSource: AudioBufferSourceNode | null = null;
   private silenceResolve: (() => void) | null = null;
   private listeners: Listeners;
+  private nativeOutput = false;
+  private nativeDeviceId = "";
+  private nativePlayToken = 0;
 
   constructor(listeners: Listeners) {
     this.listeners = listeners;
+  }
+
+  enableNativeOutput() {
+    this.nativeOutput = true;
   }
 
   private emit() {
@@ -98,8 +106,10 @@ export class LineAudioPlayer {
     return this.ctx;
   }
 
-  /** Route Web Audio output to a sink (Chrome / Edge). Empty id = system default. */
+  /** Route output. Native WASAPI when enabled; otherwise Chrome/Edge setSinkId. */
   async setOutputDevice(deviceId: string): Promise<boolean> {
+    this.nativeDeviceId = deviceId;
+    if (this.nativeOutput) return true;
     const ctx = this.ensureCtx();
     const setSinkId = (
       ctx as AudioContext & { setSinkId?: (id: string) => Promise<void> }
@@ -296,6 +306,10 @@ export class LineAudioPlayer {
   stop(clearLine = true) {
     this.cancelSilence();
     this.disconnectSource();
+    if (this.nativeOutput) {
+      this.nativePlayToken += 1;
+      void invoke("native_audio_stop");
+    }
     this.playing = false;
     this.offset = 0;
     this.playFrom = 0;
@@ -350,6 +364,45 @@ export class LineAudioPlayer {
   ) {
     await this.loadFromBytes(lineId, variantId, bytes, volume);
     this.startSource();
+  }
+
+  /** Play a WAV on disk. Native output reads the file in Rust (WebView2 has no setSinkId). */
+  async playFromWavPath(
+    lineId: string,
+    variantId: string | null,
+    path: string,
+    volume: number,
+  ) {
+    if (!this.nativeOutput) {
+      const bytes = await invoke<number[]>("read_file_bytes", { path });
+      await this.playFromBytes(lineId, variantId, new Uint8Array(bytes), volume);
+      return;
+    }
+    this.cancelSilence();
+    this.disconnectSource();
+    this.releaseEndedWaiters();
+    this.nativePlayToken += 1;
+    const token = this.nativePlayToken;
+    this.lineId = lineId;
+    this.variantId = variantId;
+    this.volume = volume;
+    this.offset = 0;
+    this.playFrom = 0;
+    this.playUntil = null;
+    this.playing = true;
+    this.emit();
+    try {
+      await invoke("native_audio_play_path", {
+        path,
+        deviceId: this.nativeDeviceId,
+        volume,
+      });
+    } finally {
+      if (this.nativePlayToken === token && this.lineId === lineId) {
+        this.playing = false;
+        this.finishEnded();
+      }
+    }
   }
 
   private startSource() {
@@ -421,6 +474,9 @@ export class LineAudioPlayer {
   setVolume(volume: number) {
     this.volume = volume;
     if (this.gain) this.gain.gain.value = volume;
+    if (this.nativeOutput) {
+      void invoke("native_audio_set_volume", { volume });
+    }
   }
 
   setAudioFx(fx: AudioFx) {

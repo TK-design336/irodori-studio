@@ -22,7 +22,7 @@ export type LiveHistoryItem = {
 
 const HISTORY_KEY = "irodori-studio-live-history-v1";
 const PREFS_KEY = "irodori-studio-live-prefs-v3";
-const MAX_HISTORY = 120;
+export const MAX_HISTORY = 120;
 
 export type LiveQualityPreset = "fast" | "standard" | "quality";
 
@@ -206,23 +206,32 @@ function normalizeHistoryItem(raw: unknown): LiveHistoryItem | null {
   };
 }
 
+function chronologicalHistory(items: LiveHistoryItem[]): LiveHistoryItem[] {
+  if (items.length < 2) return items;
+  const first = Date.parse(items[0].createdAt);
+  const last = Date.parse(items[items.length - 1].createdAt);
+  if (Number.isFinite(first) && Number.isFinite(last) && first > last) {
+    return items.slice().reverse();
+  }
+  return items;
+}
+
 export function loadLiveHistory(): LiveHistoryItem[] {
   try {
     const raw = localStorage.getItem(HISTORY_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw) as unknown;
     if (!Array.isArray(parsed)) return [];
-    return parsed
-      .map(normalizeHistoryItem)
-      .filter((x): x is LiveHistoryItem => x != null)
-      .slice(0, MAX_HISTORY);
+    return chronologicalHistory(
+      parsed.map(normalizeHistoryItem).filter((x): x is LiveHistoryItem => x != null),
+    ).slice(-MAX_HISTORY);
   } catch {
     return [];
   }
 }
 
 export function saveLiveHistory(items: LiveHistoryItem[]): void {
-  const trimmed = items.slice(0, MAX_HISTORY).map((item) => ({
+  const trimmed = items.slice(-MAX_HISTORY).map((item) => ({
     ...item,
     status:
       item.status === "queued" || item.status === "synthesizing" || item.status === "playing"
