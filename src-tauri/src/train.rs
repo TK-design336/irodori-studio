@@ -390,6 +390,9 @@ pub fn start_train_job(
                         "reverb": af.reverb,
                         "muffle": af.muffle,
                         "enhance": af.enhance,
+                    },
+                    "diarize": {
+                        "enabled": review.diarize_enabled,
                     }
                 });
                 std::fs::write(&p, cfg.to_string()).map_err(|e| e.to_string())?;
@@ -1152,4 +1155,43 @@ pub fn complete_slice_review(job_dir: &str) -> Result<u64, String> {
     let _ = std::fs::remove_file(root.join(".done_dataset"));
     let _ = std::fs::remove_file(root.join(".done_prepare_manifest"));
     Ok(reverted)
+}
+
+pub fn load_diarization(job_dir: &str) -> Result<serde_json::Value, String> {
+    let path = slice_review_dir(job_dir)?.join("diarization.json");
+    if !path.is_file() {
+        return Ok(serde_json::json!({
+            "enabled": false,
+            "clusters": [],
+            "labels": {},
+            "selected": [],
+        }));
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+pub fn save_diarization(job_dir: &str, selected: Vec<String>) -> Result<serde_json::Value, String> {
+    let path = slice_review_dir(job_dir)?.join("diarization.json");
+    let mut data = if path.is_file() {
+        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        serde_json::from_str::<serde_json::Value>(&text).map_err(|e| e.to_string())?
+    } else {
+        serde_json::json!({
+            "enabled": true,
+            "clusters": [],
+            "labels": {},
+            "selected": [],
+        })
+    };
+    let arr: Vec<serde_json::Value> = selected
+        .into_iter()
+        .map(|s| serde_json::Value::String(s))
+        .collect();
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert("selected".into(), serde_json::Value::Array(arr));
+    }
+    let text = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
+    std::fs::write(&path, format!("{text}\n")).map_err(|e| e.to_string())?;
+    Ok(data)
 }

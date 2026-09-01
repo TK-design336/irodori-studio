@@ -1,6 +1,7 @@
 mod asr;
 mod dictionary;
 mod http_server;
+mod native_asr;
 mod project;
 mod python_env;
 mod settings;
@@ -206,6 +207,19 @@ fn start_training(
         slice_method,
         state.train.clone(),
     )
+}
+
+#[tauri::command]
+fn load_diarization_cmd(job_dir: String) -> Result<serde_json::Value, String> {
+    train::load_diarization(&job_dir)
+}
+
+#[tauri::command]
+fn save_diarization_cmd(
+    job_dir: String,
+    selected: Vec<String>,
+) -> Result<serde_json::Value, String> {
+    train::save_diarization(&job_dir, selected)
 }
 
 #[tauri::command]
@@ -878,6 +892,51 @@ fn ffmpeg_pcm_mono_48k(
 }
 
 /// Keep numeric targets in sync with `src/lib/audioFx.ts`.
+fn build_clip_af(clip: &project::ClipEdit) -> String {
+    let clip = clip.clamped();
+    if clip.is_identity() {
+        return String::new();
+    }
+    let mut filters: Vec<String> = Vec::new();
+    let trim_start = clip.trim_start_sec;
+    let trim_end = clip.trim_end_sec;
+    if trim_start > 0.001 || trim_end > 0.001 {
+        if trim_end > trim_start + 0.001 {
+            filters.push(format!("atrim=start={trim_start:.6}:end={trim_end:.6}"));
+        } else if trim_start > 0.001 {
+            filters.push(format!("atrim=start={trim_start:.6}"));
+        }
+        filters.push("asetpts=PTS-STARTPTS".into());
+    }
+    if clip.pre_pad_sec > 0.001 {
+        let ms = (clip.pre_pad_sec * 1000.0).round() as u64;
+        filters.push(format!("adelay={ms}|{ms}"));
+    }
+    if clip.post_pad_sec > 0.001 {
+        filters.push(format!("apad=pad_dur={:.6}", clip.post_pad_sec));
+    }
+    if clip.fade_in_sec > 0.001 {
+        filters.push(format!("afade=t=in:st=0:d={:.6}", clip.fade_in_sec));
+    }
+    if clip.fade_out_sec > 0.001 {
+        filters.push(format!(
+            "areverse,afade=t=in:st=0:d={:.6},areverse",
+            clip.fade_out_sec
+        ));
+    }
+    filters.join(",")
+}
+
+fn join_af_parts(parts: &[String]) -> String {
+    parts
+        .iter()
+        .filter(|p| !p.is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Keep numeric targets in sync with `src/lib/audioFx.ts`.
 fn build_post_af(
     volume: f64,
     speed: f64,
@@ -953,15 +1012,19 @@ pub(crate) fn export_wav_adjusted_inner(
     audio_fx: &project::AudioFx,
     format: ExportAudioFormat,
     bitrate_kbps: Option<u32>,
+    clip_edit: Option<&project::ClipEdit>,
 ) -> Result<(), String> {
     let dest = ensure_audio_ext(&dest, format);
     let vol_ok = (volume - 1.0).abs() < 0.001;
     let spd_ok = (speed - 1.0).abs() < 0.001;
-    if vol_ok && spd_ok && audio_fx.is_identity() && format == ExportAudioFormat::Wav {
+    let clip = clip_edit.map(|c| c.clamped()).filter(|c| !c.is_identity());
+    if vol_ok && spd_ok && audio_fx.is_identity() && clip.is_none() && format == ExportAudioFormat::Wav {
         return copy_file(src, dest);
     }
 
-    let af = build_post_af(volume, speed, audio_fx, false);
+    let post = build_post_af(volume, speed, audio_fx, false);
+    let clip_af = clip.as_ref().map(build_clip_af).unwrap_or_default();
+    let af = join_af_parts(&[clip_af, post]);
     let af = if af.is_empty() { None } else { Some(af) };
     run_ffmpeg_export(
         settings,
@@ -980,13 +1043,15 @@ fn export_wav_adjusted(
     volume: f64,
     speed: f64,
     audio_fx: Option<project::AudioFx>,
+    clip_edit: Option<project::ClipEdit>,
     format: Option<String>,
     bitrate_kbps: Option<u32>,
 ) -> Result<(), String> {
     let settings = state.settings.lock().clone();
     let fmt = resolve_export_format(format.as_deref(), &dest);
     let fx = audio_fx.unwrap_or_default();
-    export_wav_adjusted_inner(&settings, src, dest, volume, speed, &fx, fmt, bitrate_kbps)
+    let clip = clip_edit.as_ref();
+    export_wav_adjusted_inner(&settings, src, dest, volume, speed, &fx, fmt, bitrate_kbps, clip)
 }
 
 #[derive(serde::Deserialize)]
@@ -997,6 +1062,8 @@ pub(crate) struct WavExportSeg {
     pub speed: f64,
     #[serde(default)]
     pub audio_fx: project::AudioFx,
+    #[serde(default)]
+    pub clip_edit: Option<project::ClipEdit>,
 }
 
 /// Concatenate adjusted audio with optional silence between segments.
@@ -1062,6 +1129,7 @@ pub(crate) fn export_wavs_concatenated_inner(
             &seg.audio_fx,
             ExportAudioFormat::Wav,
             None,
+            seg.clip_edit.as_ref(),
         ) {
             cleanup(&tmp_dir);
             return Err(e);
@@ -1166,21 +1234,57 @@ fn prepare_playback_wav(
     src: String,
     speed: f64,
     denoise: Option<f64>,
+    clip_edit: Option<project::ClipEdit>,
 ) -> Result<String, String> {
     let settings = state.settings.lock().clone();
     let speed = speed.clamp(0.5, 2.0);
     let denoise = denoise.unwrap_or(0.0);
     let mut fx = project::AudioFx::default();
     fx.denoise = denoise;
-    if (speed - 1.0).abs() < 0.001 && fx.denoise.abs() < 0.001 {
+    let clip = clip_edit.map(|c| c.clamped()).filter(|c| !c.is_identity());
+    if (speed - 1.0).abs() < 0.001 && fx.denoise.abs() < 0.001 && clip.is_none() {
         return Ok(src);
     }
     let dest = studio_cache_dir()
         .join("playback")
         .join(format!("play_{}.wav", uuid::Uuid::new_v4()));
-    let af = build_post_af(1.0, speed, &fx, true);
+    let post = build_post_af(1.0, speed, &fx, true);
+    let clip_af = clip.as_ref().map(build_clip_af).unwrap_or_default();
+    let af = join_af_parts(&[clip_af, post]);
     run_ffmpeg_af(&settings, &src, &dest.display().to_string(), &af)?;
     Ok(dest.display().to_string())
+}
+
+/// Trim a reference WAV to [start_sec, end_sec) and write a new file (original kept).
+#[tauri::command]
+fn trim_ref_wav(
+    state: tauri::State<'_, AppState>,
+    src: String,
+    dest: Option<String>,
+    start_sec: f64,
+    end_sec: f64,
+) -> Result<String, String> {
+    let settings = state.settings.lock().clone();
+    let start = start_sec.max(0.0);
+    let end = end_sec.max(0.0);
+    if end <= start + 0.01 {
+        return Err("終了位置は開始位置より後にしてください".into());
+    }
+    let dest = dest.unwrap_or_else(|| {
+        let p = std::path::Path::new(&src);
+        let stem = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("trim");
+        let parent = p.parent().unwrap_or_else(|| std::path::Path::new("."));
+        parent
+            .join(format!("{stem}_trim_{:.0}ms_{:.0}ms.wav", start * 1000.0, end * 1000.0))
+            .display()
+            .to_string()
+    });
+    let af = format!("atrim=start={start:.6}:end={end:.6},asetpts=PTS-STARTPTS");
+    run_ffmpeg_af(&settings, &src, &dest, &af)?;
+    Ok(dest)
 }
 
 #[tauri::command]
@@ -1246,6 +1350,77 @@ fn reading_payloads(dicts: &dictionary::Dictionaries) -> Vec<asr::ReadingDictPay
 }
 
 #[tauri::command]
+fn prepare_synth_text_cmd(
+    state: tauri::State<'_, AppState>,
+    text: String,
+    manual_readings: Option<Vec<project::AppliedReading>>,
+) -> Result<String, String> {
+    let settings = state.settings.lock().clone();
+    dictionary::prepare_synth_text(&settings, &text, &manual_readings.unwrap_or_default())
+}
+
+#[tauri::command]
+fn auto_readings_cmd(
+    state: tauri::State<'_, AppState>,
+    text: String,
+    manual_readings: Option<Vec<project::AppliedReading>>,
+) -> Result<Vec<dictionary::ReadingSpan>, String> {
+    let settings = state.settings.lock().clone();
+    let replaced = dictionary::apply_dict_replacements(&text);
+    let dicts = dictionary::load_dictionaries();
+    let reading_dict = reading_payloads(&dicts);
+    let manual = manual_readings.unwrap_or_default();
+    let manual_json: Vec<serde_json::Value> = manual
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "start": r.start,
+                "end": r.end,
+                "surface": r.surface,
+                "reading": r.reading,
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "text": replaced,
+        "manualReadings": manual_json,
+        "readingDict": reading_dict,
+    });
+    let v = asr::run_python_json_script(&settings, "auto_readings_apply.py", &payload)?;
+    let items = v.get("readings").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    let mut out = Vec::new();
+    for item in items {
+        let start = item.get("start").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+        let end = item.get("end").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+        let reading = item
+            .get("reading")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if reading.is_empty() || start >= end {
+            continue;
+        }
+        out.push(dictionary::ReadingSpan {
+            kind: item
+                .get("kind")
+                .and_then(|x| x.as_str())
+                .unwrap_or("english")
+                .to_string(),
+            start,
+            end,
+            surface: item
+                .get("surface")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            reading,
+        });
+    }
+    Ok(out)
+}
+
+#[tauri::command]
 fn detect_homographs_cmd(
     state: tauri::State<'_, AppState>,
     text: String,
@@ -1291,6 +1466,20 @@ async fn ensure_asr_model_cmd(app: AppHandle) -> Result<String, String> {
         let mut asr = state.asr_worker.lock();
         let dir = asr.ensure_loaded(&settings)?;
         Ok(dir.display().to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn transcribe_pcm_asr_cmd(
+    app: AppHandle,
+    samples: Vec<i16>,
+    sample_rate: u32,
+) -> Result<String, String> {
+    with_state_blocking(app, move |state| {
+        let settings = state.settings.lock().clone();
+        let mut asr = state.asr_worker.lock();
+        asr::transcribe_pcm_asr(&settings, &mut asr, &samples, sample_rate)
     })
     .await
 }
@@ -1381,6 +1570,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .manage(state)
+        .manage(native_asr::NativeAsrAppState::default())
         .setup(|app| {
             match init_studio_resource_paths(app.handle()) {
                 Ok(dir) => {
@@ -1430,6 +1620,8 @@ pub fn run() {
             load_slice_review_log_cmd,
             save_slice_review_exclusions_cmd,
             complete_slice_review_cmd,
+            save_diarization_cmd,
+            load_diarization_cmd,
             load_slice_autofix_log_cmd,
             run_slice_autofix_cmd,
             list_vocal_separator_models,
@@ -1454,6 +1646,9 @@ pub fn run() {
             export_wav_adjusted,
             export_wavs_concatenated,
             prepare_playback_wav,
+            trim_ref_wav,
+            prepare_synth_text_cmd,
+            auto_readings_cmd,
             resolve_python_path,
             get_dictionaries,
             set_dictionaries,
@@ -1461,6 +1656,15 @@ pub fn run() {
             detect_annotations_cmd,
             verify_line_asr,
             ensure_asr_model_cmd,
+            transcribe_pcm_asr_cmd,
+            native_asr::commands::native_asr_get_model_status,
+            native_asr::commands::native_asr_download_models,
+            native_asr::commands::native_asr_preload,
+            native_asr::commands::native_asr_start,
+            native_asr::commands::native_asr_stop,
+            native_asr::commands::native_asr_list_devices,
+            native_asr::commands::native_asr_get_config,
+            native_asr::commands::native_asr_set_config,
             wav_duration_secs,
             write_text_file,
         ])

@@ -14,7 +14,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const baseUrl = (process.env.IRODORI_BASE_URL || "http://127.0.0.1:18790").replace(
+const baseUrl = (process.env.IRODORI_BASE_URL || "http://127.0.0.1:50021").replace(
   /\/$/,
   "",
 );

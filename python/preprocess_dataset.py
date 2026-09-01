@@ -60,6 +60,39 @@ def load_transcripts(sliced_dir: Path, wavs: list[Path]) -> dict[str, str]:
     return out
 
 
+def load_diarization_exclusions(path: Path | None) -> set[str]:
+    if path is None or not path.is_file():
+        return set()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if not isinstance(data, dict) or not data.get("enabled"):
+        return set()
+    labels = data.get("labels")
+    if not isinstance(labels, dict):
+        return set()
+    selected = data.get("selected")
+    if not isinstance(selected, list):
+        selected = []
+    selected_set = {str(x) for x in selected if str(x)}
+    clusters = data.get("clusters")
+    known = {
+        str(c)
+        for c in (clusters if isinstance(clusters, list) else [])
+        if str(c) and str(c) != "?"
+    }
+    if len(known) <= 1:
+        return set()
+    if not selected_set:
+        return set(labels.keys())
+    out: set[str] = set()
+    for name, cluster in labels.items():
+        if str(cluster) not in selected_set:
+            out.add(str(name))
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build local_dataset.jsonl")
     parser.add_argument("--sliced-dir", required=True)
@@ -69,6 +102,11 @@ def main() -> int:
         "--exclusions-json",
         default="",
         help="slice_review/exclusions.json — excluded wavs are skipped",
+    )
+    parser.add_argument(
+        "--diarization-json",
+        default="",
+        help="slice_review/diarization.json — non-selected speaker clusters are skipped",
     )
     args = parser.parse_args()
 
@@ -85,6 +123,12 @@ def main() -> int:
         if candidate.is_file():
             excl_path = candidate
     excluded = load_exclusions(excl_path)
+    diar_path = Path(args.diarization_json) if args.diarization_json.strip() else None
+    if diar_path is None:
+        candidate = sliced_dir.parent / "slice_review" / "diarization.json"
+        if candidate.is_file():
+            diar_path = candidate
+    excluded |= load_diarization_exclusions(diar_path)
 
     wavs = sorted(p for p in sliced_dir.iterdir() if p.suffix.lower() == ".wav")
     transcripts = load_transcripts(sliced_dir, wavs)

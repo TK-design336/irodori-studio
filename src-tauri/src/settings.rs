@@ -125,6 +125,9 @@ pub struct SliceReviewSettings {
     /// Non-generative WPE / tilt / denoise on sliced clips before review.
     #[serde(default = "default_slice_auto_fix")]
     pub auto_fix: SliceAutoFixSettings,
+    /// Cluster sliced clips by speaker before review (multi-speaker sources).
+    #[serde(default)]
+    pub diarize_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -250,6 +253,7 @@ pub fn default_slice_review() -> SliceReviewSettings {
         auto_remove_percent: 0.0,
         auto_keep_max: 0,
         auto_fix: default_slice_auto_fix(),
+        diarize_enabled: false,
     }
 }
 
@@ -404,7 +408,7 @@ fn default_http_bind_address() -> String {
 }
 
 fn default_http_port() -> u16 {
-    18790
+    50021
 }
 
 fn default_http_max_chars() -> u32 {
@@ -1093,7 +1097,23 @@ fn push_unique(tried: &mut Vec<String>, path: &Path) {
 }
 
 /// Dev / portable fallbacks that do not need Tauri PathResolver.
+fn workspace_python_dir() -> Option<PathBuf> {
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("python");
+    if studio_python_candidate_ok(&dev) {
+        Some(dev.canonicalize().unwrap_or(dev))
+    } else {
+        None
+    }
+}
+
 fn discover_studio_python_dir_local(tried: &mut Vec<String>) -> Option<PathBuf> {
+    if let Some(p) = workspace_python_dir() {
+        push_unique(tried, &p);
+        return Some(p);
+    }
+
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             for name in ["python", "_up_/python"] {
@@ -1106,17 +1126,18 @@ fn discover_studio_python_dir_local(tried: &mut Vec<String>) -> Option<PathBuf> 
         }
     }
 
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let dev = manifest.join("..").join("python");
-    push_unique(tried, &dev);
-    if studio_python_candidate_ok(&dev) {
-        return Some(dev.canonicalize().unwrap_or(dev));
-    }
     None
 }
 
 fn discover_studio_python_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let mut tried = Vec::new();
+
+    // Debug/dev: prefer live repo scripts over bundled copies under target/.
+    #[cfg(debug_assertions)]
+    if let Some(p) = workspace_python_dir() {
+        push_unique(&mut tried, &p);
+        return Ok(p);
+    }
 
     // Preferred: mapped resource `python/` (tauri.conf.json bundle.resources).
     // Legacy: array form `../python/**/*` landed under `_up_/python`.

@@ -1,6 +1,6 @@
 [package]
 name = "irodori-studio"
-version = "0.5.0"
+version = "0.6.0"
 description = "Irodori Studio — speaker embedding training & OPT generation"
 authors = ["you"]
 edition = "2021"
@@ -11,6 +11,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+
+[target.'cfg(windows)'.build-dependencies]
+sherpa-windows-prebuilt-guard = { path = "../crates/sherpa-windows-prebuilt-guard" }
 
 [dependencies]
 tauri = { version = "2", features = [] }
@@ -30,4 +33,17 @@ tower-http = { version = "0.6", features = ["cors"] }
 tower = "0.5"
 http = "1"
 bytes = "1"
+log = "0.4"
+anyhow = "1.0"
+cpal = "0.17.3"
+dasp_sample = "0.11.0"
+rubato = "1.0.1"
+hound = "3.5.1"
+reqwest = { version = "0.12", features = ["rustls-tls", "blocking", "json", "stream"], default-features = false }
+futures-util = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-native", "api-24"] }
+sherpa-onnx = { version = "=1.12.39", default-features = false, features = ["shared"] }
+sherpa-onnx-sys = { version = "=1.12.39", default-features = false, features = ["shared"] }
 

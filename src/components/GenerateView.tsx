@@ -5,6 +5,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
@@ -41,8 +42,18 @@ import {
   MAX_LINE_VARIANTS,
   multiGenerateModeOf,
   audioFxOf,
+  clipEditOf,
+  clipEditIsIdentity,
   type LineVariant,
 } from "../types";
+import {
+  bumpPreparedSynthEpoch,
+  clearPreparedSynthCache,
+  currentLineSynthText,
+  hasFreshPreparedSynth,
+  lineSynthText,
+  lineSynthTextSync,
+} from "../lib/synthText";
 import { SamplingPanel } from "./SamplingPanel";
 import { AudioAdjustmentPanel } from "./AudioAdjustmentPanel";
 import { CaptionPanel } from "./CaptionPanel";
@@ -67,7 +78,8 @@ import {
 } from "../lib/exportAudio";
 import { reconcileProjectSpeakers } from "../lib/speakerResolve";
 import { SpeakerApplyMenu } from "./SpeakerApplyMenu";
-import { IconSave, IconTrash } from "./icons";
+import { IconMic, IconSave, IconTrash, IconTrimEnd, IconTrimStart } from "./icons";
+import { startLineDictation, stopLineDictation } from "../lib/lineDictation";
 import { LineAudioPlayer, type PlaybackSnapshot } from "../lib/audioPlayer";
 import type { ImportedLine } from "../lib/scriptImport";
 import {
@@ -88,7 +100,6 @@ import {
   newReadingId,
   normalizeDetectedAnnotations,
   readingForApply,
-  synthTextForLine,
   validateReadings,
   type AnnotationKind,
   type AppliedReading,
@@ -156,10 +167,6 @@ function effectiveCfgScaleCaption(
   return usesStyleCaption(speakerOf(speakers, line.speakerEmbedPath))
     ? lineCfgScaleCaption(line)
     : DEFAULT_CFG_SCALE_CAPTION;
-}
-
-function lineSynthText(line: ProjectLine): string {
-  return synthTextForLine(line.text, line.readings);
 }
 
 type VariantGenerationSnap = {
@@ -340,7 +347,9 @@ function variantDirtyDiffs(
     });
   }
   const genText = variant.generatedText ?? line.generatedText ?? "";
-  const curText = lineSynthText(line);
+  // Compare against prepared TTS text (auto readings / dict replace), not the
+  // display string. Otherwise English→カタカナ auto-readings stay 要再生成 forever.
+  const curText = currentLineSynthText(line);
   if (genText !== curText) {
     diffs.push({
       label: "テキスト",
@@ -565,6 +574,25 @@ function wavPathMatchesLine(line: ProjectLine, wavPath?: string): boolean {
 
 function variantDurationKey(lineId: string, variantId: string, speed: number) {
   return `${lineId}:${variantId}:${speed.toFixed(2)}`;
+}
+
+function lineSpeed(speed: number) {
+  return Math.max(0.5, speed);
+}
+
+function playbackTimeToSourceSec(playSec: number, speed: number) {
+  return Math.max(0, playSec * lineSpeed(speed));
+}
+
+function sourceSecToPlaybackTime(sourceSec: number, speed: number) {
+  return Math.max(0, sourceSec / lineSpeed(speed));
+}
+
+function clipTrimSec(edit: { trimStartSec?: number; trimEndSec?: number }) {
+  return {
+    start: edit.trimStartSec ?? 0,
+    end: edit.trimEndSec ?? 0,
+  };
 }
 
 function samplingForContentKey(
@@ -862,10 +890,20 @@ function AutoTextarea({
   const ref = useRef<HTMLTextAreaElement>(null);
   const [focused, setFocused] = useState(false);
   const [draft, setDraft] = useState(value);
+  const [dictating, setDictating] = useState(false);
+  const [dictationPhase, setDictationPhase] = useState<"off" | "starting" | "on">(
+    "off",
+  );
+  const [dictationLevel, setDictationLevel] = useState(0);
+  const [dictationHint, setDictationHint] = useState("");
   const composingRef = useRef(false);
   const debounceRef = useRef<number | null>(null);
   const caretRef = useRef({ start: 0, end: 0, touched: false });
   const lastInsertNonceRef = useRef<number | null>(null);
+  const dictatingRef = useRef(false);
+  const dictationTokenRef = useRef(0);
+  const dictationGenRef = useRef(0);
+  const dictationRangeRef = useRef({ start: 0, liveEnd: 0 });
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
   const onDraftChangeRef = useRef(onDraftChange);
@@ -947,8 +985,137 @@ function AutoTextarea({
   useEffect(() => {
     return () => {
       if (debounceRef.current) window.clearTimeout(debounceRef.current);
+      dictationGenRef.current += 1;
+      const token = dictationTokenRef.current;
+      const wasDictating = dictatingRef.current || token !== 0;
+      dictationTokenRef.current = 0;
+      dictatingRef.current = false;
+      if (token) void stopLineDictation(token);
+      else if (wasDictating) void stopLineDictation();
     };
   }, []);
+
+  const applyDictationText = useCallback(
+    (insert: string, commit: boolean) => {
+      if (!dictatingRef.current || composingRef.current) return;
+      const text = draftRef.current;
+      const range = dictationRangeRef.current;
+      const start = Math.max(0, Math.min(range.start, text.length));
+      const liveEnd = Math.max(start, Math.min(range.liveEnd, text.length));
+      let next = text.slice(0, start) + insert + text.slice(liveEnd);
+      let caret = start + insert.length;
+      if (commit) {
+        const auto = applyAutoIfNeeded(next, caret);
+        next = auto.text;
+        caret = auto.caret;
+        dictationRangeRef.current = { start: caret, liveEnd: caret };
+        setDraftBoth(next);
+        flush(next);
+      } else {
+        dictationRangeRef.current = { start, liveEnd: caret };
+        setDraftBoth(next);
+        scheduleFlush(next);
+      }
+      restoreCaret(caret);
+    },
+    [applyAutoIfNeeded, flush, restoreCaret, scheduleFlush, setDraftBoth],
+  );
+  const applyDictationTextRef = useRef(applyDictationText);
+  applyDictationTextRef.current = applyDictationText;
+
+  const stopDictation = useCallback(async () => {
+    dictationGenRef.current += 1;
+    dictationRangeRef.current = {
+      start: dictationRangeRef.current.liveEnd,
+      liveEnd: dictationRangeRef.current.liveEnd,
+    };
+    const token = dictationTokenRef.current;
+    dictationTokenRef.current = 0;
+    dictatingRef.current = false;
+    setDictating(false);
+    setDictationPhase("off");
+    setDictationLevel(0);
+    setDictationHint("");
+    await stopLineDictation(token || undefined);
+  }, []);
+
+  const toggleDictation = useCallback(async () => {
+    if (dictatingRef.current || dictationPhase === "starting") {
+      await stopDictation();
+      return;
+    }
+    rememberCaret();
+    const start = caretRef.current.start;
+    const end = caretRef.current.end;
+    dictationRangeRef.current = { start, liveEnd: end };
+    const gen = ++dictationGenRef.current;
+    dictatingRef.current = true;
+    setDictating(true);
+    setDictationPhase("starting");
+    setDictationHint("準備中…");
+    setDictationLevel(0);
+    try {
+      const { token } = await startLineDictation(
+        {
+          onLevel: (level) => {
+            if (!dictatingRef.current) return;
+            setDictationLevel(level);
+          },
+          onPartial: (text) => applyDictationTextRef.current(text, false),
+          onSegment: (text) => applyDictationTextRef.current(text, true),
+          onStatus: (msg) => {
+            if (!dictatingRef.current) return;
+            if (msg.includes("準備") || msg.includes("失敗") || msg.includes("エラー")) {
+              setDictationHint(msg);
+            } else {
+              setDictationHint("");
+            }
+          },
+          onError: (msg) => {
+            if (!dictatingRef.current) return;
+            setDictationHint(msg);
+          },
+        },
+        (stolenToken) => {
+          if (dictationGenRef.current !== gen) return;
+          if (
+            dictationTokenRef.current !== 0 &&
+            dictationTokenRef.current !== stolenToken
+          ) {
+            return;
+          }
+          dictationGenRef.current += 1;
+          dictationTokenRef.current = 0;
+          dictatingRef.current = false;
+          setDictating(false);
+          setDictationPhase("off");
+          setDictationLevel(0);
+          setDictationHint("");
+        },
+      );
+      if (dictationGenRef.current !== gen) {
+        if (token) void stopLineDictation(token);
+        return;
+      }
+      if (!dictatingRef.current || token === 0) {
+        dictatingRef.current = false;
+        setDictating(false);
+        setDictationPhase("off");
+        setDictationHint("");
+        return;
+      }
+      dictationTokenRef.current = token;
+      setDictationPhase("on");
+      setDictationHint("");
+    } catch (error) {
+      if (dictationGenRef.current !== gen) return;
+      dictatingRef.current = false;
+      dictationTokenRef.current = 0;
+      setDictating(false);
+      setDictationPhase("off");
+      setDictationHint(String(error));
+    }
+  }, [dictationPhase, rememberCaret, stopDictation]);
 
   const resize = useCallback(() => {
     const el = ref.current;
@@ -1036,6 +1203,9 @@ function AutoTextarea({
     setDraftBoth(next);
     flush(next);
     onInsertConsumedRef.current?.(consumedNonce);
+    if (dictatingRef.current) {
+      dictationRangeRef.current = { start: caret, liveEnd: caret };
+    }
     requestAnimationFrame(() => {
       el.focus({ preventScroll: true });
       el.setSelectionRange(caret, caret);
@@ -1055,11 +1225,14 @@ function AutoTextarea({
       const end = el.selectionEnd;
       const text = draftRef.current;
 
-      if (e.ctrlKey || e.metaKey) {
-        // Ctrl/Cmd+Enter → internal newline within this line
+      if (e.shiftKey && !e.ctrlKey && !e.metaKey) {
+        // Shift+Enter → internal newline within this line
         const next = text.slice(0, start) + "\n" + text.slice(end);
         setDraftBoth(next);
         flush(next);
+        if (dictatingRef.current) {
+          dictationRangeRef.current = { start: start + 1, liveEnd: start + 1 };
+        }
         requestAnimationFrame(() => {
           el.selectionStart = el.selectionEnd = start + 1;
           resize();
@@ -1077,6 +1250,7 @@ function AutoTextarea({
       // Parent persist owns the structural update; blur must not re-flush.
       suppressBlurFlushRef.current = true;
       setDraftBoth(before);
+      void stopDictation();
       onSplitRef.current(before, after);
       return;
     }
@@ -1093,6 +1267,7 @@ function AutoTextarea({
       }
       // Line may unmount (blur); skip flush so we don't no-op-persist the whole project.
       suppressBlurFlushRef.current = true;
+      void stopDictation();
       onMergePrevRef.current(draftRef.current);
     }
   };
@@ -1101,9 +1276,15 @@ function AutoTextarea({
     !focused &&
     ((pendingAnnotations && pendingAnnotations.length > 0) ||
       (appliedReadings && appliedReadings.length > 0));
+  const showMic = focused || dictating;
+  const dictationError = Boolean(dictationHint && !dictating);
 
   return (
-    <div className="line-text-wrap">
+    <div
+      className={`line-text-wrap${focused ? " is-editing" : ""}${
+        dictating ? " is-dictating" : ""
+      }`}
+    >
       {showOverlay && onApplyAnnotation ? (
         <AnnotationOverlay
           text={draft}
@@ -1136,15 +1317,28 @@ function AutoTextarea({
             setDraftBoth(next);
             scheduleFlush(next);
             restoreCaret(caret);
+            if (dictatingRef.current) {
+              dictationRangeRef.current = { start: caret, liveEnd: caret };
+            }
             return;
           }
         }
         setDraftBoth(next);
         rememberCaret();
+        if (dictatingRef.current && !composing) {
+          dictationRangeRef.current = { start: caret, liveEnd: caret };
+        }
         if (composing) return;
         scheduleFlush(next);
       }}
-      onSelect={rememberCaret}
+      onSelect={() => {
+        rememberCaret();
+        if (!dictatingRef.current) return;
+        const c = caretRef.current;
+        const range = dictationRangeRef.current;
+        if (c.start >= range.start && c.end <= range.liveEnd) return;
+        dictationRangeRef.current = { start: c.start, liveEnd: c.end };
+      }}
       onKeyUp={rememberCaret}
       onPointerDown={(e) => {
         if (e.button !== 0 || !isLineSelectModifier(e)) return;
@@ -1177,6 +1371,9 @@ function AutoTextarea({
         setDraftBoth(next);
         flush(next);
         restoreCaret(caret);
+        if (dictatingRef.current) {
+          dictationRangeRef.current = { start: caret, liveEnd: caret };
+        }
         // Resize after composition so candidate window stays attached
         requestAnimationFrame(() => resize());
       }}
@@ -1185,10 +1382,16 @@ function AutoTextarea({
         onFocusLine();
         rememberCaret();
       }}
-      onBlur={() => {
+      onBlur={(e) => {
+        const next = e.relatedTarget;
+        if (next instanceof Element && next.closest(".line-dictation-btn")) {
+          return;
+        }
         rememberCaret();
         setFocused(false);
         composingRef.current = false;
+        if (dictatingRef.current) void stopDictation();
+        else setDictationHint("");
         if (suppressBlurFlushRef.current) {
           suppressBlurFlushRef.current = false;
           return;
@@ -1196,6 +1399,48 @@ function AutoTextarea({
         flush(draftRef.current);
       }}
     />
+      {showMic && dictationHint ? (
+        <span
+          className={`line-dictation-hint${dictationError ? " is-error" : ""}`}
+        >
+          {dictationHint}
+        </span>
+      ) : null}
+      {showMic ? (
+        <button
+          type="button"
+          tabIndex={-1}
+          className={`line-dictation-btn${
+            dictating ? " is-active action-aura" : ""
+          }`}
+          aria-pressed={dictating}
+          aria-label={dictating ? "音声入力を停止" : "音声入力を開始"}
+          title={dictating ? "音声入力を停止" : "音声入力"}
+          onPointerDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onMouseDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            void toggleDictation();
+          }}
+        >
+          <span
+            className="line-dictation-level"
+            aria-hidden
+            style={{
+              transform: `translate(-50%, -50%) scale(${0.4 + dictationLevel * 0.85})`,
+              opacity: dictating ? 0.35 + dictationLevel * 0.5 : 0,
+            }}
+          />
+          <IconMic size={14} />
+        </button>
+      ) : null}
     </div>
   );
 }
@@ -1586,6 +1831,8 @@ export function GenerateView({
     {},
   );
   const [asrBusy, setAsrBusy] = useState(false);
+  /** Re-render dirty badges when auto-reading synth-text cache updates. */
+  const [preparedTick, setPreparedTick] = useState(0);
   const [autoReplaceEntries, setAutoReplaceEntries] = useState<ReplaceEntry[]>(
     [],
   );
@@ -1766,6 +2013,7 @@ export function GenerateView({
   /** Last text used for annotation detect (skip unchanged lines). */
   const annotationTextByLineRef = useRef<Record<string, string>>({});
   const annotationsByLineRef = useRef<Record<string, DetectedAnnotation[]>>({});
+  const preparedRunId = useRef(0);
   useEffect(() => {
     annotationsByLineRef.current = annotationsByLine;
   }, [annotationsByLine]);
@@ -1849,7 +2097,7 @@ export function GenerateView({
       ) {
         readyCacheRef.current.set(line.id, {
           key: lineContentKey(
-            lineSynthText(line),
+            currentLineSynthText(line),
             speakerConditionKey(speakersRef.current, line.speakerEmbedPath),
             effectiveLineCaption(line, speakersRef.current),
             effectiveCfgScaleCaption(line, speakersRef.current),
@@ -1859,7 +2107,7 @@ export function GenerateView({
         });
       }
     }
-  }, [project, speakers]);
+  }, [project, speakers, preparedTick]);
 
   useEffect(() => {
     if (project) setNameEdit(project.name);
@@ -2111,6 +2359,9 @@ export function GenerateView({
     const player = playerRef.current;
     if (!player || !selected || player.activeLineId !== selected.id) return;
     if (!player.isPlaying && !player.hasBuffer) return;
+    // Batch play advances selectedId; do not rebuild the buffer (it would
+    // drop the in-player trim window and jump the playhead).
+    if (batchPlayActiveRef.current) return;
     if (!selected.wavPath || !wavPathMatchesLine(selected)) return;
 
     if (speedTimer.current) window.clearTimeout(speedTimer.current);
@@ -2127,6 +2378,7 @@ export function GenerateView({
             src: wavPath,
             speed,
             denoise,
+            clipEdit: null,
           });
           const bytes = await invoke<number[]>("read_file_bytes", {
             path: playPath,
@@ -2489,6 +2741,7 @@ export function GenerateView({
               generatedSampling: variant.generatedSampling
                 ? { ...variant.generatedSampling }
                 : variant.generatedSampling,
+              clipEdit: variant.clipEdit ? { ...variant.clipEdit } : variant.clipEdit,
             });
           } catch {
             /* skip missing variant files */
@@ -2860,6 +3113,44 @@ export function GenerateView({
     }
   }, []);
 
+  const refreshPreparedSynth = useCallback(async () => {
+    const runId = ++preparedRunId.current;
+    const p = projectRef.current;
+    if (!p) {
+      clearPreparedSynthCache();
+      setPreparedTick((t) => t + 1);
+      return;
+    }
+    let updated = false;
+    for (const line of p.lines) {
+      if (runId !== preparedRunId.current) return;
+      if (!line.text.trim()) continue;
+      const variants = normalizeLineVariants(line);
+      if (variants.length === 0 && !line.wavPath) continue;
+      if (hasFreshPreparedSynth(line)) continue;
+      const genTexts =
+        variants.length > 0
+          ? variants.map((v) => v.generatedText ?? line.generatedText ?? "")
+          : [line.generatedText ?? ""];
+      const sync = lineSynthTextSync(line);
+      if (genTexts.every((g) => g === sync)) continue;
+      try {
+        await lineSynthText(line);
+        updated = true;
+      } catch {
+        /* keep sync fallback */
+      }
+    }
+    if (runId !== preparedRunId.current) return;
+    if (updated) setPreparedTick((t) => t + 1);
+  }, []);
+
+  const prepareSynthAndNotify = useCallback(async (line: ProjectLine) => {
+    const text = await lineSynthText(line);
+    setPreparedTick((t) => t + 1);
+    return text;
+  }, []);
+
   // Keep ASR badge in sync with 要再生成 (dirty / missing wav).
   // If the user only edits text then restores it (no re-synth), restore the
   // previous ASR result when the line is clean again and matches the verified text.
@@ -2878,7 +3169,8 @@ export function GenerateView({
         if (!asr.needsReverify) staleIds.push(line.id);
       } else if (
         asr.needsReverify &&
-        lineSynthText(line) === asr.expectedText
+        (currentLineSynthText(line) === asr.expectedText ||
+          lineSynthTextSync(line) === asr.expectedText)
       ) {
         restoreIds.push(line.id);
       }
@@ -2897,14 +3189,17 @@ export function GenerateView({
         return changed ? next : prev;
       });
     }
-  }, [project, speakers, asrByLine, invalidateAsrMany]);
+  }, [project, speakers, asrByLine, invalidateAsrMany, preparedTick]);
 
-  // Reset annotation cache when project changes
+  // Reset annotation / prepared-synth cache when project changes
   useEffect(() => {
     annotationTextByLineRef.current = {};
     annotationsByLineRef.current = {};
     setAnnotationsByLine({});
-  }, [project?.name]);
+    clearPreparedSynthCache();
+    setPreparedTick((t) => t + 1);
+    void refreshPreparedSynth();
+  }, [project?.name, refreshPreparedSynth]);
 
   // Debounced annotation refresh — schedules Python detection 700ms after last
   // trigger (text edit, project load, or dict change). Uses a ref timer so that
@@ -2917,8 +3212,9 @@ export function GenerateView({
     annotationTimerRef.current = window.setTimeout(() => {
       annotationTimerRef.current = null;
       void refreshAnnotations();
+      void refreshPreparedSynth();
     }, 700);
-  }, [refreshAnnotations]);
+  }, [refreshAnnotations, refreshPreparedSynth]);
 
   // Schedule when project lines change
   useEffect(() => {
@@ -2929,6 +3225,9 @@ export function GenerateView({
   useEffect(() => {
     const onDictsChanged = () => {
       annotationTextByLineRef.current = {};
+      bumpPreparedSynthEpoch();
+      clearPreparedSynthCache();
+      setPreparedTick((t) => t + 1);
       void reloadDicts();
       scheduleAnnotationRefresh();
     };
@@ -3006,7 +3305,9 @@ export function GenerateView({
       invalidateAsr(fresh.id);
       return;
     }
-    const text = lineSynthText(fresh);
+    const text = hasFreshPreparedSynth(fresh)
+      ? currentLineSynthText(fresh)
+      : await prepareSynthAndNotify(fresh);
     setAsrBusy(true);
     setStatus("文字起こし検証の準備中（Whisper small・CPU／初回のみモデル取得）…");
     try {
@@ -3097,7 +3398,9 @@ export function GenerateView({
       for (let i = 0; i < targets.length; i++) {
         const line = targets[i];
         setStatus(`文字起こし検証中… ${i + 1}/${targets.length}`);
-        const text = lineSynthText(line);
+        const text = hasFreshPreparedSynth(line)
+          ? currentLineSynthText(line)
+          : await prepareSynthAndNotify(line);
         const res = await invoke<{
           ok: boolean;
           asrText: string;
@@ -3345,6 +3648,7 @@ export function GenerateView({
   /**
    * Backspace at start of line 2+: append this line as a new internal row
    * on the previous line (`prev\ncurrent`), then remove this line.
+   * An empty line is only removed (no trailing empty row on the previous line).
    */
   const mergeLineWithPrevious = (id: string, text: string) => {
     const p = projectRef.current;
@@ -3354,12 +3658,15 @@ export function GenerateView({
     const prevLine = p.lines[idx - 1];
     const prevDraft =
       lineDraftsRef.current.get(prevLine.id) ?? prevLine.text;
-    const joined = `${prevDraft}\n${text}`;
-    const cursor = prevDraft.length + 1;
+    const empty = text.length === 0;
+    const joined = empty ? prevDraft : `${prevDraft}\n${text}`;
+    const cursor = empty ? prevDraft.length : prevDraft.length + 1;
 
-    lineDraftsRef.current.set(prevLine.id, joined);
+    if (!empty) {
+      lineDraftsRef.current.set(prevLine.id, joined);
+      readyCacheRef.current.delete(prevLine.id);
+    }
     lineDraftsRef.current.delete(id);
-    readyCacheRef.current.delete(prevLine.id);
     readyCacheRef.current.delete(id);
 
     if (playerRef.current?.activeLineId === id) {
@@ -3372,7 +3679,9 @@ export function GenerateView({
       const i = prev.lines.findIndex((l) => l.id === id);
       if (i <= 0) return prev;
       const lines = [...prev.lines];
-      lines[i - 1] = { ...lines[i - 1], text: joined };
+      if (!empty) {
+        lines[i - 1] = { ...lines[i - 1], text: joined };
+      }
       lines.splice(i, 1);
       return { ...prev, lines };
     });
@@ -4210,7 +4519,7 @@ export function GenerateView({
         fresh,
         speakersRef.current,
       );
-      const synthText = lineSynthText(fresh);
+      const synthText = await prepareSynthAndNotify(fresh);
       const s = samplingForLine(fresh);
       const contentKey = lineContentKey(
         synthText,
@@ -4463,8 +4772,9 @@ export function GenerateView({
       speakersRef.current,
     );
     const s = samplingForLine(fresh);
+    const synthText = await prepareSynthAndNotify(fresh);
     const snap = generationSnap(
-      lineSynthText(fresh),
+      synthText,
       speakerKey,
       captionUsed,
       cfgCaptionUsed,
@@ -4549,7 +4859,7 @@ export function GenerateView({
       fresh,
       speakersRef.current,
     );
-    const synthText = lineSynthText(fresh);
+    const synthText = await prepareSynthAndNotify(fresh);
 
     const ids = Array.from({ length: n }, () => newVariantId());
     const paths: string[] = [];
@@ -4786,7 +5096,7 @@ export function GenerateView({
           seed: result.seed,
           wavPath: result.wav,
           ...generationSnap(
-            lineSynthText(fresh),
+            result.line.generatedText ?? currentLineSynthText(fresh),
             speakerConditionKey(
               speakersRef.current,
               fresh.speakerEmbedPath,
@@ -4934,10 +5244,17 @@ export function GenerateView({
     const gen = ++playGenRef.current;
     player.stop(true);
     try {
+      const variants = normalizeLineVariants(line);
+      const variant =
+        variantId != null
+          ? variants.find((v) => v.id === variantId) ?? variants[0]
+          : variants[0];
+      const clipEdit = clipEditOf(line, variant);
       const playPath = await invoke<string>("prepare_playback_wav", {
         src: wavPath,
         speed: line.speed,
         denoise: audioFxOf(line).denoise,
+        clipEdit: null,
       });
       if (gen !== playGenRef.current) return;
       const exists = await invoke<boolean>("file_exists", { path: playPath });
@@ -4958,13 +5275,23 @@ export function GenerateView({
       );
       if (gen !== playGenRef.current) return;
       const pending = pendingSeekRef.current;
-      if (
+      const hasPending =
         pending &&
         pending.lineId === line.id &&
-        pending.variantId === variantId
-      ) {
+        pending.variantId === variantId;
+      const { start, end } = clipTrimSec(clipEdit);
+      const from =
+        start > 0.001 ? sourceSecToPlaybackTime(start, line.speed) : null;
+      const until =
+        end > start + 0.001
+          ? sourceSecToPlaybackTime(end, line.speed)
+          : null;
+      player.setPlayWindow(from, until);
+      if (hasPending) {
         player.seek(pending.time);
         pendingSeekRef.current = null;
+      } else if (from != null) {
+        player.seek(from);
       }
       setSeekDraft((d) =>
         d && d.lineId === line.id && d.variantId === (variantId ?? d.variantId)
@@ -5164,6 +5491,70 @@ export function GenerateView({
       }
       return { ...prev, [lineId]: next };
     });
+  };
+
+  const updateVariantClipTrim = async (
+    lineId: string,
+    variantId: string,
+    patch: { trimStartSec?: number; trimEndSec?: number },
+  ) => {
+    await persist((prev) => ({
+      ...prev,
+      lines: prev.lines.map((l) => {
+        if (l.id !== lineId) return l;
+        const variants = normalizeLineVariants(l).map((v) => {
+          if (v.id !== variantId) return v;
+          return { ...v, clipEdit: { ...(v.clipEdit ?? {}), ...patch } };
+        });
+        return syncLineWavPath({ ...l, variants });
+      }),
+    }));
+  };
+
+  const markVariantTrim = (
+    line: ProjectLine,
+    variant: LineVariant,
+    which: "start" | "end",
+    clear = false,
+  ) => {
+    const player = playerRef.current;
+    const speed = line.speed;
+    const draft =
+      seekDraft?.lineId === line.id && seekDraft.variantId === variant.id
+        ? seekDraft.time
+        : null;
+    const playTime =
+      draft ??
+      (player?.isActiveVariant(line.id, variant.id)
+        ? player.getCurrentTime()
+        : 0);
+    const sourceSec = clear
+      ? 0
+      : Math.round(playbackTimeToSourceSec(playTime, speed) * 100) / 100;
+    const patch =
+      which === "start" ? { trimStartSec: sourceSec } : { trimEndSec: sourceSec };
+    void updateVariantClipTrim(line.id, variant.id, patch);
+    if (player?.isActiveVariant(line.id, variant.id) && player.hasBuffer) {
+      const { start, end } = clipTrimSec({
+        ...clipEditOf(line, variant),
+        ...patch,
+      });
+      player.setPlayWindow(
+        start > 0.001 ? sourceSecToPlaybackTime(start, speed) : null,
+        end > start + 0.001 ? sourceSecToPlaybackTime(end, speed) : null,
+      );
+    }
+    if (clear) {
+      setStatus(
+        which === "start" ? "開始トリムを解除" : "終了トリムを解除",
+      );
+      return;
+    }
+    setStatus(
+      which === "start"
+        ? `開始トリム: ${sourceSec.toFixed(2)}s`
+        : `終了トリム: ${sourceSec.toFixed(2)}s`,
+    );
   };
 
   const seekVariant = async (
@@ -5553,13 +5944,16 @@ export function GenerateView({
     dest: string,
     line: ProjectLine,
     format: ExportAudioFormat,
+    variant?: LineVariant | null,
   ) => {
+    const clipEdit = clipEditOf(line, variant ?? undefined);
     await invoke("export_wav_adjusted", {
       src,
       dest,
       volume: line.volume,
       speed: line.speed,
       audioFx: audioFxOf(line),
+      clipEdit: clipEditIsIdentity(clipEdit) ? null : clipEdit,
       format,
       bitrateKbps: exportBitrateKbps(format, settings),
     });
@@ -5575,6 +5969,7 @@ export function GenerateView({
   ) => {
     const variantCount = wavs.length;
     const ext = exportAudioExt(format);
+    const variants = normalizeLineVariants(line);
     for (let i = 0; i < wavs.length; i++) {
       const name = lineExportName(
         projectName,
@@ -5584,7 +5979,13 @@ export function GenerateView({
         i + 1,
         variantCount,
       );
-      await exportAdjustedWav(wavs[i], joinPath(folder, name), line, format);
+      await exportAdjustedWav(
+        wavs[i],
+        joinPath(folder, name),
+        line,
+        format,
+        variants[i] ?? variants[0],
+      );
     }
   };
 
@@ -5616,7 +6017,13 @@ export function GenerateView({
     try {
       if (wavs.length === 1) {
         const outPath = withAudioExt(dest, format);
-        await exportAdjustedWav(wavs[0], outPath, resolved.line, format);
+        await exportAdjustedWav(
+          wavs[0],
+          outPath,
+          resolved.line,
+          format,
+          normalizeLineVariants(resolved.line)[0],
+        );
         setStatus(`保存: ${outPath}`);
         return;
       }
@@ -5710,12 +6117,17 @@ export function GenerateView({
           `${p.name}_concat.${exportAudioExt(batchFormat)}`,
         );
         await invoke("export_wavs_concatenated", {
-          segments: resolved.map((r) => ({
-            src: r.wavs[0],
-            volume: r.line.volume,
-            speed: r.line.speed,
-            audioFx: audioFxOf(r.line),
-          })),
+          segments: resolved.map((r) => {
+            const variant = normalizeLineVariants(r.line)[0];
+            const clipEdit = clipEditOf(r.line, variant);
+            return {
+              src: r.wavs[0],
+              volume: r.line.volume,
+              speed: r.line.speed,
+              audioFx: audioFxOf(r.line),
+              clipEdit: clipEditIsIdentity(clipEdit) ? null : clipEdit,
+            };
+          }),
           silenceSecs,
           dest,
           format: batchFormat,
@@ -6344,13 +6756,36 @@ export function GenerateView({
                             speakers,
                           );
                           const variantStale = variantDiffs.length > 0;
+                          const variantClip = clipEditOf(line, variant);
+                          const { start: trimStartSec, end: trimEndSec } =
+                            clipTrimSec(variantClip);
+                          const trimStartPlay = sourceSecToPlaybackTime(
+                            trimStartSec,
+                            line.speed,
+                          );
+                          const trimEndPlay = sourceSecToPlaybackTime(
+                            trimEndSec,
+                            line.speed,
+                          );
+                          const showTrimBtns = isActive && !batchPlayActive;
+                          const trimLeftPct =
+                            duration > 0 && trimStartSec > 0.001
+                              ? Math.min(100, (trimStartPlay / duration) * 100)
+                              : 0;
+                          const trimRightPct =
+                            duration > 0 && trimEndSec > trimStartSec + 0.001
+                              ? Math.min(100, (trimEndPlay / duration) * 100)
+                              : 100;
+                          const showTrimRange =
+                            duration > 0 &&
+                            (trimStartSec > 0.001 || trimEndSec > 0.001);
                           return (
                             <div
                               className={`variant-seek-row${
                                 showKeepCheck ? " multi" : ""
-                              }${isKept ? " is-kept" : ""}${
-                                variantStale ? " is-stale" : ""
-                              }`}
+                              }${showTrimBtns ? " has-trim-btns" : ""}${
+                                isKept ? " is-kept" : ""
+                              }${variantStale ? " is-stale" : ""}`}
                               key={variant.id}
                             >
                               {showKeepCheck ? (
@@ -6386,13 +6821,32 @@ export function GenerateView({
                                   variantStale ? " is-stale-track asr-badge" : ""
                                 }`}
                               >
-                                <input
-                                  type="range"
-                                  min={0}
-                                  max={duration || 0}
-                                  step={0.01}
-                                  value={Math.min(currentTime, duration || 0)}
-                                  disabled={duration <= 0}
+                                <div
+                                  className={`variant-seek-input-wrap${
+                                    showTrimRange ? " has-trim" : ""
+                                  }`}
+                                  style={
+                                    {
+                                      "--trim-start": `${trimLeftPct}%`,
+                                      "--trim-end": `${trimRightPct}%`,
+                                      "--seek-progress": `${
+                                        duration > 0
+                                          ? Math.min(
+                                              100,
+                                              (currentTime / duration) * 100,
+                                            )
+                                          : 0
+                                      }%`,
+                                    } as CSSProperties
+                                  }
+                                >
+                                  <input
+                                    type="range"
+                                    min={0}
+                                    max={duration || 0}
+                                    step={0.01}
+                                    value={Math.min(currentTime, duration || 0)}
+                                    disabled={duration <= 0}
                                   onPointerDown={() => {
                                     userSeekingKeyRef.current = `${line.id}:${variant.id}`;
                                   }}
@@ -6442,6 +6896,7 @@ export function GenerateView({
                                     }, 0);
                                   }}
                                 />
+                                </div>
                                 <span className="seek-time">
                                   {duration > 0
                                     ? `${currentTime.toFixed(1)} / ${duration.toFixed(1)}s`
@@ -6451,6 +6906,54 @@ export function GenerateView({
                                   <DirtyDiffTooltip diffs={variantDiffs} />
                                 ) : null}
                               </div>
+                              {showTrimBtns ? (
+                                <>
+                                  <button
+                                    type="button"
+                                    className={`line-btn variant-trim-btn${
+                                      trimStartSec > 0.001 ? " is-set" : ""
+                                    }`}
+                                    title={
+                                      trimStartSec > 0.001
+                                        ? `開始地点 ${trimStartSec.toFixed(2)}s（Shift+クリックで解除）`
+                                        : "再生位置を開始地点に設定"
+                                    }
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      markVariantTrim(
+                                        line,
+                                        variant,
+                                        "start",
+                                        e.shiftKey,
+                                      );
+                                    }}
+                                  >
+                                    <IconTrimStart />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className={`line-btn variant-trim-btn${
+                                      trimEndSec > 0.001 ? " is-set" : ""
+                                    }`}
+                                    title={
+                                      trimEndSec > 0.001
+                                        ? `終了地点 ${trimEndSec.toFixed(2)}s（Shift+クリックで解除）`
+                                        : "再生位置を終了地点に設定"
+                                    }
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      markVariantTrim(
+                                        line,
+                                        variant,
+                                        "end",
+                                        e.shiftKey,
+                                      );
+                                    }}
+                                  >
+                                    <IconTrimEnd />
+                                  </button>
+                                </>
+                              ) : null}
                               <button
                                 type="button"
                                 className="line-btn danger variant-delete-btn"

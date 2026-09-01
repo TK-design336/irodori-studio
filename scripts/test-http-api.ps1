@@ -7,7 +7,7 @@
 #   .\scripts\test-http-api.ps1
 
 param(
-    [string]$BaseUrl = $(if ($env:IRODORI_BASE_URL) { $env:IRODORI_BASE_URL } else { "http://127.0.0.1:18790" }),
+    [string]$BaseUrl = $(if ($env:IRODORI_BASE_URL) { $env:IRODORI_BASE_URL } else { "http://127.0.0.1:50021" }),
     [string]$Token = $env:IRODORI_API_TOKEN,
     [string]$SpeakerId = $env:IRODORI_SPEAKER_ID,
     [string]$OutDir = $(Join-Path $PSScriptRoot "api-test-out"),

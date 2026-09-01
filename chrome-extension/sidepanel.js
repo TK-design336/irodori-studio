@@ -25,7 +25,7 @@ import {
 } from "./lib/playbackSettings.js";
 
 const DEFAULTS = {
-  baseUrl: "http://127.0.0.1:18790",
+  baseUrl: "http://127.0.0.1:50021",
   token: "",
   speakerId: "",
   rate: 1,

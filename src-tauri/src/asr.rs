@@ -52,6 +52,14 @@ fn extract_json_value(stdout: &str) -> Result<serde_json::Value, String> {
     Err(format!("no JSON object found; out={trimmed}"))
 }
 
+pub fn run_python_json_script(
+    settings: &AppSettings,
+    script_name: &str,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    run_python_json(settings, script_name, payload)
+}
+
 fn run_python_json(
     settings: &AppSettings,
     script_name: &str,
@@ -449,6 +457,29 @@ impl AsrWorker {
         })
     }
 
+    pub fn transcribe(&mut self, settings: &AppSettings, wav_path: &str) -> Result<String, String> {
+        self.ensure_loaded(settings)?;
+        let resp = self.request(
+            serde_json::json!({
+                "cmd": "transcribe",
+                "wavPath": wav_path,
+            }),
+            std::time::Duration::from_secs(120),
+        )?;
+        if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            let err = resp
+                .get("error")
+                .and_then(|x| x.as_str())
+                .unwrap_or("ASR transcribe failed");
+            return Err(err.to_string());
+        }
+        Ok(resp
+            .get("text")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string())
+    }
+
     pub fn shutdown(&mut self) {
         if self.stdin.is_some() {
             let _ = self.request(
@@ -474,4 +505,48 @@ pub fn verify_wav_asr(
     expected_text: &str,
 ) -> Result<AsrVerifyResult, String> {
     worker.verify(settings, wav_path, expected_text)
+}
+
+pub fn write_wav_mono_i16(path: &std::path::Path, samples: &[i16], sample_rate: u32) -> Result<(), String> {
+    let data_size = samples.len().saturating_mul(2);
+    let mut out = Vec::with_capacity(44 + data_size);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&((36 + data_size) as u32).to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&(sample_rate.saturating_mul(2)).to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&(data_size as u32).to_le_bytes());
+    for sample in samples {
+        out.extend_from_slice(&sample.to_le_bytes());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(path, out).map_err(|e| e.to_string())
+}
+
+pub fn transcribe_pcm_asr(
+    settings: &AppSettings,
+    worker: &mut AsrWorker,
+    samples: &[i16],
+    sample_rate: u32,
+) -> Result<String, String> {
+    if samples.is_empty() {
+        return Ok(String::new());
+    }
+    let rate = sample_rate.max(8_000).min(48_000);
+    let dir = crate::studio_cache_dir().join("live_asr");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("seg_{}.wav", uuid::Uuid::new_v4()));
+    write_wav_mono_i16(&path, samples, rate)?;
+    let text = worker.transcribe(settings, &path.display().to_string())?;
+    let _ = std::fs::remove_file(&path);
+    Ok(text)
 }

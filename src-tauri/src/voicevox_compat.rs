@@ -1,6 +1,6 @@
 //! VOICEVOX-compatible HTTP surface (speakers / audio_query / synthesis).
 
-use crate::dictionary::apply_dict_replacements;
+use crate::dictionary::{apply_dict_replacements, prepare_synth_text};
 use crate::settings::AppSettings;
 use crate::speakers::{self, SpeakerInfo};
 use crate::split_text::{normalize_max_chars_from_settings, prepare_chunks};
@@ -271,16 +271,23 @@ pub async fn audio_query_vv(
     let (settings, speakers, map) = with_speakers_and_map(app)?;
     let _speaker = speaker_by_style_id(&speakers, &map, params.speaker)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "話者が見つかりません".into()))?;
-    let replaced = apply_dict_replacements(&params.text);
+    let prepared = prepare_synth_text(&settings, &params.text, &[]).map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, e)
+    })?;
     let max_chars = normalize_max_chars_from_settings(settings.http_max_chars);
-    let chunks = prepare_chunks(&replaced, true, max_chars);
+    let chunks = prepare_chunks(&prepared, true, max_chars);
     if chunks.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "text が空です".into()));
     }
-    Ok(Json(build_audio_query(&replaced, &chunks, &settings)))
+    Ok(Json(build_audio_query(&params.text, &prepared, &chunks, &settings)))
 }
 
-fn build_audio_query(text: &str, chunks: &[String], _settings: &AppSettings) -> AudioQuery {
+fn build_audio_query(
+    display_text: &str,
+    prepared_text: &str,
+    chunks: &[String],
+    _settings: &AppSettings,
+) -> AudioQuery {
     let accent_phrases: Vec<VvAccentPhrase> = chunks
         .iter()
         .map(|c| VvAccentPhrase {
@@ -309,9 +316,9 @@ fn build_audio_query(text: &str, chunks: &[String], _settings: &AppSettings) -> 
         pause_length_scale: 1.0,
         output_sampling_rate: 44100,
         output_stereo: false,
-        kana: String::new(),
+        kana: prepared_text.to_string(),
         irodori: Some(IrodoriMeta {
-            text: text.to_string(),
+            text: display_text.to_string(),
             chunks: chunks.to_vec(),
         }),
     }
@@ -332,8 +339,11 @@ pub async fn synthesis_vv(
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "話者が見つかりません".into()))?
         .clone();
 
-    let chunks: Vec<String> = if let Some(meta) = &query.irodori {
-        meta.chunks.clone()
+    let (chunks, skip_dict): (Vec<String>, bool) = if !query.kana.trim().is_empty() {
+        let max_chars = normalize_max_chars_from_settings(settings.http_max_chars);
+        (prepare_chunks(query.kana.trim(), false, max_chars), true)
+    } else if let Some(meta) = &query.irodori {
+        (meta.chunks.clone(), false)
     } else {
         let joined: String = query
             .accent_phrases
@@ -341,13 +351,18 @@ pub async fn synthesis_vv(
             .flat_map(|p| p.moras.iter().map(|m| m.text.clone()))
             .collect();
         let replaced = apply_dict_replacements(&joined);
+        let prepared = prepare_synth_text(&settings, &replaced, &[]).map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, e)
+        })?;
         let max_chars = normalize_max_chars_from_settings(settings.http_max_chars);
-        prepare_chunks(&replaced, true, max_chars)
+        (prepare_chunks(&prepared, true, max_chars), true)
     };
 
     if chunks.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "text が空です".into()));
     }
+
+    let _ = skip_dict;
 
     let silence_ms = (settings.chunk_silence_ms as f64 * query.pause_length_scale.max(0.0)) as u32;
     let opts = UtteranceSynthOpts {

@@ -248,3 +248,120 @@ pub fn apply_dict_replacements(text: &str) -> String {
     let dicts = load_dictionaries();
     apply_replacements(text, &dicts.replace)
 }
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadingSpan {
+    pub kind: String,
+    pub start: usize,
+    pub end: usize,
+    pub surface: String,
+    pub reading: String,
+}
+
+/// Unicode code-point span replacement (matches TS `buildSynthText`).
+pub fn apply_readings_to_text(text: &str, readings: &[ReadingSpan]) -> String {
+    if readings.is_empty() {
+        return text.to_string();
+    }
+    let mut sorted: Vec<&ReadingSpan> = readings
+        .iter()
+        .filter(|r| !r.reading.trim().is_empty())
+        .collect();
+    sorted.sort_by_key(|r| std::cmp::Reverse(r.start));
+    let mut chars: Vec<char> = text.chars().collect();
+    for r in sorted {
+        if r.start >= r.end || r.end > chars.len() {
+            continue;
+        }
+        let repl: Vec<char> = r.reading.chars().collect();
+        chars.splice(r.start..r.end, repl);
+    }
+    chars.into_iter().collect()
+}
+
+pub fn prepare_synth_text(
+    settings: &crate::settings::AppSettings,
+    text: &str,
+    manual: &[crate::project::AppliedReading],
+) -> Result<String, String> {
+    let replaced = apply_dict_replacements(text);
+    let dicts = load_dictionaries();
+    let reading_dict: Vec<crate::asr::ReadingDictPayload> = dicts
+        .reading
+        .iter()
+        .filter(|e| e.enabled && !e.surface.is_empty())
+        .map(|e| crate::asr::ReadingDictPayload {
+            kind: e.kind.clone(),
+            surface: e.surface.clone(),
+            reading: e.reading.clone(),
+        })
+        .collect();
+    let manual_json: Vec<serde_json::Value> = manual
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "start": r.start,
+                "end": r.end,
+                "surface": r.surface,
+                "reading": r.reading,
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "text": replaced,
+        "manualReadings": manual_json,
+        "readingDict": reading_dict,
+    });
+    let v = crate::asr::run_python_json_script(settings, "auto_readings_apply.py", &payload)?;
+    let auto = v
+        .get("readings")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut all: Vec<ReadingSpan> = manual
+        .iter()
+        .map(|r| ReadingSpan {
+            kind: r.kind.clone(),
+            start: r.start,
+            end: r.end,
+            surface: r.surface.clone(),
+            reading: r.reading.clone(),
+        })
+        .collect();
+    for item in auto {
+        let start = item.get("start").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+        let end = item.get("end").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+        let reading = item
+            .get("reading")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if reading.is_empty() || start >= end {
+            continue;
+        }
+        let overlaps_manual = all
+            .iter()
+            .any(|m| start < m.end && m.start < end);
+        if overlaps_manual {
+            continue;
+        }
+        all.push(ReadingSpan {
+            kind: item
+                .get("kind")
+                .and_then(|x| x.as_str())
+                .unwrap_or("english")
+                .to_string(),
+            start,
+            end,
+            surface: item
+                .get("surface")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            reading,
+        });
+    }
+    Ok(apply_readings_to_text(&replaced, &all))
+}

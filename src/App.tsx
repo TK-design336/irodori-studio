@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { GenerateView } from "./components/GenerateView";
+import { LiveView } from "./components/LiveView";
 import { SettingsView } from "./components/SettingsView";
 import { TrainView } from "./components/TrainView";
 import { SpeakerView } from "./components/SpeakerView";
@@ -17,7 +18,13 @@ import { isIrodoriV4 } from "./types";
 import { applyAppearance } from "./lib/accent";
 import "./App.css";
 
-type Tab = "generate" | "speaker" | "train" | "dictionary" | "settings";
+type Tab =
+  | "generate"
+  | "live"
+  | "speaker"
+  | "train"
+  | "dictionary"
+  | "settings";
 
 function App() {
   const [tab, setTab] = useState<Tab>("generate");
@@ -174,6 +181,21 @@ function App() {
           </button>
           <button
             type="button"
+            className={tab === "live" ? "active" : ""}
+            disabled={training || setupIncomplete}
+            title={
+              setupIncomplete
+                ? "先に Irodori ルートを設定してください"
+                : training
+                  ? "学習中は配信画面へ移動できません"
+                  : undefined
+            }
+            onClick={() => selectTab("live")}
+          >
+            配信
+          </button>
+          <button
+            type="button"
             className={tab === "speaker" ? "active" : ""}
             disabled={training || setupIncomplete}
             title={
@@ -273,6 +295,13 @@ function App() {
 
       <div className="content">
         {/* Keep views mounted so in-flight work (esp. training) survives layout changes */}
+        <div
+          className="tab-panel"
+          hidden={tab !== "live"}
+          aria-hidden={tab !== "live"}
+        >
+          <LiveView speakers={speakers} settings={settings} />
+        </div>
         <div
           className="tab-panel"
           hidden={tab !== "speaker"}

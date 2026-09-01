@@ -25,6 +25,72 @@ export function IconSave({ size = 15, className }: IconProps) {
   );
 }
 
+/** In-point bracket for per-clip trim */
+export function IconTrimStart({ size = 15, className }: IconProps) {
+  return (
+    <svg
+      className={className}
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.25"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M8 5v14" />
+      <path d="M8 5h8" />
+      <path d="M8 19h8" />
+    </svg>
+  );
+}
+
+/** Out-point bracket for per-clip trim */
+export function IconTrimEnd({ size = 15, className }: IconProps) {
+  return (
+    <svg
+      className={className}
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.25"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M16 5v14" />
+      <path d="M8 5h8" />
+      <path d="M8 19h8" />
+    </svg>
+  );
+}
+
+/** Lucide-style microphone icon */
+export function IconMic({ size = 15, className }: IconProps) {
+  return (
+    <svg
+      className={className}
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+      <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+      <line x1="12" x2="12" y1="19" y2="22" />
+    </svg>
+  );
+}
+
 /** Lucide-style trash icon */
 export function IconTrash({ size = 15, className }: IconProps) {
   return (

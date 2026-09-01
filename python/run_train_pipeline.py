@@ -414,6 +414,55 @@ def apply_autofix_step(
     return sliced_dir
 
 
+def _diarize_enabled(review_config_json: str) -> bool:
+    if not review_config_json.strip():
+        return False
+    try:
+        cfg = json.loads(Path(review_config_json).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    di = cfg.get("diarize") or {}
+    return bool(di.get("enabled"))
+
+
+def apply_diarize_step(
+    *,
+    py: Path,
+    studio_py: Path,
+    irodori: Path,
+    job_dir: Path,
+    sliced_dir: Path,
+    review_config_json: str,
+    step: int,
+    total: int,
+) -> None:
+    if not _diarize_enabled(review_config_json):
+        return
+    print(f"STEP {step}/{total} diarize", flush=True)
+    if is_done(job_dir, "diarize"):
+        print("SKIP diarize (already done)", flush=True)
+        emit_progress(step=step, total=total, name="diarize", fraction=1.0)
+        return
+    review_dir = job_dir / "slice_review"
+    review_dir.mkdir(parents=True, exist_ok=True)
+    out_json = review_dir / "diarization.json"
+    run(
+        [
+            str(py),
+            str(studio_py / "speaker_diarize.py"),
+            "--sliced-dir",
+            str(sliced_dir),
+            "--out-json",
+            str(out_json),
+        ],
+        cwd=irodori,
+        step=step,
+        total=total,
+        name="diarize",
+    )
+    mark_done(job_dir, "diarize")
+
+
 def apply_review_step(
     *,
     py: Path,
@@ -702,8 +751,8 @@ def main() -> int:
         return vocals_dir
 
     if args.input_mode == "sliced":
-        # prepare (or separate) → speed → autofix → review → dataset → prepare_manifest → train
-        total = 7
+        # prepare (or separate) → diarize → speed → autofix → review → dataset → prepare_manifest → train
+        total = 8
         # --- 1 prepare sliced / separate ---
         if vocal_separate:
             sliced_dir = run_separate_vocals(step=1, total=total, name="separate_vocals")
@@ -730,183 +779,17 @@ def main() -> int:
                 )
                 mark_done(job_dir, "prepare_sliced")
 
-        # --- 2 speed ---
-        sliced_dir = apply_speed_step(
+        # --- 2 diarize ---
+        apply_diarize_step(
             py=py,
             studio_py=studio_py,
             irodori=irodori,
             job_dir=job_dir,
             sliced_dir=sliced_dir,
-            speed=speed,
+            review_config_json=args.review_config_json,
             step=2,
             total=total,
         )
-
-        # --- 3 autofix ---
-        sliced_dir = apply_autofix_step(
-            py=py,
-            studio_py=studio_py,
-            irodori=irodori,
-            job_dir=job_dir,
-            sliced_dir=sliced_dir,
-            review_config_json=args.review_config_json,
-            step=3,
-            total=total,
-        )
-
-        # --- 4 review ---
-        pause = apply_review_step(
-            py=py,
-            studio_py=studio_py,
-            irodori=irodori,
-            job_dir=job_dir,
-            sliced_dir=sliced_dir,
-            review_mode=args.review_mode,
-            review_config_json=args.review_config_json,
-            review_model_cache_dir=args.review_model_cache_dir,
-            asr_model_dir=args.asr_model_dir,
-            step=4,
-            total=total,
-        )
-        if pause:
-            return 0
-
-        # --- 5 dataset ---
-        print("STEP 5/7 dataset", flush=True)
-        if is_done(job_dir, "dataset") and dataset_jsonl.is_file():
-            print("SKIP dataset (already done)", flush=True)
-            emit_progress(step=5, total=total, name="dataset", fraction=1.0)
-        else:
-            excl = job_dir / "slice_review" / "exclusions.json"
-            cmd_ds = [
-                str(py),
-                str(studio_py / "preprocess_dataset.py"),
-                "--sliced-dir",
-                str(sliced_dir),
-                "--output-jsonl",
-                str(dataset_jsonl),
-            ]
-            if excl.is_file():
-                cmd_ds.extend(["--exclusions-json", str(excl)])
-            run(
-                cmd_ds,
-                cwd=irodori,
-                step=5,
-                total=total,
-                name="dataset",
-            )
-            mark_done(job_dir, "dataset")
-
-        # --- 6 prepare_manifest ---
-        run_prepare_manifest(
-            py=py,
-            studio_py=studio_py,
-            irodori=irodori,
-            job_dir=job_dir,
-            dataset_jsonl=dataset_jsonl,
-            manifest=manifest,
-            latent_dir=latent_dir,
-            device=args.device,
-            step=6,
-            total=total,
-        )
-
-        # --- 7 train ---
-        print("STEP 7/7 train", flush=True)
-        run(
-            [
-                str(py),
-                str(irodori / "train.py"),
-                "--config",
-                args.config,
-                "--init-checkpoint",
-                str(Path(args.init_checkpoint).resolve()),
-                "--manifest",
-                str(manifest),
-                "--output-dir",
-                str(output_dir),
-            ],
-            cwd=irodori,
-            step=7,
-            total=total,
-            name="train",
-        )
-        mark_done(job_dir, "train")
-    else:
-        # (separate | to_wav) → slice → speed → autofix → review → dataset → prepare_manifest → train
-        total = 8
-        audio_files = list_audio_files(input_dir)
-        all_wav = bool(audio_files) and all(
-            p.suffix.lower() == ".wav" for p in audio_files
-        )
-
-        # --- 1 separate_vocals or to_wav ---
-        if vocal_separate:
-            wav_dir = run_separate_vocals(step=1, total=total, name="separate_vocals")
-        else:
-            print("STEP 1/8 to_wav", flush=True)
-            if is_done(job_dir, "to_wav"):
-                print("SKIP to_wav (already done)", flush=True)
-                emit_progress(step=1, total=total, name="to_wav", fraction=1.0)
-                if all_wav or not (wav_dir.is_dir() and any(wav_dir.glob("*.wav"))):
-                    if all_wav:
-                        wav_dir = input_dir
-            elif all_wav:
-                wav_dir = input_dir
-                print(
-                    f"SKIP to_wav: {len(audio_files)} file(s) already wav → using {wav_dir}",
-                    flush=True,
-                )
-                emit_progress(
-                    step=1,
-                    total=total,
-                    name="to_wav",
-                    fraction=1.0,
-                    detail=f"{len(audio_files)} wav(s)",
-                )
-                mark_done(job_dir, "to_wav")
-            else:
-                run(
-                    [
-                        str(py),
-                        str(studio_py / "preprocess_to_wav.py"),
-                        "--input-dir",
-                        str(input_dir),
-                        "--output-dir",
-                        str(wav_dir),
-                    ],
-                    cwd=irodori,
-                    step=1,
-                    total=total,
-                    name="to_wav",
-                )
-                mark_done(job_dir, "to_wav")
-
-        # --- 2 slice ---
-        print("STEP 2/8 slice", flush=True)
-        if is_done(job_dir, "slice") and sliced_dir.is_dir() and any(
-            sliced_dir.glob("*.wav")
-        ):
-            print("SKIP slice (already done)", flush=True)
-            emit_progress(step=2, total=total, name="slice", fraction=1.0)
-        else:
-            run(
-                [
-                    str(py),
-                    str(studio_py / "preprocess_slice.py"),
-                    "--input-dir",
-                    str(wav_dir),
-                    "--output-dir",
-                    str(sliced_dir),
-                    "--method",
-                    slice_method,
-                ],
-                cwd=irodori,
-                step=2,
-                total=total,
-                name="slice",
-            )
-            mark_done(job_dir, "slice")
 
         # --- 3 speed ---
         sliced_dir = apply_speed_step(
@@ -966,6 +849,9 @@ def main() -> int:
             ]
             if excl.is_file():
                 cmd_ds.extend(["--exclusions-json", str(excl)])
+            diar = job_dir / "slice_review" / "diarization.json"
+            if diar.is_file():
+                cmd_ds.extend(["--diarization-json", str(diar)])
             run(
                 cmd_ds,
                 cwd=irodori,
@@ -1006,6 +892,199 @@ def main() -> int:
             ],
             cwd=irodori,
             step=8,
+            total=total,
+            name="train",
+        )
+        mark_done(job_dir, "train")
+    else:
+        # (separate | to_wav) → slice → diarize → speed → autofix → review → dataset → prepare_manifest → train
+        total = 9
+        audio_files = list_audio_files(input_dir)
+        all_wav = bool(audio_files) and all(
+            p.suffix.lower() == ".wav" for p in audio_files
+        )
+
+        # --- 1 separate_vocals or to_wav ---
+        if vocal_separate:
+            wav_dir = run_separate_vocals(step=1, total=total, name="separate_vocals")
+        else:
+            print("STEP 1/8 to_wav", flush=True)
+            if is_done(job_dir, "to_wav"):
+                print("SKIP to_wav (already done)", flush=True)
+                emit_progress(step=1, total=total, name="to_wav", fraction=1.0)
+                if all_wav or not (wav_dir.is_dir() and any(wav_dir.glob("*.wav"))):
+                    if all_wav:
+                        wav_dir = input_dir
+            elif all_wav:
+                wav_dir = input_dir
+                print(
+                    f"SKIP to_wav: {len(audio_files)} file(s) already wav → using {wav_dir}",
+                    flush=True,
+                )
+                emit_progress(
+                    step=1,
+                    total=total,
+                    name="to_wav",
+                    fraction=1.0,
+                    detail=f"{len(audio_files)} wav(s)",
+                )
+                mark_done(job_dir, "to_wav")
+            else:
+                run(
+                    [
+                        str(py),
+                        str(studio_py / "preprocess_to_wav.py"),
+                        "--input-dir",
+                        str(input_dir),
+                        "--output-dir",
+                        str(wav_dir),
+                    ],
+                    cwd=irodori,
+                    step=1,
+                    total=total,
+                    name="to_wav",
+                )
+                mark_done(job_dir, "to_wav")
+
+        # --- 2 slice ---
+        print("STEP 2/9 slice", flush=True)
+        if is_done(job_dir, "slice") and sliced_dir.is_dir() and any(
+            sliced_dir.glob("*.wav")
+        ):
+            print("SKIP slice (already done)", flush=True)
+            emit_progress(step=2, total=total, name="slice", fraction=1.0)
+        else:
+            run(
+                [
+                    str(py),
+                    str(studio_py / "preprocess_slice.py"),
+                    "--input-dir",
+                    str(wav_dir),
+                    "--output-dir",
+                    str(sliced_dir),
+                    "--method",
+                    slice_method,
+                ],
+                cwd=irodori,
+                step=2,
+                total=total,
+                name="slice",
+            )
+            mark_done(job_dir, "slice")
+
+        # --- 3 diarize ---
+        apply_diarize_step(
+            py=py,
+            studio_py=studio_py,
+            irodori=irodori,
+            job_dir=job_dir,
+            sliced_dir=sliced_dir,
+            review_config_json=args.review_config_json,
+            step=3,
+            total=total,
+        )
+
+        # --- 4 speed ---
+        sliced_dir = apply_speed_step(
+            py=py,
+            studio_py=studio_py,
+            irodori=irodori,
+            job_dir=job_dir,
+            sliced_dir=sliced_dir,
+            speed=speed,
+            step=4,
+            total=total,
+        )
+
+        # --- 5 autofix ---
+        sliced_dir = apply_autofix_step(
+            py=py,
+            studio_py=studio_py,
+            irodori=irodori,
+            job_dir=job_dir,
+            sliced_dir=sliced_dir,
+            review_config_json=args.review_config_json,
+            step=5,
+            total=total,
+        )
+
+        # --- 6 review ---
+        pause = apply_review_step(
+            py=py,
+            studio_py=studio_py,
+            irodori=irodori,
+            job_dir=job_dir,
+            sliced_dir=sliced_dir,
+            review_mode=args.review_mode,
+            review_config_json=args.review_config_json,
+            review_model_cache_dir=args.review_model_cache_dir,
+            asr_model_dir=args.asr_model_dir,
+            step=6,
+            total=total,
+        )
+        if pause:
+            return 0
+
+        # --- 7 dataset ---
+        print("STEP 7/9 dataset", flush=True)
+        if is_done(job_dir, "dataset") and dataset_jsonl.is_file():
+            print("SKIP dataset (already done)", flush=True)
+            emit_progress(step=7, total=total, name="dataset", fraction=1.0)
+        else:
+            excl = job_dir / "slice_review" / "exclusions.json"
+            cmd_ds = [
+                str(py),
+                str(studio_py / "preprocess_dataset.py"),
+                "--sliced-dir",
+                str(sliced_dir),
+                "--output-jsonl",
+                str(dataset_jsonl),
+            ]
+            if excl.is_file():
+                cmd_ds.extend(["--exclusions-json", str(excl)])
+            diar = job_dir / "slice_review" / "diarization.json"
+            if diar.is_file():
+                cmd_ds.extend(["--diarization-json", str(diar)])
+            run(
+                cmd_ds,
+                cwd=irodori,
+                step=7,
+                total=total,
+                name="dataset",
+            )
+            mark_done(job_dir, "dataset")
+
+        # --- 8 prepare_manifest ---
+        run_prepare_manifest(
+            py=py,
+            studio_py=studio_py,
+            irodori=irodori,
+            job_dir=job_dir,
+            dataset_jsonl=dataset_jsonl,
+            manifest=manifest,
+            latent_dir=latent_dir,
+            device=args.device,
+            step=8,
+            total=total,
+        )
+
+        # --- 9 train ---
+        print("STEP 9/9 train", flush=True)
+        run(
+            [
+                str(py),
+                str(irodori / "train.py"),
+                "--config",
+                args.config,
+                "--init-checkpoint",
+                str(Path(args.init_checkpoint).resolve()),
+                "--manifest",
+                str(manifest),
+                "--output-dir",
+                str(output_dir),
+            ],
+            cwd=irodori,
+            step=9,
             total=total,
             name="train",
         )

@@ -61,6 +61,8 @@ export type SliceReviewSettings = {
   autoKeepMax?: number;
   /** Non-generative WPE / tilt / denoise on sliced clips before review. */
   autoFix: SliceAutoFixSettings;
+  /** Cluster sliced clips by speaker (multi-speaker sources). */
+  diarizeEnabled?: boolean;
 };
 
 export type SliceAutoFixSettings = {
@@ -115,6 +117,7 @@ export const DEFAULT_SLICE_REVIEW: SliceReviewSettings = {
   autoRemovePercent: 0,
   autoKeepMax: 0,
   autoFix: { ...DEFAULT_SLICE_AUTO_FIX },
+  diarizeEnabled: false,
 };
 
 export function sliceReviewSettings(
@@ -146,6 +149,7 @@ export function sliceReviewSettings(
       : 0,
     autoKeepMax: Number.isFinite(keep) ? Math.max(0, Math.floor(keep)) : 0,
     autoFix: sliceAutoFixSettings(raw.autoFix),
+    diarizeEnabled: raw.diarizeEnabled === true,
   };
 }
 
@@ -346,6 +350,25 @@ export function multiGenerateModeOf(
   return s?.multiGenerateMode === "individual" ? "individual" : "candidates";
 }
 
+export type ClipEdit = {
+  trimStartSec?: number;
+  /** 0 = through end of file */
+  trimEndSec?: number;
+  prePadSec?: number;
+  postPadSec?: number;
+  fadeInSec?: number;
+  fadeOutSec?: number;
+};
+
+export const EMPTY_CLIP_EDIT: ClipEdit = {
+  trimStartSec: 0,
+  trimEndSec: 0,
+  prePadSec: 0,
+  postPadSec: 0,
+  fadeInSec: 0,
+  fadeOutSec: 0,
+};
+
 export type LineVariant = {
   id: string;
   seed: number;
@@ -356,6 +379,8 @@ export type LineVariant = {
   generatedCaption?: string | null;
   generatedCfgScaleCaption?: number | null;
   generatedSampling?: SamplingParams | null;
+  /** Per-clip trim (in/out). Pad / fade stay on the line. */
+  clipEdit?: ClipEdit | null;
 };
 
 export type ProjectLine = {
@@ -386,6 +411,8 @@ export type ProjectLine = {
   speed: number;
   /** Post-generation tone / denoise. Missing → all off. */
   audioFx?: AudioFx;
+  /** Pad / fade between clips on concat / playback. Trim is per-variant. */
+  clipEdit?: ClipEdit | null;
 };
 
 /** Line post-FX amounts in 0..1 (0 = bypass). Keep in sync with Rust `AudioFx`. */
@@ -431,6 +458,46 @@ export function audioFxOf(
     deesser: clampFx01(raw.deesser),
     denoise: clampFx01(raw.denoise),
   };
+}
+
+function clipNum(v: unknown): number {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+export function clipEditOf(
+  line: { clipEdit?: ClipEdit | null } | null | undefined,
+  variant?: { clipEdit?: ClipEdit | null } | null,
+): ClipEdit {
+  const lineRaw = line?.clipEdit;
+  const varRaw = variant?.clipEdit;
+  if (!lineRaw && !varRaw) return { ...EMPTY_CLIP_EDIT };
+  // Variant clipEdit, once present, owns trim so clearing it does not
+  // fall back to a leftover line-level trim from older projects.
+  const trimFromVariant = varRaw != null;
+  return {
+    trimStartSec: trimFromVariant
+      ? clipNum(varRaw.trimStartSec)
+      : clipNum(lineRaw?.trimStartSec),
+    trimEndSec: trimFromVariant
+      ? clipNum(varRaw.trimEndSec)
+      : clipNum(lineRaw?.trimEndSec),
+    prePadSec: clipNum(varRaw?.prePadSec) || clipNum(lineRaw?.prePadSec),
+    postPadSec: clipNum(varRaw?.postPadSec) || clipNum(lineRaw?.postPadSec),
+    fadeInSec: clipNum(varRaw?.fadeInSec) || clipNum(lineRaw?.fadeInSec),
+    fadeOutSec: clipNum(varRaw?.fadeOutSec) || clipNum(lineRaw?.fadeOutSec),
+  };
+}
+
+export function clipEditIsIdentity(edit: ClipEdit): boolean {
+  return (
+    clipNum(edit.trimStartSec) < 0.001 &&
+    clipNum(edit.trimEndSec) < 0.001 &&
+    clipNum(edit.prePadSec) < 0.001 &&
+    clipNum(edit.postPadSec) < 0.001 &&
+    clipNum(edit.fadeInSec) < 0.001 &&
+    clipNum(edit.fadeOutSec) < 0.001
+  );
 }
 
 export function audioFxActive(fx: AudioFx): boolean {

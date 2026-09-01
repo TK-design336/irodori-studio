@@ -52,6 +52,8 @@ export type SliceMetricsRow = {
     batchMuffle?: boolean;
     backupDir?: string;
   };
+  /** A / B / ? from speaker diarization */
+  speakerCluster?: string | null;
 };
 
 type ExclusionMeta = {
@@ -165,6 +167,9 @@ export function SliceReviewView({
   const [playDur, setPlayDur] = useState(0);
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
+  const [diarClusters, setDiarClusters] = useState<string[]>([]);
+  const [diarSelected, setDiarSelected] = useState<string[]>([]);
+  const [speakerFilter, setSpeakerFilter] = useState<string>("all");
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const blobUrlRef = useRef<string | null>(null);
   const listParentRef = useRef<HTMLDivElement>(null);
@@ -196,6 +201,11 @@ export function SliceReviewView({
         excludedCount?: number;
         byAspect?: Record<string, number>;
       }>("load_slice_review_log_cmd", { jobDir });
+      const diar = await invoke<{
+        enabled?: boolean;
+        clusters?: string[];
+        selected?: string[];
+      }>("load_diarization_cmd", { jobDir });
       const af = await invoke<{
         changedCount?: number;
         total?: number;
@@ -217,6 +227,13 @@ export function SliceReviewView({
       setReviewLog(log || null);
       setAutoFixLog(
         af && typeof af === "object" && typeof af.total === "number" ? af : null,
+      );
+      const clusters = Array.isArray(diar?.clusters)
+        ? diar.clusters.map(String)
+        : [];
+      setDiarClusters(clusters);
+      setDiarSelected(
+        Array.isArray(diar?.selected) ? diar.selected.map(String) : [],
       );
       setStatus("");
     } catch (e) {
@@ -246,6 +263,9 @@ export function SliceReviewView({
 
   const filtered = useMemo(() => {
     let rows = [...slices];
+    if (speakerFilter !== "all") {
+      rows = rows.filter((r) => (r.speakerCluster ?? "?") === speakerFilter);
+    }
     if (tab !== "all") {
       rows = rows.filter((r) => r.flags?.[tab] || r.hitAspects?.includes(tab));
     }
@@ -282,7 +302,7 @@ export function SliceReviewView({
       return cmpName(a, b);
     });
     return rows;
-  }, [slices, tab, allSort]);
+  }, [slices, tab, allSort, speakerFilter]);
 
   const filteredRef = useRef(filtered);
   filteredRef.current = filtered;
@@ -856,6 +876,54 @@ export function SliceReviewView({
                   .join(", ")}）`
               : ""}
           </p>
+        )}
+        {diarClusters.length > 0 && (
+          <div className="row slice-review-diarize">
+            <span className="hint">話者クラスタ:</span>
+            <button
+              type="button"
+              className={speakerFilter === "all" ? "chip active" : "chip"}
+              onClick={() => setSpeakerFilter("all")}
+            >
+              すべて
+            </button>
+            {diarClusters.map((c) => (
+              <button
+                key={c}
+                type="button"
+                className={speakerFilter === c ? "chip active" : "chip"}
+                onClick={() => setSpeakerFilter(c)}
+              >
+                {c === "?" ? "判別不能" : `話者 ${c}`}
+              </button>
+            ))}
+            {!readOnly && diarClusters.filter((c) => c !== "?").length > 1 && (
+              <span className="hint">
+                学習に使う話者:
+                {diarClusters
+                  .filter((c) => c !== "?")
+                  .map((c) => (
+                    <label key={c} style={{ marginLeft: 8 }}>
+                      <input
+                        type="checkbox"
+                        checked={diarSelected.includes(c)}
+                        onChange={(e) => {
+                          const next = e.target.checked
+                            ? [...new Set([...diarSelected, c])]
+                            : diarSelected.filter((x) => x !== c);
+                          setDiarSelected(next);
+                          void invoke("save_diarization_cmd", {
+                            jobDir,
+                            selected: next,
+                          });
+                        }}
+                      />
+                      {c}
+                    </label>
+                  ))}
+              </span>
+            )}
+          </div>
         )}
         <div className="row slice-review-tabs" role="tablist">
           <button

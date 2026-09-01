@@ -1,6 +1,6 @@
 //! Shared TTS synthesize path used by Tauri commands and the local HTTP API.
 
-use crate::dictionary::apply_dict_replacements;
+use crate::dictionary::prepare_synth_text;
 use crate::settings::{studio_python_dir, AppSettings};
 use crate::speakers::SpeakerInfo;
 use crate::split_text::{normalize_max_chars_from_settings, prepare_chunks};
@@ -51,8 +51,8 @@ pub fn synthesize_utterance_to_path(
     opts: UtteranceSynthOpts,
 ) -> Result<(), String> {
     let opts = opts.clamped();
-    let replaced = apply_dict_replacements(text);
-    let chunks = prepare_chunks(&replaced, opts.split, opts.max_chars);
+    let prepared = prepare_synth_text(settings, text, &[])?;
+    let chunks = prepare_chunks(&prepared, opts.split, opts.max_chars);
     if chunks.is_empty() {
         return Err("text が空です".into());
     }
@@ -99,6 +99,7 @@ fn synthesize_chunks_inner(
             &Default::default(),
             ExportAudioFormat::Wav,
             None,
+            None,
         );
     }
 
@@ -118,6 +119,7 @@ fn synthesize_chunks_inner(
             volume: opts.volume,
             speed: opts.speed,
             audio_fx: Default::default(),
+            clip_edit: None,
         })
         .collect();
 

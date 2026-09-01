@@ -105,7 +105,7 @@ impl Default for HttpServerHandle {
                 running: false,
                 bind_address: "127.0.0.1".into(),
                 port: None,
-                preferred_port: 18790,
+                preferred_port: 50021,
             })),
         }
     }
@@ -549,7 +549,7 @@ fn convert_wav_to_format(
         "m4b" => ExportAudioFormat::M4b,
         _ => ExportAudioFormat::Wav,
     };
-    export_wav_adjusted_inner(settings, wav_path.to_string(), dest, 1.0, 1.0, &Default::default(), fmt, None)?;
+    export_wav_adjusted_inner(settings, wav_path.to_string(), dest, 1.0, 1.0, &Default::default(), fmt, None, None)?;
     let bytes = std::fs::read(&tmp).map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(&tmp);
     Ok((bytes, content_type_for(format)))
@@ -1010,6 +1010,7 @@ fn concat_paths_to_bytes(
             volume,
             speed,
             audio_fx: Default::default(),
+            clip_edit: None,
         })
         .collect();
     export_wavs_concatenated_inner(
@@ -1213,6 +1214,7 @@ async fn concat_http(
             volume,
             speed,
             audio_fx: Default::default(),
+            clip_edit: None,
         })
         .collect();
 

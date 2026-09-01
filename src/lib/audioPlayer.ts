@@ -32,6 +32,10 @@ export class LineAudioPlayer {
   private variantId: string | null = null;
   private startedAt = 0;
   private offset = 0;
+  /** In-point for the next start after the clip ends (original buffer seconds). */
+  private playFrom = 0;
+  /** Out-point; playback stops here when set. */
+  private playUntil: number | null = null;
   private playing = false;
   private volume = 1;
   private audioFx: AudioFx = defaultAudioFx();
@@ -69,7 +73,11 @@ export class LineAudioPlayer {
   private tick = () => {
     if (!this.playing) return;
     this.emit();
-    if (this.getCurrentTime() >= (this.buffer?.duration ?? 0) - 0.02) {
+    const limit =
+      this.playUntil != null && this.offset < this.playUntil - 0.02
+        ? this.playUntil
+        : (this.buffer?.duration ?? 0);
+    if (this.getCurrentTime() >= limit - 0.02) {
       this.finishEnded();
       return;
     }
@@ -79,7 +87,7 @@ export class LineAudioPlayer {
   private finishEnded() {
     this.disconnectSource();
     this.playing = false;
-    this.offset = 0;
+    this.offset = this.playFrom;
     this.emit();
     const waiters = this.endedWaiters.splice(0);
     waiters.forEach((w) => w());
@@ -88,6 +96,18 @@ export class LineAudioPlayer {
   private ensureCtx() {
     if (!this.ctx) this.ctx = new AudioContext();
     return this.ctx;
+  }
+
+  /** Route Web Audio output to a sink (Chrome / Edge). Empty id = system default. */
+  async setOutputDevice(deviceId: string): Promise<boolean> {
+    const ctx = this.ensureCtx();
+    const setSinkId = (
+      ctx as AudioContext & { setSinkId?: (id: string) => Promise<void> }
+    ).setSinkId;
+    if (typeof setSinkId !== "function") return false;
+    const sinkId = deviceId.trim() || "default";
+    await setSinkId.call(ctx, sinkId);
+    return true;
   }
 
   private fxNodes() {
@@ -278,6 +298,8 @@ export class LineAudioPlayer {
     this.disconnectSource();
     this.playing = false;
     this.offset = 0;
+    this.playFrom = 0;
+    this.playUntil = null;
     this.releaseEndedWaiters();
     if (clearLine) {
       this.lineId = null;
@@ -310,6 +332,8 @@ export class LineAudioPlayer {
     this.buffer = audioBuf;
     this.volume = volume;
     this.offset = 0;
+    this.playFrom = 0;
+    this.playUntil = null;
     this.playing = false;
     this.ensureChain(ctx);
     this.applyFx();
@@ -344,7 +368,17 @@ export class LineAudioPlayer {
     this.source = src;
     this.startedAt = this.ctx.currentTime;
     this.playing = true;
-    src.start(0, this.offset);
+    const useWindow =
+      this.playUntil != null && this.offset < this.playUntil - 0.02;
+    const endAt = useWindow
+      ? this.playUntil!
+      : this.buffer.duration;
+    const remaining = endAt - this.offset;
+    if (remaining <= 0.02) {
+      this.finishEnded();
+      return;
+    }
+    src.start(0, this.offset, remaining);
     this.raf = requestAnimationFrame(this.tick);
     this.emit();
   }
@@ -375,6 +409,15 @@ export class LineAudioPlayer {
     else this.emit();
   }
 
+  /** Constrain the next play-through to [from, until) in buffer seconds. */
+  setPlayWindow(from: number | null, until: number | null) {
+    const dur = this.buffer?.duration ?? 0;
+    const start = from != null && from > 0.001 ? Math.min(from, dur) : 0;
+    this.playFrom = start;
+    this.playUntil =
+      until != null && until > start + 0.001 ? Math.min(until, dur) : null;
+  }
+
   setVolume(volume: number) {
     this.volume = volume;
     if (this.gain) this.gain.gain.value = volume;
@@ -389,15 +432,16 @@ export class LineAudioPlayer {
   async replaceBufferKeepPosition(bytes: Uint8Array) {
     if (!this.lineId) return;
     const wasPlaying = this.playing;
-    const ratio =
-      this.buffer && this.buffer.duration > 0
-        ? this.getCurrentTime() / this.buffer.duration
-        : 0;
+    const oldDur = this.buffer?.duration ?? 0;
+    const ratio = oldDur > 0 ? this.getCurrentTime() / oldDur : 0;
     const ctx = this.ensureCtx();
     const copy = new Uint8Array(bytes);
     const audioBuf = await ctx.decodeAudioData(copy.buffer);
     this.disconnectSource();
     this.buffer = audioBuf;
+    const scale = oldDur > 0 ? audioBuf.duration / oldDur : 1;
+    this.playFrom *= scale;
+    if (this.playUntil != null) this.playUntil *= scale;
     this.offset = ratio * audioBuf.duration;
     if (wasPlaying) this.startSource();
     else this.emit();

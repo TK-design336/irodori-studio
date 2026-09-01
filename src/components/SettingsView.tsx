@@ -1092,17 +1092,20 @@ export function SettingsView({
                   type="number"
                   min={1}
                   max={65535}
-                  value={draft.httpPort ?? 18790}
+                  value={draft.httpPort ?? 50021}
                   onChange={(e) =>
                     setShared(
                       "httpPort",
                       Math.min(
                         65535,
-                        Math.max(1, Math.floor(Number(e.target.value) || 18790)),
+                        Math.max(1, Math.floor(Number(e.target.value) || 50021)),
                       ),
                     )
                   }
                 />
+                <p className="hint">
+                  既定は 50021（VOICEVOX ENGINE と同じ）。ENGINE が同ポートを使用中だと 50022 などへ退避します。
+                </p>
               </label>
             </div>
             <div className="http-status-box">

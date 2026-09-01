@@ -12,6 +12,7 @@ import type { SpeakerInfo } from "../types";
 import { defaultSampling, speakerRealName } from "../types";
 import { noteSpeakerRename } from "../lib/speakerResolve";
 import { sortAndFilterSpeakers, speakerMatchesQuery } from "../lib/speakerSort";
+import { RefWavTrimEditor } from "./RefWavTrimEditor";
 
 type Props = {
   speakers: SpeakerInfo[];
@@ -946,17 +947,25 @@ export function SpeakerView({ speakers, onSpeakersChanged, isV4 }: Props) {
                   </p>
                 )}
                 {profileRefWavs.map((wav, idx) => (
-                  <div key={idx} className="ref-wav-row">
-                    <input
-                      value={wav}
-                      onChange={(e) => setRefWavAt(idx, e.target.value)}
-                      placeholder="wav / mp3 / flac など"
-                    />
-                    <button type="button" onClick={() => void pickRefWavAt(idx)}>参照</button>
-                    {profileRefWavs.length > 1 && (
-                      <button type="button" className="danger icon-btn"
-                        title="この音源を削除"
-                        onClick={() => removeRefWav(idx)}>✕</button>
+                  <div key={idx} className="ref-wav-block">
+                    <div className="ref-wav-row">
+                      <input
+                        value={wav}
+                        onChange={(e) => setRefWavAt(idx, e.target.value)}
+                        placeholder="wav / mp3 / flac など"
+                      />
+                      <button type="button" onClick={() => void pickRefWavAt(idx)}>参照</button>
+                      {profileRefWavs.length > 1 && (
+                        <button type="button" className="danger icon-btn"
+                          title="この音源を削除"
+                          onClick={() => removeRefWav(idx)}>✕</button>
+                      )}
+                    </div>
+                    {wav.trim() && (
+                      <RefWavTrimEditor
+                        wavPath={wav}
+                        onAdopt={(newPath) => setRefWavAt(idx, newPath)}
+                      />
                     )}
                   </div>
                 ))}

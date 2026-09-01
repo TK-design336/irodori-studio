@@ -12,7 +12,7 @@ Studio 起動中に、同一 PC（またはバインド先のネットワーク�
 1. **Irodori Studio を起動**する（生成エンジン OPT がロード可能な状態）。
 2. **設定 → ローカル HTTP サーバー** を開く。
    - 「HTTP サーバーを有効」がオン（既定オン）。
-   - **ベース URL** と **API トークン** を確認する。画面に `http://127.0.0.1:18790/v1/` のように表示される。
+   - **ベース URL** と **API トークン** を確認する。画面に `http://127.0.0.1:50021/v1/` のように表示される。
 3. **話者（Speaker Embedding）** が Outputs に存在すること。`/v1/speakers` で `id`（埋め込みパス）を取得する。
 4. 外部アプリやブラウザから呼ぶ場合は、必要に応じて **CORS 許可オリジン** を設定に追加する。
 
@@ -28,7 +28,7 @@ Studio 起動中に、同一 PC（またはバインド先のネットワーク�
 | 項目 | 既定 |
 |------|------|
 | バインドアドレス | `127.0.0.1` |
-| ポート | `18790`（使用中なら +1 ずつ最大 20 個試行） |
+| ポート | `50021`（使用中なら +1 ずつ最大 20 個試行。本 PC の VOICEVOX ENGINE が同ポートを使うと退避） |
 | 自動分割上限 | `httpMaxChars` = 80 文字 |
 | チャンク間無音 | アプリ設定の `chunkSilenceMs` |
 
@@ -58,7 +58,7 @@ VOICEVOX 互換ルートは **接続元 IP がループバックのときのみ*
 
 ```powershell
 $token = "<設定画面からコピーしたトークン>"
-$base = "http://127.0.0.1:18790"
+$base = "http://127.0.0.1:50021"
 
 Invoke-RestMethod -Uri "$base/v1/health" -Headers @{ Authorization = "Bearer $token" }
 ```
@@ -204,7 +204,7 @@ JSON のキーは **camelCase** です。
 {
   "ok": true,
   "name": "Irodori Studio",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "features": {
     "synthesize": true,
     "jobs": true,
@@ -399,7 +399,7 @@ Content-Type: `multipart/form-data`
 ## curl 例（参考）
 
 ```bash
-export BASE=http://127.0.0.1:18790
+export BASE=http://127.0.0.1:50021
 export TOKEN="<トークン>"
 
 curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/health" | jq .

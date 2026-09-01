@@ -1213,6 +1213,17 @@ export function TrainView({
                 }
               />
             </label>
+            <label className="train-announce-check" title="複数話者が混ざる長尺音源向け。スライス後に A/B/判別不能へクラスタします。">
+              <input
+                type="checkbox"
+                checked={sliceReviewSettings(settings).diarizeEnabled === true}
+                disabled={running}
+                onChange={(e) =>
+                  void persistSliceReview({ diarizeEnabled: e.target.checked })
+                }
+              />
+              話者分離（任意）
+            </label>
             {reviewMode === "auto" && (
               <>
                 <div className="slice-review-settings-grid">

@@ -1,6 +1,6 @@
 /** Studio HTTP API helpers (storage-backed; no DOM). */
 
-export const DEFAULT_BASE_URL = "http://127.0.0.1:18790";
+export const DEFAULT_BASE_URL = "http://127.0.0.1:50021";
 export const ALL_PAGE_ORIGINS = ["http://*/*", "https://*/*"];
 
 export function studioOrigin(baseUrl) {

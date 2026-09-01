@@ -41,12 +41,58 @@ impl Default for SamplingParams {
     }
 }
 
+/// Per-clip trim / pad / fade for concat and playback (0 = off / auto).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipEdit {
+    #[serde(default)]
+    pub trim_start_sec: f64,
+    /// 0 = through end of file.
+    #[serde(default)]
+    pub trim_end_sec: f64,
+    #[serde(default)]
+    pub pre_pad_sec: f64,
+    #[serde(default)]
+    pub post_pad_sec: f64,
+    #[serde(default)]
+    pub fade_in_sec: f64,
+    #[serde(default)]
+    pub fade_out_sec: f64,
+}
+
+impl ClipEdit {
+    pub fn is_identity(&self) -> bool {
+        self.trim_start_sec.abs() < 0.001
+            && self.trim_end_sec.abs() < 0.001
+            && self.pre_pad_sec.abs() < 0.001
+            && self.post_pad_sec.abs() < 0.001
+            && self.fade_in_sec.abs() < 0.001
+            && self.fade_out_sec.abs() < 0.001
+    }
+
+    pub fn clamped(&self) -> Self {
+        fn nz(x: f64) -> f64 {
+            if x.is_finite() { x.max(0.0) } else { 0.0 }
+        }
+        Self {
+            trim_start_sec: nz(self.trim_start_sec),
+            trim_end_sec: nz(self.trim_end_sec),
+            pre_pad_sec: nz(self.pre_pad_sec),
+            post_pad_sec: nz(self.post_pad_sec),
+            fade_in_sec: nz(self.fade_in_sec),
+            fade_out_sec: nz(self.fade_out_sec),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LineVariant {
     pub id: String,
     pub seed: i64,
     pub wav_path: String,
+    #[serde(default)]
+    pub clip_edit: Option<ClipEdit>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +141,8 @@ pub struct ProjectLine {
     /// Post-generation tone / denoise. Missing in old projects → all off.
     #[serde(default)]
     pub audio_fx: AudioFx,
+    #[serde(default)]
+    pub clip_edit: Option<ClipEdit>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
