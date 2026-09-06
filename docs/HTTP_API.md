@@ -204,7 +204,7 @@ JSON のキーは **camelCase** です。
 {
   "ok": true,
   "name": "Irodori Studio",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "features": {
     "synthesize": true,
     "jobs": true,

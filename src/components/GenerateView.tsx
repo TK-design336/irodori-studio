@@ -5830,50 +5830,45 @@ export function GenerateView({
     setStatus("一括再生中…");
     try {
       let playedAny = false;
+      let skipped = 0;
       for (const line of p.lines) {
         if (gen !== batchPlayGenRef.current) return;
         if (!line.text.trim()) continue;
-        const variants = normalizeLineVariants(line);
-        let playLine = line;
         let playWav: string | null = null;
         let playVariantId: string | null = null;
-        const primary = variants[0];
-        if (
-          primary &&
-          !isDirty(line, speakers) &&
-          wavPathMatchesLine(line, primary.wavPath)
-        ) {
+        for (const variant of normalizeLineVariants(line)) {
+          if (!variant.wavPath) continue;
           const exists = await invoke<boolean>("file_exists", {
-            path: primary.wavPath,
+            path: variant.wavPath,
           });
           if (exists) {
-            playWav = primary.wavPath;
-            playVariantId = primary.id;
+            playWav = variant.wavPath;
+            playVariantId = variant.id;
+            break;
           }
         }
         if (!playWav) {
-          const result = await synthesizeLineAudio(line, "overwrite");
-          const first = result?.newVariants[0];
-          if (!result || !first) continue;
-          playLine = result.line;
-          playWav = first.wavPath;
-          playVariantId = first.id;
+          skipped += 1;
+          continue;
         }
-        if (gen !== batchPlayGenRef.current) return;
-        await persistChain.current;
-        if (gen !== batchPlayGenRef.current) return;
         if (playedAny && silenceMs > 0) {
           await player.waitSilenceMs(silenceMs);
           if (gen !== batchPlayGenRef.current) return;
         }
-        await startPlayback(playLine, playWav, playVariantId);
+        await startPlayback(line, playWav, playVariantId);
         if (gen !== batchPlayGenRef.current) return;
         await player.waitUntilInactive();
         if (gen !== batchPlayGenRef.current) return;
         playedAny = true;
       }
       if (gen === batchPlayGenRef.current) {
-        setStatus("一括再生完了");
+        if (!playedAny) {
+          setStatus("再生できる音声がありません（未生成の行はスキップ）");
+        } else if (skipped > 0) {
+          setStatus(`一括再生完了（未生成 ${skipped} 行をスキップ）`);
+        } else {
+          setStatus("一括再生完了");
+        }
       }
     } finally {
       if (gen === batchPlayGenRef.current) {
@@ -6373,7 +6368,7 @@ export function GenerateView({
               type="button"
               disabled={busy || asrBusy || project.lines.length === 0}
               onClick={() => void playBatch()}
-              title="全行を順に再生"
+              title="全行の既存音声を順に再生（未生成はスキップ。再生成しません）"
             >
               再生
             </button>
