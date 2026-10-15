@@ -1,5 +1,28 @@
 use serde::{Deserialize, Serialize};
 
+/// Which offline recognizer to load. Live dictation and audio import share this.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AsrModel {
+    Reazonspeech,
+    Parakeet,
+}
+
+impl Default for AsrModel {
+    fn default() -> Self {
+        Self::Reazonspeech
+    }
+}
+
+impl AsrModel {
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "parakeet" => Self::Parakeet,
+            _ => Self::Reazonspeech,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AsrPrecision {
@@ -21,6 +44,7 @@ pub struct NativeAsrConfig {
     pub input_device_host: Option<String>,
     pub input_device_name: Option<String>,
     pub asr_precision: AsrPrecision,
+    pub asr_model: AsrModel,
     pub asr_num_threads: i32,
     pub model_dir: Option<String>,
     pub vad_threshold: f32,
@@ -41,6 +65,7 @@ impl Default for NativeAsrConfig {
             input_device_host: None,
             input_device_name: None,
             asr_precision: AsrPrecision::Int8Float32,
+            asr_model: AsrModel::Reazonspeech,
             asr_num_threads: 4,
             model_dir: None,
             vad_threshold: 0.5,

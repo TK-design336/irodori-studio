@@ -1,5 +1,7 @@
+import { invoke } from "@tauri-apps/api/core";
 import { LiveMicAsrSession, type LiveMicAsrCallbacks } from "./liveMicAsr";
 import { loadLivePrefs } from "./liveStorage";
+import { asrModelOf, type AppSettings } from "../types";
 
 export type LineDictationHandle = {
   token: number;
@@ -34,8 +36,13 @@ export async function startLineDictation(
   onStolen = stolen ?? null;
 
   const prefs = loadLivePrefs();
+  const settings = await invoke<AppSettings>("get_settings");
   try {
-    await next.start(prefs.asrEngine, prefs.micInputDeviceId);
+    await next.start(
+      prefs.asrEngine,
+      prefs.micInputDeviceId,
+      asrModelOf(settings),
+    );
     if (session !== next) {
       return { token: 0 };
     }

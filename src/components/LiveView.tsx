@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { AppSettings, SpeakerInfo } from "../types";
-import { defaultSampling, isIrodoriV4, newLineId, speakerOptionLabel } from "../types";
+import type { AppSettings, AsrModel, SpeakerInfo } from "../types";
+import { asrModelOf, defaultSampling, isIrodoriV4, isMeanflowSettings, newLineId, speakerOptionLabel } from "../types";
 import { SpeakerSelect } from "./SpeakerSelect";
 import { LineAudioPlayer } from "../lib/audioPlayer";
 import {
@@ -37,6 +37,7 @@ import { LiveMicAsrSession, listNativeMicInputDevices, preloadLiveNativeAsr } fr
 type Props = {
   speakers: SpeakerInfo[];
   settings: AppSettings;
+  onSettingsChange: (settings: AppSettings) => void;
 };
 
 const STATUS_LABEL: Record<LiveItemStatus, string> = {
@@ -86,6 +87,7 @@ function ParamSlider({
   onChange,
   onReset,
   altered,
+  disabled,
 }: {
   label: string;
   hint?: string;
@@ -96,6 +98,7 @@ function ParamSlider({
   onChange: (v: number) => void;
   onReset: () => void;
   altered?: boolean;
+  disabled?: boolean;
 }) {
   return (
     <label className={`param-field${altered ? " is-speed-altered" : ""}`}>
@@ -108,6 +111,7 @@ function ParamSlider({
           max={max}
           step={step}
           value={value}
+          disabled={disabled}
           onChange={(e) => onChange(Number(e.target.value))}
         />
         <input
@@ -116,9 +120,10 @@ function ParamSlider({
           max={max}
           step={step}
           value={value}
+          disabled={disabled}
           onChange={(e) => onChange(Number(e.target.value))}
         />
-        <button type="button" className="icon-btn" title="リセット" onClick={onReset}>
+        <button type="button" className="icon-btn" title="リセット" disabled={disabled} onClick={onReset}>
           ↺
         </button>
       </div>
@@ -126,7 +131,7 @@ function ParamSlider({
   );
 }
 
-export function LiveView({ speakers, settings }: Props) {
+export function LiveView({ speakers, settings, onSettingsChange }: Props) {
   const [prefs, setPrefs] = useState<LivePrefs>(() => loadLivePrefs());
   const [history, setHistory] = useState<LiveHistoryItem[]>(() => loadLiveHistory());
   const [input, setInput] = useState("");
@@ -167,6 +172,7 @@ export function LiveView({ speakers, settings }: Props) {
   const speakersRef = useRef(speakers);
   const settingsRef = useRef(settings);
   const prefsRef = useRef(prefs);
+  const meanflowRef = useRef(false);
   const historyListRef = useRef<HTMLUListElement | null>(null);
   const playerRef = useRef<LineAudioPlayer | null>(null);
 
@@ -297,8 +303,8 @@ export function LiveView({ speakers, settings }: Props) {
   }, []);
 
   useEffect(() => {
-    void preloadLiveNativeAsr();
-  }, []);
+    void preloadLiveNativeAsr(asrModelOf(settings));
+  }, [settings.asrModel]);
 
   useEffect(() => {
     void refreshMicInputs();
@@ -337,7 +343,12 @@ export function LiveView({ speakers, settings }: Props) {
     });
   }, []);
 
-  const sampling = useMemo(() => buildLiveSampling(prefs), [prefs]);
+  const meanflow = isMeanflowSettings(settings);
+  meanflowRef.current = meanflow;
+  const sampling = useMemo(
+    () => buildLiveSampling(prefs, meanflow),
+    [prefs, meanflow],
+  );
 
   const notifySeg = useCallback(() => {
     const waiters = segWaitersRef.current.splice(0);
@@ -703,7 +714,7 @@ export function LiveView({ speakers, settings }: Props) {
         text,
         speakerEmbedPath: prefsRef.current.speakerEmbedPath,
         caption: prefsRef.current.caption,
-        sampling: buildLiveSampling(prefsRef.current),
+        sampling: buildLiveSampling(prefsRef.current, meanflowRef.current),
       });
     },
     [],
@@ -726,6 +737,7 @@ export function LiveView({ speakers, settings }: Props) {
       await session.start(
         prefsRef.current.asrEngine,
         prefsRef.current.micInputDeviceId,
+        asrModelOf(settings),
       );
     } catch (error) {
       micSessionRef.current = null;
@@ -734,7 +746,7 @@ export function LiveView({ speakers, settings }: Props) {
       setStatus(`マイク開始失敗: ${msg}`);
       setMicStatus(msg);
     }
-  }, [handleMicPhrase]);
+  }, [handleMicPhrase, settings]);
 
   const enqueueFromInput = useCallback(() => {
     const ok = enqueueItem({
@@ -826,7 +838,7 @@ export function LiveView({ speakers, settings }: Props) {
   }, [prefs.asrEngine]);
 
   const showCaption = isIrodoriV4(settings);
-  const defaults = defaultSampling();
+  const defaults = defaultSampling(meanflow);
   const queueCount = history.filter(
     (item) =>
       item.status === "queued" ||
@@ -912,9 +924,9 @@ export function LiveView({ speakers, settings }: Props) {
                       }))
                     }
                   >
-                    <option value="fast">高速（25）</option>
-                    <option value="standard">標準（40）</option>
-                    <option value="quality">高品質（50）</option>
+                    <option value="fast">{meanflow ? "高速（4）" : "高速（25）"}</option>
+                    <option value="standard">{meanflow ? "標準（4）" : "標準（40）"}</option>
+                    <option value="quality">{meanflow ? "高品質（4）" : "高品質（50）"}</option>
                   </select>
                 </label>
                 <ParamSlider
@@ -929,11 +941,15 @@ export function LiveView({ speakers, settings }: Props) {
                   }
                   altered={Math.abs(prefs.durationScale - defaults.durationScale) > 0.001}
                 />
+                {meanflow ? (
+                  <p className="hint">このモデルではステップ数以外の強さは変わりません</p>
+                ) : null}
                 <ParamSlider
                   label="話者強度"
                   min={0}
                   max={10}
                   step={0.1}
+                  disabled={meanflow}
                   value={prefs.cfgScaleSpeaker}
                   onChange={(cfgScaleSpeaker) =>
                     setPrefs((p) => ({ ...p, cfgScaleSpeaker }))
@@ -1034,8 +1050,34 @@ export function LiveView({ speakers, settings }: Props) {
                   </span>
                 </label>
                 {prefs.asrEngine === "native" ? (
-                  <label className="param-field">
-                    <span className="param-label">マイク入力</span>
+                  <>
+                    <label className="param-field">
+                      <span className="param-label">認識モデル</span>
+                      <select
+                        value={asrModelOf(settings)}
+                        disabled={micListening}
+                        onChange={(e) => {
+                          const next: AsrModel =
+                            e.target.value === "parakeet" ? "parakeet" : "reazonspeech";
+                          if (next === asrModelOf(settings)) return;
+                          void invoke<AppSettings>("set_settings", {
+                            settings: { ...settings, asrModel: next },
+                          })
+                            .then(onSettingsChange)
+                            .catch((error) => {
+                              setStatus(`認識モデルを保存できません: ${String(error)}`);
+                            });
+                        }}
+                      >
+                        <option value="reazonspeech">ReazonSpeech</option>
+                        <option value="parakeet">Parakeet</option>
+                      </select>
+                      <span className="param-hint">
+                        音声からのテキスト追加でも同じモデルを使います
+                      </span>
+                    </label>
+                    <label className="param-field">
+                      <span className="param-label">マイク入力</span>
                     <select
                       value={prefs.micInputDeviceId}
                       disabled={micListening}
@@ -1050,6 +1092,7 @@ export function LiveView({ speakers, settings }: Props) {
                       ))}
                     </select>
                   </label>
+                  </>
                 ) : null}
                 <label className="param-field live-mic-auto-enqueue">
                   <span className="param-label">エコー対策</span>

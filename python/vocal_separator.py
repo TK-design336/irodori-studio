@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -285,17 +286,134 @@ def separate_vocals(
     return resolved
 
 
+def replace_with_vocals(
+    inputs: list[str | Path],
+    *,
+    model_name: str | None = None,
+    model_file_dir: str | Path,
+) -> list[Path]:
+    """Overwrite each file with its Vocals stem.
+
+    Short clips use the same silence-pad / trim path as sliced training audio.
+    """
+    paths = [Path(p) for p in inputs]
+    if not paths:
+        raise ValueError("no input files")
+    for src in paths:
+        if not src.is_file():
+            raise FileNotFoundError(f"input not found: {src}")
+
+    model = (model_name or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    tmp_root = Path(tempfile.mkdtemp(prefix="irodori_sep_replace_"))
+    try:
+        separator = make_separator(output_dir=tmp_root, model_file_dir=model_file_dir)
+        print(f"Loading model {model}…", flush=True)
+        separator.load_model(model)
+        print("Model loaded", flush=True)
+        replaced: list[Path] = []
+        for src in paths:
+            print(f"Separating {src.name}", flush=True)
+            outs = separate_vocals(
+                src,
+                tmp_root,
+                model_name=model,
+                separator=separator,
+            )
+            primary = next((p for p in outs if p.is_file()), None)
+            if primary is None:
+                raise RuntimeError(f"no vocals output for {src.name}")
+            tmp_out = src.with_name(src.name + ".vocals.tmp")
+            try:
+                shutil.copyfile(primary, tmp_out)
+                os.replace(tmp_out, src)
+            finally:
+                if tmp_out.is_file():
+                    try:
+                        tmp_out.unlink()
+                    except OSError:
+                        pass
+            replaced.append(src.resolve())
+            for extra in outs:
+                if extra.is_file():
+                    try:
+                        extra.unlink()
+                    except OSError:
+                        pass
+            print(f"  -> replaced {src.name}", flush=True)
+        return replaced
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
 def list_models_json() -> str:
     return json.dumps(list_vocal_models(), ensure_ascii=False)
 
 
 if __name__ == "__main__":
-    # CLI: list models as JSON for Tauri
-    if len(sys.argv) > 1 and sys.argv[1] in ("--list-models", "list-models"):
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Vocal stem separation")
+    parser.add_argument("--list-models", action="store_true")
+    parser.add_argument("--input", default="")
+    parser.add_argument("--output-dir", default="")
+    parser.add_argument("--model-name", default=DEFAULT_MODEL)
+    parser.add_argument("--model-file-dir", default="")
+    parser.add_argument(
+        "--replace",
+        nargs="+",
+        default=None,
+        metavar="FILE",
+        help="Overwrite each FILE with Vocals (short clips are silence-padded)",
+    )
+    args = parser.parse_args()
+
+    if args.list_models:
         print(list_models_json())
         raise SystemExit(0)
-    print(
-        "Usage: vocal_separator.py --list-models",
-        file=sys.stderr,
+
+    if args.replace:
+        if not args.model_file_dir.strip():
+            print("ERROR: --model-file-dir is required", file=sys.stderr)
+            raise SystemExit(2)
+        ensure_bundled_ffmpeg_on_path()
+        replaced = replace_with_vocals(
+            args.replace,
+            model_name=args.model_name or DEFAULT_MODEL,
+            model_file_dir=args.model_file_dir,
+        )
+        print(
+            json.dumps(
+                {"replaced": [str(p) for p in replaced]},
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        raise SystemExit(0)
+
+    if not args.input.strip() or not args.output_dir.strip() or not args.model_file_dir.strip():
+        print(
+            "Usage: vocal_separator.py --list-models\n"
+            "       vocal_separator.py --input FILE --output-dir DIR "
+            "--model-file-dir DIR [--model-name NAME]",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    ensure_bundled_ffmpeg_on_path()
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    files = separate_vocals(
+        input_path=args.input,
+        output_dir=out_dir,
+        model_name=args.model_name or DEFAULT_MODEL,
+        model_file_dir=args.model_file_dir,
     )
-    raise SystemExit(2)
+    vocals = next((p for p in files if p.is_file()), None)
+    if vocals is None:
+        print("ERROR: no vocals output", file=sys.stderr)
+        raise SystemExit(1)
+    print(
+        json.dumps({"vocalsPath": str(vocals.resolve())}, ensure_ascii=False),
+        flush=True,
+    )
+    raise SystemExit(0)

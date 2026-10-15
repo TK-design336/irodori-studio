@@ -52,15 +52,19 @@ export type LivePrefs = {
   micInputDeviceId: string;
 };
 
-export function liveSamplingForPreset(preset: LiveQualityPreset): SamplingParams {
-  const base = defaultSampling();
+export function liveSamplingForPreset(
+  preset: LiveQualityPreset,
+  meanflow = false,
+): SamplingParams {
+  const base = defaultSampling(meanflow);
+  if (meanflow) return base;
   if (preset === "fast") return { ...base, numSteps: 25 };
   if (preset === "quality") return { ...base, numSteps: 50 };
   return base;
 }
 
-export function buildLiveSampling(prefs: LivePrefs): SamplingParams {
-  const base = liveSamplingForPreset(prefs.qualityPreset);
+export function buildLiveSampling(prefs: LivePrefs, meanflow = false): SamplingParams {
+  const base = liveSamplingForPreset(prefs.qualityPreset, meanflow);
   return {
     ...base,
     durationScale: prefs.durationScale,

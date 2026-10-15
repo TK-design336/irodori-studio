@@ -1,10 +1,13 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
-use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig};
+use sherpa_onnx::{
+    OfflineNemoEncDecCtcModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
+    OfflineTransducerModelConfig,
+};
 
 use crate::native_asr::audio::ASR_SAMPLE_RATE;
-use crate::native_asr::config::AsrPrecision;
+use crate::native_asr::config::{AsrModel, AsrPrecision};
 
 pub trait AsrEngine: Send {
     fn transcribe(&mut self, samples: &[f32]) -> Result<String>;
@@ -101,21 +104,67 @@ impl SherpaOnnxTransducerModelFiles {
     }
 }
 
-impl SherpaOnnxAsrEngine {
-    pub fn new(model_dir: &Path, precision: AsrPrecision, num_threads: i32) -> Result<Self> {
-        let files = SherpaOnnxTransducerModelFiles::from_dir(model_dir, precision)?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SherpaOnnxParakeetModelFiles {
+    pub model: PathBuf,
+    pub tokens: PathBuf,
+}
 
-        let mut config = OfflineRecognizerConfig::default();
-        config.model_config.transducer = OfflineTransducerModelConfig {
-            encoder: Some(files.encoder.display().to_string()),
-            decoder: Some(files.decoder.display().to_string()),
-            joiner: Some(files.joiner.display().to_string()),
+impl SherpaOnnxParakeetModelFiles {
+    pub fn from_dir(model_dir: &Path) -> Result<Self> {
+        let files = Self {
+            model: model_dir.join("model.int8.onnx"),
+            tokens: model_dir.join("tokens.txt"),
         };
-        config.model_config.tokens = Some(files.tokens.display().to_string());
+        files.validate()?;
+        Ok(files)
+    }
+
+    pub fn required_file_names() -> &'static [&'static str] {
+        &["model.int8.onnx", "tokens.txt"]
+    }
+
+    fn validate(&self) -> Result<()> {
+        for path in [&self.model, &self.tokens] {
+            if !path.is_file() {
+                return Err(anyhow!("ASR model file not found: {}", path.display()));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl SherpaOnnxAsrEngine {
+    pub fn new(
+        model_dir: &Path,
+        model: AsrModel,
+        precision: AsrPrecision,
+        num_threads: i32,
+    ) -> Result<Self> {
+        let mut config = OfflineRecognizerConfig::default();
         config.model_config.provider = Some("cpu".to_string());
-        config.model_config.modeling_unit = Some("cjkchar".to_string());
         config.model_config.num_threads = num_threads;
         config.decoding_method = Some("greedy_search".to_string());
+
+        match model {
+            AsrModel::Reazonspeech => {
+                let files = SherpaOnnxTransducerModelFiles::from_dir(model_dir, precision)?;
+                config.model_config.transducer = OfflineTransducerModelConfig {
+                    encoder: Some(files.encoder.display().to_string()),
+                    decoder: Some(files.decoder.display().to_string()),
+                    joiner: Some(files.joiner.display().to_string()),
+                };
+                config.model_config.tokens = Some(files.tokens.display().to_string());
+                config.model_config.modeling_unit = Some("cjkchar".to_string());
+            }
+            AsrModel::Parakeet => {
+                let files = SherpaOnnxParakeetModelFiles::from_dir(model_dir)?;
+                config.model_config.nemo_ctc = OfflineNemoEncDecCtcModelConfig {
+                    model: Some(files.model.display().to_string()),
+                };
+                config.model_config.tokens = Some(files.tokens.display().to_string());
+            }
+        }
 
         let recognizer = OfflineRecognizer::create(&config)
             .ok_or_else(|| anyhow!("Failed to create sherpa-onnx recognizer"))?;

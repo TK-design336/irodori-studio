@@ -6,18 +6,23 @@ import { highpassHz } from "../lib/audioFx";
 type Patch = {
   volume?: number;
   speed?: number;
+  pitch?: number;
   audioFx?: AudioFx;
 };
 
 type Props = {
   volume: number;
   speed: number;
+  pitch: number;
   audioFx?: AudioFx | null;
   onChange: (patch: Patch) => void;
   collapsed?: boolean;
   onToggle?: () => void;
   onApplyAll?: () => void;
   onApplySameSpeaker?: () => void;
+  onSeparateVocals?: () => void;
+  canSeparateVocals?: boolean;
+  separatingVocals?: boolean;
   disabled?: boolean;
 };
 
@@ -78,15 +83,32 @@ function SliderField({
   );
 }
 
+function formatPitch(semitones: number): string {
+  const n = Math.round((Number.isFinite(semitones) ? semitones : 0) * 10) / 10;
+  if (Math.abs(n) < 0.05) return "0.0";
+  const sign = n > 0 ? "+" : "";
+  return `${sign}${n.toFixed(1)}`;
+}
+
+function clampPitch(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  const clamped = Math.min(12, Math.max(-12, value));
+  return Math.round(clamped * 10) / 10;
+}
+
 export function AudioAdjustmentPanel({
   volume,
   speed,
+  pitch,
   audioFx,
   onChange,
   collapsed,
   onToggle,
   onApplyAll,
   onApplySameSpeaker,
+  onSeparateVocals,
+  canSeparateVocals,
+  separatingVocals,
   disabled,
 }: Props) {
   const [fxOpen, setFxOpen] = useState(false);
@@ -129,6 +151,17 @@ export function AudioAdjustmentPanel({
             disabled={disabled}
             onChange={(v) => onChange({ speed: v })}
             onReset={() => onChange({ speed: 1 })}
+          />
+          <SliderField
+            label={`ピッチ (${formatPitch(pitch)} 半音)`}
+            hint="声の高さを変える。長さはそのまま"
+            min={-12}
+            max={12}
+            step={0.1}
+            value={pitch}
+            disabled={disabled}
+            onChange={(v) => onChange({ pitch: clampPitch(v) })}
+            onReset={() => onChange({ pitch: 0 })}
           />
           <div className={`audio-fx-section${fxOpen ? " open" : ""}`}>
             <button
@@ -234,6 +267,18 @@ export function AudioAdjustmentPanel({
                 </p>
               </div>
             )}
+          </div>
+          <div className="audio-special">
+            <button
+              type="button"
+              disabled={disabled || separatingVocals || !canSeparateVocals}
+              onClick={onSeparateVocals}
+            >
+              {separatingVocals ? "ボーカル分離中…" : "ボーカル分離"}
+            </button>
+            <p className="hint">
+              【一度きりの処理】 保持音声からボーカルのみを抽出します。
+            </p>
           </div>
           <div className="apply-actions">
             <button type="button" disabled={disabled} onClick={onApplyAll}>

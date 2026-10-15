@@ -9,6 +9,8 @@ type Props = {
   onToggle?: () => void;
   onApplyAll?: () => void;
   onApplySameSpeaker?: () => void;
+  /** v4.1 MF: text/speaker strength, Sway, and schedule do not change the result. */
+  fixedStrength?: boolean;
 };
 
 function SliderField({
@@ -19,6 +21,7 @@ function SliderField({
   value,
   onChange,
   disabled,
+  meanflow,
 }: {
   label: string;
   min: number;
@@ -27,6 +30,7 @@ function SliderField({
   value: number;
   onChange: (v: number) => void;
   disabled?: boolean;
+  meanflow?: boolean;
 }) {
   return (
     <label className="param-field">
@@ -57,7 +61,7 @@ function SliderField({
           disabled={disabled}
           onClick={(e) => {
             e.preventDefault();
-            const d = defaultSampling();
+            const d = defaultSampling(meanflow);
             const map: Record<string, number> = {
               ステップ数: d.numSteps,
               生成数: d.numCandidates,
@@ -83,8 +87,9 @@ export function SamplingPanel({
   onToggle,
   onApplyAll,
   onApplySameSpeaker,
+  fixedStrength = false,
 }: Props) {
-  const swayDisabled = value.tScheduleMode !== "sway";
+  const swayDisabled = fixedStrength || value.tScheduleMode !== "sway";
 
   return (
     <section
@@ -97,12 +102,16 @@ export function SamplingPanel({
       {!collapsed && (
         <div className="panel-body">
           <div className="param-grid">
+            {fixedStrength ? (
+              <p className="hint">このモデルではステップ数以外の強さは変わりません</p>
+            ) : null}
             <SliderField
               label="ステップ数"
               min={1}
               max={120}
               step={1}
               value={value.numSteps}
+              meanflow={fixedStrength}
               onChange={(numSteps) => onChange({ ...value, numSteps })}
             />
             <SliderField
@@ -188,6 +197,7 @@ export function SamplingPanel({
                   { value: "linear", label: "線形" },
                   { value: "sway", label: "Sway" },
                 ]}
+                disabled={fixedStrength}
                 onChange={(tScheduleMode) =>
                   onChange({ ...value, tScheduleMode })
                 }
@@ -201,6 +211,7 @@ export function SamplingPanel({
               step={0.01}
               value={value.swayCoeff}
               disabled={swayDisabled}
+              meanflow={fixedStrength}
               onChange={(swayCoeff) => onChange({ ...value, swayCoeff })}
             />
             <label className="param-field">
@@ -212,6 +223,7 @@ export function SamplingPanel({
                   { value: "joint", label: "一括" },
                   { value: "alternating", label: "交互" },
                 ]}
+                disabled={fixedStrength}
                 onChange={(cfgGuidanceMode) =>
                   onChange({ ...value, cfgGuidanceMode })
                 }
@@ -224,6 +236,8 @@ export function SamplingPanel({
               max={10}
               step={0.1}
               value={value.cfgScaleText}
+              disabled={fixedStrength}
+              meanflow={fixedStrength}
               onChange={(cfgScaleText) => onChange({ ...value, cfgScaleText })}
             />
             <SliderField
@@ -232,6 +246,8 @@ export function SamplingPanel({
               max={10}
               step={0.1}
               value={value.cfgScaleSpeaker}
+              disabled={fixedStrength}
+              meanflow={fixedStrength}
               onChange={(cfgScaleSpeaker) =>
                 onChange({ ...value, cfgScaleSpeaker })
               }

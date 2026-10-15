@@ -52,6 +52,25 @@ pub fn append_japanese_asr_segment(draft: &mut String, segment_joinable: &str) {
     draft.push_str(seg);
 }
 
+/// Same-line join for file import: insert `、` between VAD-chopped phrases.
+pub fn append_japanese_asr_segment_with_comma(draft: &mut String, segment_joinable: &str) {
+    let seg = trim_japanese_sentence_end_for_join(segment_joinable.trim());
+    if seg.is_empty() {
+        return;
+    }
+    if draft.is_empty() {
+        draft.push_str(seg);
+        return;
+    }
+    let base = trim_japanese_sentence_end_for_join(draft.trim_end()).to_string();
+    draft.clear();
+    draft.push_str(&base);
+    if !base.is_empty() && !base.ends_with('、') {
+        draft.push('、');
+    }
+    draft.push_str(seg);
+}
+
 fn trim_continuation_marker(text: &str) -> &str {
     text.trim_end_matches("...")
 }

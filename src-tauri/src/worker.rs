@@ -11,6 +11,8 @@ pub struct OptWorkerSimple {
     stdin: Option<ChildStdin>,
     lines_rx: Option<std::sync::mpsc::Receiver<String>>,
     loaded: bool,
+    meanflow: bool,
+    default_num_steps: u32,
 }
 
 impl Default for OptWorkerSimple {
@@ -20,6 +22,8 @@ impl Default for OptWorkerSimple {
             stdin: None,
             lines_rx: None,
             loaded: false,
+            meanflow: false,
+            default_num_steps: 40,
         }
     }
 }
@@ -33,6 +37,35 @@ impl OptWorkerSimple {
         self.loaded
     }
 
+    pub fn is_meanflow(&self) -> bool {
+        self.meanflow
+    }
+
+    pub fn default_num_steps(&self) -> u32 {
+        if self.default_num_steps == 0 {
+            if self.meanflow { 4 } else { 40 }
+        } else {
+            self.default_num_steps
+        }
+    }
+
+    fn remember_load(&mut self, resp: &Value) {
+        self.loaded = true;
+        self.meanflow = resp.get("meanflow").and_then(|v| v.as_bool()).unwrap_or(false);
+        self.default_num_steps = resp
+            .get("default_num_steps")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32)
+            .filter(|n| *n > 0)
+            .unwrap_or(if self.meanflow { 4 } else { 40 });
+    }
+
+    fn clear_loaded(&mut self) {
+        self.loaded = false;
+        self.meanflow = false;
+        self.default_num_steps = 40;
+    }
+
     pub fn reap_if_dead(&mut self) {
         let dead = self
             .child
@@ -43,7 +76,7 @@ impl OptWorkerSimple {
             self.child = None;
             self.stdin = None;
             self.lines_rx = None;
-            self.loaded = false;
+            self.clear_loaded();
         }
     }
 
@@ -187,7 +220,26 @@ impl OptWorkerSimple {
         }
         self.read_response(timeout)
     }
+}
 
+pub fn load_failure_message(resp: &Value) -> String {
+    let err = resp
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if err == "このチェックポイントには、いまの Irodori では対応していません"
+        || err.to_ascii_lowercase().contains("meanflow")
+    {
+        "このチェックポイントには、いまの Irodori では対応していません".into()
+    } else if err.is_empty() {
+        format!("load failed: {resp}")
+    } else {
+        err.to_string()
+    }
+}
+
+impl OptWorkerSimple {
     pub fn load(&mut self, settings: &AppSettings) -> Result<Value, String> {
         let resp = self.request(
             json!({
@@ -201,9 +253,22 @@ impl OptWorkerSimple {
             Duration::from_secs(900),
         )?;
         if resp.get("ok").and_then(|v| v.as_bool()) == Some(true) {
-            self.loaded = true;
+            self.remember_load(&resp);
         }
         Ok(resp)
+    }
+
+    /// Encode reference WAVs to latent files. `false` means this Irodori has no encode API.
+    pub fn encode_refs(&mut self, wavs: &[String], outs: &[String]) -> Result<bool, String> {
+        let resp = self.request(
+            json!({
+                "cmd": "encode_refs",
+                "wavs": wavs,
+                "outs": outs,
+            }),
+            Duration::from_secs(180),
+        )?;
+        Ok(resp.get("ok").and_then(|v| v.as_bool()) == Some(true))
     }
 
     pub fn synthesize(&mut self, mut payload: Value) -> Result<Value, String> {
@@ -238,7 +303,7 @@ impl OptWorkerSimple {
 
     pub fn unload(&mut self) -> Result<Value, String> {
         let resp = self.request(json!({"cmd": "unload"}), Duration::from_secs(180))?;
-        self.loaded = false;
+        self.clear_loaded();
         Ok(resp)
     }
 
@@ -252,7 +317,7 @@ impl OptWorkerSimple {
         }
         self.stdin = None;
         self.lines_rx = None;
-        self.loaded = false;
+        self.clear_loaded();
         Ok(())
     }
 }

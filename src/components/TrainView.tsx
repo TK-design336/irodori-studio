@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { BoundedSelect } from "./BoundedSelect";
+import { ManualCutView } from "./ManualCutView";
 import { SliceReviewView } from "./SliceReviewView";
 import type {
   AppSettings,
@@ -15,6 +16,7 @@ import {
   defaultSampling,
   DEFAULT_VOCAL_SEPARATOR_MODEL,
   isIrodoriV4,
+  isMeanflowSettings,
   sliceAutoFixSettings,
   sliceReviewSettings,
 } from "../types";
@@ -463,6 +465,8 @@ export function TrainView({
     sliceReviewSettings(settings).mode,
   );
   const [reviewJobDir, setReviewJobDir] = useState<string | null>(null);
+  const [embedCollapsed, setEmbedCollapsed] = useState(false);
+  const [manualCollapsed, setManualCollapsed] = useState(false);
   const [reviewReadOnly, setReviewReadOnly] = useState(false);
   const logRef = useRef<HTMLPreElement>(null);
   const layoutRef = useRef<HTMLDivElement>(null);
@@ -729,7 +733,7 @@ export function TrainView({
           projectName: "_train_notify",
           lineId: "done",
         });
-        const s = defaultSampling();
+        const s = defaultSampling(isMeanflowSettings(settings));
         await invoke("synthesize_line", {
           args: {
             text: DONE_ANNOUNCE_TEXT,
@@ -981,6 +985,7 @@ export function TrainView({
 
   return (
     <div className="train-layout" ref={layoutRef}>
+      {/* スライスレビューはレビュー待ちのジョブがあるときだけ表示する */}
       {reviewJobDir ? (
         <SliceReviewView
           jobDir={reviewJobDir}
@@ -1016,10 +1021,18 @@ export function TrainView({
           }}
         />
       ) : null}
-      <section className="panel">
-        <header className="panel-header">
+
+      <section
+        className={`panel train-embed-panel${embedCollapsed ? " collapsed" : ""}`}
+      >
+        <header
+          className="panel-header"
+          onClick={() => setEmbedCollapsed((v) => !v)}
+        >
           <h3>Speaker Embedding 学習</h3>
+          <span className="chevron">{embedCollapsed ? "▸" : "▾"}</span>
         </header>
+        {!embedCollapsed && (
         <div className="panel-body form-stack">
           <p className="hint">
             使用エンジン: <strong>{engineLabel}</strong>
@@ -1213,17 +1226,6 @@ export function TrainView({
                 }
               />
             </label>
-            <label className="train-announce-check" title="複数話者が混ざる長尺音源向け。スライス後に A/B/判別不能へクラスタします。">
-              <input
-                type="checkbox"
-                checked={sliceReviewSettings(settings).diarizeEnabled === true}
-                disabled={running}
-                onChange={(e) =>
-                  void persistSliceReview({ diarizeEnabled: e.target.checked })
-                }
-              />
-              話者分離（任意）
-            </label>
             {reviewMode === "auto" && (
               <>
                 <div className="slice-review-settings-grid">
@@ -1355,7 +1357,7 @@ export function TrainView({
             {vocalSeparate
               ? inputMode === "raw"
                 ? " ボーカル分離はスライスより前に実行し、Vocals のみの WAV を後段に渡します（to_wav は省略）。"
-                : " ボーカル分離を各クリップに適用してから学習します。4秒未満は無音パディングして分離し、元の長さに戻します。"
+                : " ボーカル分離を各クリップに適用してから学習します。"
               : ""}
             音源速度が 1.00 以外のときは、スライス後に各クリップへピッチ維持の速度調整をかけてから学習します（元フォルダは書き換えません）。
             {sliceReviewSettings(settings).autoFix?.enabled !== false
@@ -1368,6 +1370,27 @@ export function TrainView({
             {logs.join("\n") || "ログはここに表示されます"}
           </pre>
         </div>
+        )}
+      </section>
+
+      <section
+        className={`panel train-manual-panel${manualCollapsed ? " collapsed" : ""}`}
+      >
+        <header
+          className="panel-header"
+          onClick={() => setManualCollapsed((v) => !v)}
+        >
+          <h3>手動音声切り出し</h3>
+          <span className="chevron">{manualCollapsed ? "▸" : "▾"}</span>
+        </header>
+        {!manualCollapsed && (
+          <div className="panel-body form-stack">
+            <p className="hint">
+              外部の音声・動画から話者ごとに区間を切り出し、フォルダへ WAV を書き出します（学習パイプラインとは独立）。
+            </p>
+            <ManualCutView settings={settings} />
+          </div>
+        )}
       </section>
 
       {confirmOpen && (

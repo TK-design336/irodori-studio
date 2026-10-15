@@ -27,6 +27,7 @@ import {
   speakerOptionLabel,
   activePaths,
   isIrodoriV4,
+  isMeanflowSettings,
   lineCfgScaleCaption,
   DEFAULT_CFG_SCALE_CAPTION,
   asrCerWarnThreshold,
@@ -42,6 +43,7 @@ import {
   MAX_LINE_VARIANTS,
   multiGenerateModeOf,
   audioFxOf,
+  linePitch,
   clipEditOf,
   clipEditIsIdentity,
   type LineVariant,
@@ -58,7 +60,13 @@ import { SamplingPanel } from "./SamplingPanel";
 import { AudioAdjustmentPanel } from "./AudioAdjustmentPanel";
 import { CaptionPanel } from "./CaptionPanel";
 import { BulkAddDialog } from "./BulkAddDialog";
-import { isSupportedDocFile, filesFromDataTransfer, acceptFileDrag } from "../lib/docImport/index";
+import {
+  isSupportedAudioName,
+  isSupportedDocName,
+  IMPORT_HINT,
+  IMPORT_DIALOG_FILTERS,
+} from "../lib/docImport/index";
+import { useTauriFileDrop } from "../lib/tauriFileDrop";
 import { AnnotationReviewDialog, type NumericConvertModes } from "./AnnotationReviewDialog";
 import { AnnotationOverlay } from "./AnnotationOverlay";
 import { BoundedSelect } from "./BoundedSelect";
@@ -82,6 +90,7 @@ import { IconMic, IconSave, IconTrash, IconTrimEnd, IconTrimStart } from "./icon
 import { startLineDictation, stopLineDictation } from "../lib/lineDictation";
 import { LineAudioPlayer, type PlaybackSnapshot } from "../lib/audioPlayer";
 import type { ImportedLine } from "../lib/scriptImport";
+import { buildSpeakerDialogueScript } from "../lib/scriptExport";
 import {
   applyAutoReplacements,
   previewReplacements,
@@ -634,6 +643,7 @@ function parentDir(path: string): string {
 type BatchSaveMode = "individual" | "concat";
 type BatchSubtitleMode = "none" | "srt" | "vtt";
 type BatchLabelMode = "none" | "audacity" | "reaper";
+type BatchScriptMode = "none" | "txt";
 
 type AsrLineResult = {
   cer: number;
@@ -1133,7 +1143,8 @@ function AutoTextarea({
     // Drop min-height during measure so CSS floor doesn't inflate scrollHeight
     const prevMin = el.style.minHeight;
     el.style.minHeight = "0px";
-    el.style.height = "0px";
+    // 1px (not 0): Chromium/WebView2 skips soft wraps in scrollHeight when height is 0
+    el.style.height = "1px";
     // scrollHeight includes padding, not border — add border for border-box
     const needed = el.scrollHeight + borderY;
     el.style.minHeight = prevMin;
@@ -1144,6 +1155,21 @@ function AutoTextarea({
     // Resizing mid-composition can detach the IME candidate window on WebView2
     if (!composingRef.current) resize();
   }, [draft, focused, resize]);
+
+  useEffect(() => {
+    const wrap = ref.current?.parentElement;
+    if (!wrap || typeof ResizeObserver === "undefined") return;
+    // Column width changes wrap count; remasure so compact height follows visual lines
+    let lastWidth = wrap.clientWidth;
+    const ro = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect.width ?? wrap.clientWidth;
+      if (width === lastWidth) return;
+      lastWidth = width;
+      if (!composingRef.current) resize();
+    });
+    ro.observe(wrap);
+    return () => ro.disconnect();
+  }, [resize]);
 
   // External focus after split/merge
   useEffect(() => {
@@ -1759,6 +1785,10 @@ export function GenerateView({
 }: Props) {
   const [busy, setBusy] = useState(false);
   const [busyLineId, setBusyLineId] = useState<string | null>(null);
+  const [separatingVocals, setSeparatingVocals] = useState(false);
+  const [speakerBeforeByLine, setSpeakerBeforeByLine] = useState<
+    Record<string, { speakerEmbedPath: string; speakerName: string }>
+  >({});
   const [status, setStatus] = useState("");
   const [workerInfo, setWorkerInfo] = useState("");
   const [modelLoading, setModelLoading] = useState(false);
@@ -1795,10 +1825,12 @@ export function GenerateView({
   const [batchSilenceSecs, setBatchSilenceSecs] = useState("0.5");
   const [batchSubtitle, setBatchSubtitle] = useState<BatchSubtitleMode>("none");
   const [batchLabel, setBatchLabel] = useState<BatchLabelMode>("none");
+  const [batchScript, setBatchScript] = useState<BatchScriptMode>("none");
   const [batchFormat, setBatchFormat] = useState<ExportAudioFormat>("wav");
   const [batchSaving, setBatchSaving] = useState(false);
   const [bulkAddOpen, setBulkAddOpen] = useState(false);
   const [bulkAddInitialFile, setBulkAddInitialFile] = useState<File | undefined>(undefined);
+  const [bulkAddInitialPath, setBulkAddInitialPath] = useState<string | undefined>(undefined);
   const [lineListDropOver, setLineListDropOver] = useState(false);
   const [annotationReview, setAnnotationReview] = useState<{
     items: {
@@ -1946,8 +1978,46 @@ export function GenerateView({
   const displayOrderRef = useRef<string[]>([]);
   const lineGestureConsumedRef = useRef(false);
   const lineListRef = useRef<HTMLDivElement>(null);
+  const lineListDropRef = useRef<HTMLDivElement>(null);
   const projectTabsRef = useRef<HTMLDivElement>(null);
-  const docFileInputRef = useRef<HTMLInputElement>(null);
+  const projectTabsWheelCleanup = useRef<(() => void) | null>(null);
+  const setProjectTabsRef = useCallback((el: HTMLDivElement | null) => {
+    projectTabsWheelCleanup.current?.();
+    projectTabsWheelCleanup.current = null;
+    projectTabsRef.current = el;
+    if (!el) return;
+
+    let hovering = el.matches(":hover");
+    const onWheel = (e: WheelEvent) => {
+      if (!hovering && !el.contains(e.target as Node)) return;
+      if (el.scrollWidth <= el.clientWidth + 1) return;
+      const raw =
+        Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+      if (raw === 0) return;
+      const delta =
+        e.deltaMode === 1
+          ? raw * 16
+          : e.deltaMode === 2
+            ? raw * el.clientWidth
+            : raw;
+      e.preventDefault();
+      el.scrollLeft += delta;
+    };
+    const onEnter = () => {
+      hovering = true;
+    };
+    const onLeave = () => {
+      hovering = false;
+    };
+    el.addEventListener("pointerenter", onEnter);
+    el.addEventListener("pointerleave", onLeave);
+    window.addEventListener("wheel", onWheel, { passive: false, capture: true });
+    projectTabsWheelCleanup.current = () => {
+      el.removeEventListener("pointerenter", onEnter);
+      el.removeEventListener("pointerleave", onLeave);
+      window.removeEventListener("wheel", onWheel, true);
+    };
+  }, []);
   const speakersRef = useRef(speakers);
   speakersRef.current = speakers;
 
@@ -1963,7 +2033,7 @@ export function GenerateView({
   const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
   const panelSampling = project
     ? (samplingByProject[project.name] ?? project.defaultSampling)
-    : defaultSampling();
+    : defaultSampling(isMeanflowSettings(settings));
   const panelSamplingRef = useRef(panelSampling);
   panelSamplingRef.current = panelSampling;
   selectedIdRef.current = selectedId;
@@ -2017,20 +2087,13 @@ export function GenerateView({
   useEffect(() => {
     annotationsByLineRef.current = annotationsByLine;
   }, [annotationsByLine]);
-  useEffect(() => {
-    const el = projectTabsRef.current;
-    if (!el) return;
-    const onWheel = (e: WheelEvent) => {
-      if (el.scrollWidth <= el.clientWidth) return;
-      const delta =
-        Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
-      if (delta === 0) return;
-      e.preventDefault();
-      el.scrollLeft += delta;
-    };
-    el.addEventListener("wheel", onWheel, { passive: false });
-    return () => el.removeEventListener("wheel", onWheel);
-  }, [project != null]);
+  useEffect(
+    () => () => {
+      projectTabsWheelCleanup.current?.();
+      projectTabsWheelCleanup.current = null;
+    },
+    [],
+  );
   const synthInflight = useRef(
     new Map<
       string,
@@ -2051,6 +2114,7 @@ export function GenerateView({
   const batchPlayGenRef = useRef(0);
   const batchPlayActiveRef = useRef(false);
   const [batchPlayActive, setBatchPlayActive] = useState(false);
+  const [playBatchActive, setPlayBatchActive] = useState(false);
   const dragRef = useRef<{
     id: string;
     ids: string[];
@@ -2156,6 +2220,7 @@ export function GenerateView({
       batchPlayGenRef.current += 1;
       batchPlayActiveRef.current = false;
       setBatchPlayActive(false);
+      setPlayBatchActive(false);
       playerRef.current?.stop(true);
       if (speedTimer.current) window.clearTimeout(speedTimer.current);
     };
@@ -2174,6 +2239,9 @@ export function GenerateView({
     } else {
       playerRef.current?.cancelSilence();
       playerRef.current?.releaseEndedWaiters();
+    }
+    if (!opts?.keepActive) {
+      setPlayBatchActive(false);
     }
     if (batchPlayActiveRef.current && !opts?.keepActive) {
       batchPlayActiveRef.current = false;
@@ -2354,7 +2422,7 @@ export function GenerateView({
     player.setAudioFx(audioFxOf(selected));
   }, [selected?.volume, selected?.id, selected?.audioFx]);
 
-  // Speed + denoise: debounce during playback only (ffmpeg). Do not run on wavPath changes.
+  // Speed, pitch, and denoise: debounce during playback only (ffmpeg). Do not run on wavPath changes.
   useEffect(() => {
     const player = playerRef.current;
     if (!player || !selected || player.activeLineId !== selected.id) return;
@@ -2367,6 +2435,7 @@ export function GenerateView({
     if (speedTimer.current) window.clearTimeout(speedTimer.current);
     const wavPath = selected.wavPath;
     const speed = selected.speed;
+    const pitch = linePitch(selected);
     const denoise = audioFxOf(selected).denoise;
     const lineId = selected.id;
     const gen = playGenRef.current;
@@ -2377,6 +2446,7 @@ export function GenerateView({
           const playPath = await invoke<string>("prepare_playback_wav", {
             src: wavPath,
             speed,
+            pitch,
             denoise,
             clipEdit: null,
           });
@@ -2397,7 +2467,7 @@ export function GenerateView({
     return () => {
       if (speedTimer.current) window.clearTimeout(speedTimer.current);
     };
-  }, [selected?.speed, selected?.audioFx?.denoise, selected?.id]);
+  }, [selected?.speed, selected?.pitch, selected?.audioFx?.denoise, selected?.id]);
 
   // Auto-apply sampling to selected line (serialized, skip when syncing from line→panel)
   useEffect(() => {
@@ -2668,7 +2738,7 @@ export function GenerateView({
         name,
         createdAt: new Date().toISOString(),
         lines: [],
-        defaultSampling: defaultSampling(),
+        defaultSampling: defaultSampling(isMeanflowSettings(settings)),
       };
       await invoke("save_project_cmd", { project: p });
       await activateProjectSession(p, { asNewTab: true });
@@ -2934,31 +3004,42 @@ export function GenerateView({
     if (!projectRef.current) return;
     setEmojiInsert(null);
     const lines = projectRef.current.lines;
-    const prev = lines.length > 0 ? lines[lines.length - 1] : null;
+    const activeId = selectedIdRef.current;
+    const active =
+      (activeId ? lines.find((l) => l.id === activeId) : null) ?? null;
     const fallback = speakers[0];
     const line: ProjectLine = {
       id: newLineId(),
       text: "",
-      speakerName: prev?.speakerName ?? fallback?.name ?? "",
-      speakerEmbedPath: prev?.speakerEmbedPath ?? fallback?.embedPath ?? "",
-      sampling: { ...panelSampling },
+      speakerName: active?.speakerName ?? fallback?.name ?? "",
+      speakerEmbedPath: active?.speakerEmbedPath ?? fallback?.embedPath ?? "",
+      sampling: active ? { ...active.sampling } : { ...panelSampling },
       wavPath: null,
       generatedText: null,
       generatedSpeakerEmbedPath: null,
       generatedSampling: null,
-      caption: prev?.caption ?? "",
+      caption: active?.caption ?? "",
       generatedCaption: null,
       cfgScaleCaption:
-        prev?.cfgScaleCaption ?? DEFAULT_CFG_SCALE_CAPTION,
+        active?.cfgScaleCaption ?? DEFAULT_CFG_SCALE_CAPTION,
       generatedCfgScaleCaption: null,
-      volume: selected?.volume ?? 1,
-      speed: selected?.speed ?? 1,
-      audioFx: audioFxOf(selected),
+      volume: active?.volume ?? 1,
+      speed: active?.speed ?? 1,
+      pitch: linePitch(active),
+      audioFx: audioFxOf(active),
     };
-    await persist((prevProj) => ({
-      ...prevProj,
-      lines: [...prevProj.lines, line],
-    }));
+    await persist((prevProj) => {
+      if (!active) {
+        return { ...prevProj, lines: [...prevProj.lines, line] };
+      }
+      const i = prevProj.lines.findIndex((l) => l.id === active.id);
+      if (i < 0) {
+        return { ...prevProj, lines: [...prevProj.lines, line] };
+      }
+      const next = [...prevProj.lines];
+      next.splice(i + 1, 0, line);
+      return { ...prevProj, lines: next };
+    });
     onSelectedId(line.id);
   };
 
@@ -2989,6 +3070,7 @@ export function GenerateView({
     const fallback = speakers[0];
     const vol = selected?.volume ?? 1;
     const spd = selected?.speed ?? 1;
+    const pitch = linePitch(selected);
     const fx = audioFxOf(selected);
     let curName = prev?.speakerName ?? fallback?.name ?? "";
     let curEmbed = prev?.speakerEmbedPath ?? fallback?.embedPath ?? "";
@@ -3020,6 +3102,7 @@ export function GenerateView({
         generatedCfgScaleCaption: null,
         volume: vol,
         speed: spd,
+        pitch,
         audioFx: { ...fx },
       };
     });
@@ -3627,6 +3710,7 @@ export function GenerateView({
       generatedCfgScaleCaption: null,
       volume: cur.volume,
       speed: cur.speed,
+      pitch: linePitch(cur),
       audioFx: audioFxOf(cur),
     };
     lineDraftsRef.current.set(id, before);
@@ -4338,6 +4422,39 @@ export function GenerateView({
     );
   };
 
+  const applySpeakerToFormer = (source: ProjectLine) => {
+    if (!projectRef.current) return;
+    const before = speakerBeforeByLine[source.id];
+    if (!before || before.speakerEmbedPath === source.speakerEmbedPath) {
+      setStatus("変更前の話者がありません");
+      return;
+    }
+    const { speakerEmbedPath, speakerName } = source;
+    const label = speakerName || "未選択";
+    const beforeLabel = before.speakerName || "未選択";
+    const matchCount = projectRef.current.lines.filter(
+      (l) => l.speakerEmbedPath === before.speakerEmbedPath,
+    ).length;
+    if (matchCount === 0) {
+      setStatus(`変更前の話者「${beforeLabel}」の行はありません`);
+      return;
+    }
+    askConfirm(
+      `話者「${label}」を、変更前の話者「${beforeLabel}」と同じ ${matchCount} 行に適用します。よろしいですか？`,
+      () => {
+        void persist((prev) => ({
+          ...prev,
+          lines: prev.lines.map((l) =>
+            l.speakerEmbedPath === before.speakerEmbedPath
+              ? { ...l, speakerEmbedPath, speakerName }
+              : l,
+          ),
+        }));
+        setStatus("変更前と同一の話者行に適用");
+      },
+    );
+  };
+
   const applySamplingToAll = () => {
     if (!projectRef.current) return;
     askConfirm("Sampling を全行に一括適用します。よろしいですか？", () => {
@@ -4373,13 +4490,15 @@ export function GenerateView({
   const applyAudioToAll = () => {
     if (!selected) return;
     const { volume, speed } = selected;
+    const pitch = linePitch(selected);
     const audioFx = audioFxOf(selected);
+    const pitchLabel = pitch > 0.05 ? `+${pitch.toFixed(1)}` : pitch.toFixed(1);
     askConfirm(
-      `Volume ${volume.toFixed(2)} / Speed ${speed.toFixed(2)} と追加調整を全行に適用します。よろしいですか？`,
+      `Volume ${volume.toFixed(2)} / Speed ${speed.toFixed(2)} / Pitch ${pitchLabel} と追加調整を全行に適用します。よろしいですか？`,
       () => {
         void persist((prev) => ({
           ...prev,
-          lines: prev.lines.map((l) => ({ ...l, volume, speed, audioFx })),
+          lines: prev.lines.map((l) => ({ ...l, volume, speed, pitch, audioFx })),
         }));
         setStatus("全行に Audio Adjustment を一括適用");
       },
@@ -4389,15 +4508,16 @@ export function GenerateView({
   const applyAudioToSameSpeaker = () => {
     if (!selected) return;
     const { volume, speed, speakerEmbedPath, speakerName } = selected;
+    const pitch = linePitch(selected);
     const audioFx = audioFxOf(selected);
     askConfirm(
-      `Volume / Speed / 追加調整を話者「${speakerName || "未選択"}」の全行に適用します。よろしいですか？`,
+      `Volume / Speed / Pitch / 追加調整を話者「${speakerName || "未選択"}」の全行に適用します。よろしいですか？`,
       () => {
         void persist((prev) => ({
           ...prev,
           lines: prev.lines.map((l) =>
             l.speakerEmbedPath === speakerEmbedPath
-              ? { ...l, volume, speed, audioFx }
+              ? { ...l, volume, speed, pitch, audioFx }
               : l,
           ),
         }));
@@ -5253,6 +5373,7 @@ export function GenerateView({
       const playPath = await invoke<string>("prepare_playback_wav", {
         src: wavPath,
         speed: line.speed,
+        pitch: linePitch(line),
         denoise: audioFxOf(line).denoise,
         clipEdit: null,
       });
@@ -5305,6 +5426,67 @@ export function GenerateView({
     } catch (e) {
       if (gen === playGenRef.current) setStatus(`再生失敗: ${e}`);
     }
+  };
+
+  const separateVocalsOnSelected = () => {
+    const line = selected;
+    if (!line || separatingVocals) return;
+    const paths = [
+      ...new Set(
+        normalizeLineVariants(line)
+          .map((v) => v.wavPath)
+          .filter((p): p is string => !!p),
+      ),
+    ];
+    if (paths.length === 0) {
+      setStatus("分離する音声がありません");
+      return;
+    }
+    const lineId = line.id;
+    askConfirm(
+      paths.length > 1
+        ? `この行の ${paths.length} 件の音声をボーカル分離して置き換えます。元の音声には戻せません。よろしいですか？`
+        : "この行の音声をボーカル分離して置き換えます。元の音声には戻せません。よろしいですか？",
+      () => {
+        void (async () => {
+          const player = playerRef.current;
+          const wasThis = player?.activeLineId === lineId;
+          const variantId = wasThis ? (player?.activeVariantId ?? null) : null;
+          const wasPlaying = wasThis && !!player?.isPlaying;
+          if (wasThis) player?.stop(true);
+          setSeparatingVocals(true);
+          setStatus("ボーカル分離中…");
+          try {
+            await invoke<number>("separate_vocals_inplace_cmd", { paths });
+            setStatus(
+              paths.length > 1
+                ? `${paths.length} 件の音声をボーカル分離しました`
+                : "ボーカル分離しました",
+            );
+            const fresh = projectRef.current?.lines.find((l) => l.id === lineId);
+            const playerNow = playerRef.current;
+            const tookOver =
+              playerNow?.activeLineId != null && playerNow.activeLineId !== lineId;
+            if (wasThis && !tookOver && fresh) {
+              const variants = normalizeLineVariants(fresh);
+              const variant = variantId
+                ? variants.find((v) => v.id === variantId) ?? variants[0]
+                : variants[0];
+              const wav = variant?.wavPath ?? fresh.wavPath;
+              if (wav) {
+                await startPlayback(fresh, wav, variant?.id ?? null, {
+                  autoplay: wasPlaying,
+                });
+              }
+            }
+          } catch (e) {
+            setStatus(`ボーカル分離失敗: ${e}`);
+          } finally {
+            setSeparatingVocals(false);
+          }
+        })();
+      },
+    );
   };
 
   /** Play queued items in order while generation may still be running. */
@@ -5826,6 +6008,7 @@ export function GenerateView({
     player.releaseEndedWaiters();
     batchPlayActiveRef.current = true;
     setBatchPlayActive(true);
+    setPlayBatchActive(true);
     const silenceMs = Math.max(0, Number(settings.chunkSilenceMs) || 0);
     setStatus("一括再生中…");
     try {
@@ -5874,6 +6057,7 @@ export function GenerateView({
       if (gen === batchPlayGenRef.current) {
         batchPlayActiveRef.current = false;
         setBatchPlayActive(false);
+        setPlayBatchActive(false);
       }
     }
   };
@@ -5947,6 +6131,7 @@ export function GenerateView({
       dest,
       volume: line.volume,
       speed: line.speed,
+      pitch: linePitch(line),
       audioFx: audioFxOf(line),
       clipEdit: clipEditIsIdentity(clipEdit) ? null : clipEdit,
       format,
@@ -6044,6 +6229,7 @@ export function GenerateView({
     setBatchSilenceSecs(String(secs));
     setBatchSubtitle("none");
     setBatchLabel("none");
+    setBatchScript("none");
     setBatchFormat(exportAudioFormatOf(settings));
     setBatchSaveOpen(true);
   };
@@ -6091,6 +6277,23 @@ export function GenerateView({
         return;
       }
 
+      const writeScriptSidecar = async (lines: ProjectLine[]) => {
+        if (batchScript !== "txt") return false;
+        const contents = buildSpeakerDialogueScript(
+          lines.map((l) => ({
+            ...l,
+            text: lineDraftsRef.current.get(l.id) ?? l.text,
+          })),
+          speakers,
+        );
+        if (!contents.trim()) return false;
+        await invoke("write_text_file", {
+          path: joinPath(folder, `${p.name}_script.txt`),
+          contents,
+        });
+        return true;
+      };
+
       if (batchMode === "individual") {
         let fileCount = 0;
         for (const item of resolved) {
@@ -6104,7 +6307,14 @@ export function GenerateView({
           );
           fileCount += item.wavs.length;
         }
-        setStatus(`一括保存完了: ${fileCount} ファイル → ${folder}`);
+        const wroteScript = await writeScriptSidecar(
+          resolved.map((r) => r.line),
+        );
+        setStatus(
+          wroteScript
+            ? `一括保存完了: ${fileCount} ファイル + 台本 → ${folder}`
+            : `一括保存完了: ${fileCount} ファイル → ${folder}`,
+        );
       } else {
         const silenceSecs = Math.max(0, Number(batchSilenceSecs) || 0);
         const dest = joinPath(
@@ -6119,6 +6329,7 @@ export function GenerateView({
               src: r.wavs[0],
               volume: r.line.volume,
               speed: r.line.speed,
+              pitch: linePitch(r.line),
               audioFx: audioFxOf(r.line),
               clipEdit: clipEditIsIdentity(clipEdit) ? null : clipEdit,
             };
@@ -6166,8 +6377,13 @@ export function GenerateView({
             });
           }
         }
+        const wroteScript = await writeScriptSidecar(
+          resolved.map((r) => r.line),
+        );
 
-        setStatus(`連結保存完了: ${dest}`);
+        setStatus(
+          wroteScript ? `連結保存完了: ${dest} + 台本` : `連結保存完了: ${dest}`,
+        );
       }
       setBatchSaveOpen(false);
     } catch (e) {
@@ -6176,6 +6392,21 @@ export function GenerateView({
       setBatchSaving(false);
     }
   };
+
+  useTauriFileDrop(lineListDropRef, {
+    enabled: Boolean(project) && !bulkAddOpen && !modelLoading,
+    onHover: setLineListDropOver,
+    onDrop: (paths) => {
+      const path = paths.find((p) => {
+        const name = p.split(/[/\\]/).pop() || p;
+        return isSupportedDocName(name) || isSupportedAudioName(name);
+      });
+      if (!path) return;
+      setBulkAddInitialFile(undefined);
+      setBulkAddInitialPath(path);
+      setBulkAddOpen(true);
+    },
+  });
 
   if (modelLoading) {
     return (
@@ -6233,7 +6464,7 @@ export function GenerateView({
       <main className="script-panel panel">
         <header className="panel-header toolbar">
           <div
-            ref={projectTabsRef}
+            ref={setProjectTabsRef}
             className="project-tabs"
             role="tablist"
             aria-label="開いているプロジェクト"
@@ -6350,7 +6581,11 @@ export function GenerateView({
             <button
               type="button"
               disabled={busy || batchSaving || asrBusy}
-              onClick={() => setBulkAddOpen(true)}
+              onClick={() => {
+                setBulkAddInitialFile(undefined);
+                setBulkAddInitialPath(undefined);
+                setBulkAddOpen(true);
+              }}
               title="テキストを分割して複数行追加"
             >
               テキスト追加
@@ -6366,11 +6601,25 @@ export function GenerateView({
             </button>
             <button
               type="button"
-              disabled={busy || asrBusy || project.lines.length === 0}
-              onClick={() => void playBatch()}
-              title="全行の既存音声を順に再生（未生成はスキップ。再生成しません）"
+              className={playBatchActive ? "danger" : undefined}
+              disabled={
+                !playBatchActive &&
+                (busy || asrBusy || project.lines.length === 0)
+              }
+              onClick={() => {
+                if (playBatchActive) {
+                  cancelBatchPlayback({ stopAudio: true });
+                  return;
+                }
+                void playBatch();
+              }}
+              title={
+                playBatchActive
+                  ? "一括再生を停止"
+                  : "全行の既存音声を順に再生（未生成はスキップ。再生成しません）"
+              }
             >
-              再生
+              {playBatchActive ? "停止" : "再生"}
             </button>
             <button
               type="button"
@@ -6393,48 +6642,14 @@ export function GenerateView({
         <div className="panel-body script-body">
           <EmojiPalette open={emojiOpen} onInsert={insertEmoji} />
           <div
+            ref={lineListDropRef}
             className={`line-list-wrap ${lineListDropOver ? "doc-drop-active" : ""}`}
-            onDragEnter={(e) => {
-              acceptFileDrag(e);
-              setLineListDropOver(true);
-            }}
-            onDragOver={(e) => {
-              acceptFileDrag(e);
-              setLineListDropOver(true);
-            }}
-            onDragLeave={(e) => {
-              if (e.currentTarget.contains(e.relatedTarget as Node)) return;
-              setLineListDropOver(false);
-            }}
-            onDrop={(e) => {
-              acceptFileDrag(e);
-              setLineListDropOver(false);
-              const file = filesFromDataTransfer(e.dataTransfer).find(isSupportedDocFile);
-              if (file) {
-                setBulkAddInitialFile(file);
-                setBulkAddOpen(true);
-              }
-            }}
           >
             {lineListDropOver && (
               <div className="line-list-drop-overlay">
                 ドロップしてインポート
               </div>
             )}
-            <input
-              ref={docFileInputRef}
-              type="file"
-              accept=".txt,.md,.markdown,.docx,.pdf"
-              style={{ display: "none" }}
-              onChange={(e) => {
-                const file = Array.from(e.target.files ?? []).find(isSupportedDocFile);
-                e.target.value = "";
-                if (file) {
-                  setBulkAddInitialFile(file);
-                  setBulkAddOpen(true);
-                }
-              }}
-            />
             <div
               className={`line-list ${draggingIds.length ? "is-reordering" : ""}${
                 rangeSelecting ? " is-selecting" : ""
@@ -6471,6 +6686,12 @@ export function GenerateView({
                   keptVariantIds.length < lineVariants.length;
                 const compactUnselected =
                   generateCompactLinesOf(settings) && !isSelectedLine;
+                const formerSpeaker = speakerBeforeByLine[line.id];
+                const formerSpeakerLabel =
+                  formerSpeaker &&
+                  formerSpeaker.speakerEmbedPath !== line.speakerEmbedPath
+                    ? formerSpeaker.speakerName || "未選択"
+                    : null;
                 const asrResult = asrByLine[line.id];
                 return (
                   <div
@@ -6535,6 +6756,17 @@ export function GenerateView({
                         onClick={(e) => e.stopPropagation()}
                         onChange={(v) => {
                           const sp = speakers.find((s) => s.embedPath === v);
+                          if (v !== line.speakerEmbedPath) {
+                            const beforePath = line.speakerEmbedPath;
+                            const beforeName = line.speakerName;
+                            setSpeakerBeforeByLine((prev) => ({
+                              ...prev,
+                              [line.id]: {
+                                speakerEmbedPath: beforePath,
+                                speakerName: beforeName,
+                              },
+                            }));
+                          }
                           void updateLine(line.id, {
                             speakerEmbedPath: v,
                             speakerName: sp?.name ?? "",
@@ -6545,9 +6777,11 @@ export function GenerateView({
                       <SpeakerApplyMenu
                         lineNumber={i + 1}
                         disabled={busy}
+                        formerSpeakerLabel={formerSpeakerLabel}
                         onApplyAll={() => applySpeakerToAll(line)}
                         onApplyParity={() => applySpeakerToParity(line, i)}
                         onApplyFromHere={() => applySpeakerFromHere(line, i)}
+                        onApplyFormerSpeaker={() => applySpeakerToFormer(line)}
                       />
                       <div className="line-meta-status">
                       {lineNeedsRegen && (
@@ -6559,8 +6793,8 @@ export function GenerateView({
                       {asrResult && asrIsAlert(asrResult) && (
                           <AsrBadge result={asrResult} />
                         )}
-                      {lineVariants.length > 0 &&
-                        (canCullOthers ? (
+                      {lineVariants.length > 0 ? (
+                        canCullOthers ? (
                           <button
                             type="button"
                             className="badge variant-count variant-keep-action action-aura danger"
@@ -6581,7 +6815,15 @@ export function GenerateView({
                           <span className="badge variant-count">
                             {lineVariants.length}本保持中
                           </span>
-                        ))}
+                        )
+                      ) : (
+                        <span
+                          className="badge ungenerated"
+                          title="この行の音声はまだありません"
+                        >
+                          未生成
+                        </span>
+                      )}
                       {asrResult && !asrIsAlert(asrResult) && (
                           <AsrBadge result={asrResult} />
                         )}
@@ -6971,11 +7213,22 @@ export function GenerateView({
               })}
               <div className="line-list-drop-spacer" />
               <div className="line-list-drop-cue">
-                <span>ファイル（.txt .md .docx .pdf）をここにドロップしてインポート</span>
+                <span>ファイル{IMPORT_HINT}をここにドロップしてインポート</span>
                 <button
                   type="button"
                   className="doc-drop-browse"
-                  onClick={() => docFileInputRef.current?.click()}
+                  onClick={() => {
+                    void (async () => {
+                      const selected = await open({
+                        multiple: false,
+                        filters: IMPORT_DIALOG_FILTERS,
+                      });
+                      if (typeof selected !== "string") return;
+                      setBulkAddInitialFile(undefined);
+                      setBulkAddInitialPath(selected);
+                      setBulkAddOpen(true);
+                    })();
+                  }}
                 >
                   ファイルを選択
                 </button>
@@ -7006,10 +7259,12 @@ export function GenerateView({
           onToggle={() => setSamplingCollapsed((v) => !v)}
           onApplyAll={applySamplingToAll}
           onApplySameSpeaker={applySamplingToSameSpeaker}
+          fixedStrength={isMeanflowSettings(settings)}
         />
         <AudioAdjustmentPanel
           volume={selected?.volume ?? 1}
           speed={selected?.speed ?? 1}
+          pitch={linePitch(selected)}
           audioFx={selected ? audioFxOf(selected) : undefined}
           disabled={!selected}
           collapsed={audioCollapsed}
@@ -7020,6 +7275,13 @@ export function GenerateView({
           }}
           onApplyAll={applyAudioToAll}
           onApplySameSpeaker={applyAudioToSameSpeaker}
+          onSeparateVocals={separateVocalsOnSelected}
+          canSeparateVocals={
+            !!selected &&
+            !busy &&
+            normalizeLineVariants(selected).some((v) => !!v.wavPath)
+          }
+          separatingVocals={separatingVocals}
         />
         {showLineCaption && (
           <CaptionPanel
@@ -7051,8 +7313,10 @@ export function GenerateView({
           onCancel={() => {
             setBulkAddOpen(false);
             setBulkAddInitialFile(undefined);
+            setBulkAddInitialPath(undefined);
           }}
           initialFile={bulkAddInitialFile}
+          initialPath={bulkAddInitialPath}
         />
       )}
 
@@ -7367,6 +7631,19 @@ export function GenerateView({
                   </label>
                 </>
               )}
+              <label>
+                台本出力
+                <BoundedSelect
+                  value={batchScript}
+                  options={[
+                    { value: "none", label: "なし" },
+                    { value: "txt", label: "TXT（話者名: セリフ）" },
+                  ]}
+                  onChange={(v) => setBatchScript(v as BatchScriptMode)}
+                  disabled={batchSaving}
+                  aria-label="台本出力"
+                />
+              </label>
             </div>
             <footer className="panel-footer row">
               <button

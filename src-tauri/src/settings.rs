@@ -30,6 +30,13 @@ pub struct AppSettings {
     /// `"v3"` | `"v4"` — selects which path profile is active.
     #[serde(default = "default_irodori_version")]
     pub irodori_version: String,
+    /// v4 checkpoint family: `rf` (v4.1 / v4) or `mf` (v4.1-Small-MF).
+    /// Root, Python, outputs, and speaker embeddings stay on `paths_v4`.
+    #[serde(default = "default_v4_model")]
+    pub v4_model: String,
+    /// Checkpoint for v4.1 MF. The RF checkpoint stays on `paths_v4.checkpoint_path`.
+    #[serde(default)]
+    pub checkpoint_v4_mf: String,
     #[serde(default = "default_paths_v3")]
     pub paths_v3: VersionPathSettings,
     #[serde(default = "default_paths_v4")]
@@ -66,6 +73,12 @@ pub struct AppSettings {
     /// CER above this → ASR warning badge (0–1).
     #[serde(default = "default_asr_cer_warn_threshold")]
     pub asr_cer_warn_threshold: f64,
+    /// Audio-import transcription breaks: `phrase` (、 on short pause, 。+newline on long) or `sentence` (every pause is 。+newline).
+    #[serde(default = "default_import_asr_break")]
+    pub import_asr_break: String,
+    /// Native ASR for live dictation and audio import: `reazonspeech` or `parakeet`.
+    #[serde(default = "default_asr_model")]
+    pub asr_model: String,
     /// Gacha batch size per row (3–9).
     #[serde(default = "default_gacha_count")]
     pub gacha_count: u32,
@@ -125,9 +138,6 @@ pub struct SliceReviewSettings {
     /// Non-generative WPE / tilt / denoise on sliced clips before review.
     #[serde(default = "default_slice_auto_fix")]
     pub auto_fix: SliceAutoFixSettings,
-    /// Cluster sliced clips by speaker before review (multi-speaker sources).
-    #[serde(default)]
-    pub diarize_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -253,7 +263,6 @@ pub fn default_slice_review() -> SliceReviewSettings {
         auto_remove_percent: 0.0,
         auto_keep_max: 0,
         auto_fix: default_slice_auto_fix(),
-        diarize_enabled: false,
     }
 }
 
@@ -395,6 +404,45 @@ fn default_asr_cer_warn_threshold() -> f64 {
     0.15
 }
 
+fn default_import_asr_break() -> String {
+    "phrase".into()
+}
+
+pub fn normalize_import_asr_break(v: &str) -> String {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "sentence" => "sentence".into(),
+        _ => "phrase".into(),
+    }
+}
+
+fn default_asr_model() -> String {
+    "reazonspeech".into()
+}
+
+pub fn normalize_asr_model(v: &str) -> String {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "parakeet" => "parakeet".into(),
+        _ => "reazonspeech".into(),
+    }
+}
+
+fn default_v4_model() -> String {
+    "rf".into()
+}
+
+pub fn normalize_v4_model(v: &str) -> String {
+    if v.trim().eq_ignore_ascii_case("mf") {
+        "mf".into()
+    } else {
+        "rf".into()
+    }
+}
+
+fn is_mf_checkpoint_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("meanflow") || n.contains("-mf") || n.contains("_mf")
+}
+
 fn default_irodori_version() -> String {
     "v3".into()
 }
@@ -476,7 +524,7 @@ fn empty_paths() -> VersionPathSettings {
 fn default_paths_for(folder: &str, version: &str) -> VersionPathSettings {
     let root = default_engine_root(folder);
     if root.is_dir() {
-        infer_paths_from_root(&root.display().to_string(), version).into_version_paths()
+        infer_paths_from_root(&root.display().to_string(), version, "rf").into_version_paths()
     } else {
         empty_paths()
     }
@@ -511,8 +559,10 @@ fn hf_hub_roots() -> Vec<PathBuf> {
     out
 }
 
-fn hf_repos_for_version(version: &str) -> &'static [&'static str] {
-    if version.eq_ignore_ascii_case("v4") {
+fn hf_repos_for_version(version: &str, v4_model: &str) -> &'static [&'static str] {
+    if version.eq_ignore_ascii_case("v4") && normalize_v4_model(v4_model) == "mf" {
+        &["Aratako/Irodori-TTS-v4.1-Small-MF"]
+    } else if version.eq_ignore_ascii_case("v4") {
         &[
             "Aratako/Irodori-TTS-v4.1-Small",
             "Aratako/Irodori-TTS-v4-Small",
@@ -553,22 +603,23 @@ fn snapshot_model_safetensors(model_root: &Path) -> Option<PathBuf> {
     None
 }
 
-fn hub_dir_matches_version(dir_name: &str, version: &str) -> bool {
+fn hub_dir_matches_version(dir_name: &str, version: &str, v4_model: &str) -> bool {
     let n = dir_name.to_ascii_lowercase();
     if !n.contains("irodori-tts") || n.contains("quantized") {
         return false;
     }
+    let mf = is_mf_checkpoint_name(&n);
     if version.eq_ignore_ascii_case("v4") {
-        n.contains("v4")
+        n.contains("v4") && (normalize_v4_model(v4_model) == "mf") == mf
     } else {
-        (n.contains("v3") || n.contains("500m")) && !n.contains("v4")
+        (n.contains("v3") || n.contains("500m")) && !n.contains("v4") && !mf
     }
 }
 
 fn hf_dir_preference(dir_name: &str, version: &str) -> u8 {
     let n = dir_name.to_ascii_lowercase();
     if version.eq_ignore_ascii_case("v4") {
-        if n.contains("v4.1") {
+        if n.contains("v4.1") && !is_mf_checkpoint_name(&n) {
             0
         } else {
             1
@@ -580,7 +631,7 @@ fn hf_dir_preference(dir_name: &str, version: &str) -> u8 {
     }
 }
 
-fn scan_hub_for_version(hub: &Path, version: &str) -> Option<PathBuf> {
+fn scan_hub_for_version(hub: &Path, version: &str, v4_model: &str) -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = fs::read_dir(hub)
         .ok()?
         .filter_map(|e| e.ok())
@@ -588,7 +639,7 @@ fn scan_hub_for_version(hub: &Path, version: &str) -> Option<PathBuf> {
         .filter(|p| p.is_dir())
         .filter(|p| {
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            hub_dir_matches_version(name, version)
+            hub_dir_matches_version(name, version, v4_model)
         })
         .collect();
     dirs.sort_by_key(|p| {
@@ -604,9 +655,9 @@ fn scan_hub_for_version(hub: &Path, version: &str) -> Option<PathBuf> {
 }
 
 /// Hugging Face hub: `hub/models--Aratako--…/snapshots/<revision>/model.safetensors`
-fn find_hf_checkpoint(version: &str) -> Option<PathBuf> {
+fn find_hf_checkpoint(version: &str, v4_model: &str) -> Option<PathBuf> {
     let hubs = hf_hub_roots();
-    for repo in hf_repos_for_version(version) {
+    for repo in hf_repos_for_version(version, v4_model) {
         let dir_name = format!("models--{}", repo.replace('/', "--"));
         for hub in &hubs {
             if let Some(p) = snapshot_model_safetensors(&hub.join(&dir_name)) {
@@ -615,22 +666,22 @@ fn find_hf_checkpoint(version: &str) -> Option<PathBuf> {
         }
     }
     for hub in &hubs {
-        if let Some(p) = scan_hub_for_version(hub, version) {
+        if let Some(p) = scan_hub_for_version(hub, version, v4_model) {
             return Some(p);
         }
     }
     None
 }
 
-fn find_checkpoint_for_version(root: &Path, version: &str) -> Option<PathBuf> {
-    if let Some(p) = find_hf_checkpoint(version) {
+fn find_checkpoint_for_version(root: &Path, version: &str, v4_model: &str) -> Option<PathBuf> {
+    if let Some(p) = find_hf_checkpoint(version, v4_model) {
         return Some(p);
     }
-    let local_known = known_checkpoint(root, version);
+    let local_known = known_checkpoint(root, version, v4_model);
     if local_known.is_file() {
         return Some(local_known);
     }
-    find_model_safetensors(&root.join("checkpoints"), 0, 4)
+    find_model_safetensors(&root.join("checkpoints"), 0, 4, v4_model)
 }
 
 fn default_paths_v4() -> VersionPathSettings {
@@ -677,8 +728,12 @@ fn conventional_python(root: &Path) -> PathBuf {
     }
 }
 
-fn known_checkpoint(root: &Path, version: &str) -> PathBuf {
-    if version.eq_ignore_ascii_case("v4") {
+fn known_checkpoint(root: &Path, version: &str, v4_model: &str) -> PathBuf {
+    if version.eq_ignore_ascii_case("v4") && normalize_v4_model(v4_model) == "mf" {
+        root.join("checkpoints")
+            .join("Aratako_Irodori-TTS-v4.1-Small-MF")
+            .join("model.safetensors")
+    } else if version.eq_ignore_ascii_case("v4") {
         root.join("checkpoints")
             .join("Aratako_Irodori-TTS-v4-Small")
             .join("model.safetensors")
@@ -689,20 +744,48 @@ fn known_checkpoint(root: &Path, version: &str) -> PathBuf {
     }
 }
 
-fn find_model_safetensors(dir: &Path, depth: u32, max_depth: u32) -> Option<PathBuf> {
+fn allow_checkpoint_dir(name: &str, v4_model: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    let mf = is_mf_checkpoint_name(&n);
+    let looks_like_model = n.contains("irodori") || n.contains("v4") || mf;
+    if !looks_like_model {
+        return true;
+    }
+    if normalize_v4_model(v4_model) == "mf" {
+        mf
+    } else if v4_model.is_empty() {
+        true
+    } else {
+        !mf
+    }
+}
+
+fn find_model_safetensors(
+    dir: &Path,
+    depth: u32,
+    max_depth: u32,
+    v4_model: &str,
+) -> Option<PathBuf> {
     if depth > max_depth || !dir.is_dir() {
         return None;
     }
     let direct = dir.join("model.safetensors");
     if direct.is_file() {
-        return Some(direct);
+        let parent = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if allow_checkpoint_dir(parent, v4_model) {
+            return Some(direct);
+        }
     }
     let mut entries: Vec<_> = fs::read_dir(dir).ok()?.filter_map(|e| e.ok()).collect();
     entries.sort_by_key(|e| e.file_name());
     for e in entries {
         let p = e.path();
         if p.is_dir() {
-            if let Some(found) = find_model_safetensors(&p, depth + 1, max_depth) {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !allow_checkpoint_dir(name, v4_model) {
+                continue;
+            }
+            if let Some(found) = find_model_safetensors(&p, depth + 1, max_depth, v4_model) {
                 return Some(found);
             }
         }
@@ -711,7 +794,8 @@ fn find_model_safetensors(dir: &Path, depth: u32, max_depth: u32) -> Option<Path
 }
 
 /// Infer Outputs / Python / Checkpoint from an Irodori engine root.
-pub fn infer_paths_from_root(root: &str, version: &str) -> InferredPaths {
+/// `v4_model` is `rf` or `mf` and only changes which v4 checkpoint is chosen.
+pub fn infer_paths_from_root(root: &str, version: &str, v4_model: &str) -> InferredPaths {
     let root_str = root.trim().to_string();
     let root_path = Path::new(&root_str);
     let outputs = root_path.join("outputs");
@@ -721,8 +805,8 @@ pub fn infer_paths_from_root(root: &str, version: &str) -> InferredPaths {
         None => (conventional_python(root_path).display().to_string(), false),
     };
 
-    let found = find_checkpoint_for_version(root_path, version);
-    let known = known_checkpoint(root_path, version);
+    let found = find_checkpoint_for_version(root_path, version, v4_model);
+    let known = known_checkpoint(root_path, version, v4_model);
     let (checkpoint_path, checkpoint_found) = match found {
         Some(p) if p.is_file() => (p.display().to_string(), true),
         _ => (known.display().to_string(), false),
@@ -762,6 +846,8 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             irodori_version: default_irodori_version(),
+            v4_model: default_v4_model(),
+            checkpoint_v4_mf: String::new(),
             paths_v3: default_paths_v3(),
             paths_v4: default_paths_v4(),
             model_precision: "fp32".into(),
@@ -783,6 +869,8 @@ impl Default for AppSettings {
             utterance_max_chars: default_utterance_max_chars(),
             export_filename_parts: default_export_filename_parts(),
             asr_cer_warn_threshold: default_asr_cer_warn_threshold(),
+            import_asr_break: default_import_asr_break(),
+            asr_model: default_asr_model(),
             gacha_count: default_gacha_count(),
             export_audio_format: default_export_audio_format(),
             export_mp3_bitrate_kbps: default_export_mp3_bitrate_kbps(),
@@ -817,8 +905,16 @@ impl AppSettings {
         &self.active_paths().irodori_root
     }
 
+    pub fn is_v4_mf(&self) -> bool {
+        self.is_v4() && normalize_v4_model(&self.v4_model) == "mf"
+    }
+
     pub fn checkpoint_path(&self) -> &str {
-        &self.active_paths().checkpoint_path
+        if self.is_v4_mf() {
+            &self.checkpoint_v4_mf
+        } else {
+            &self.active_paths().checkpoint_path
+        }
     }
 
     pub fn outputs_root(&self) -> &str {
@@ -841,6 +937,8 @@ impl AppSettings {
     /// True when engine root / python / checkpoint / outputs / version / device / precision differ.
     pub fn engine_identity_changed(&self, other: &AppSettings) -> bool {
         self.irodori_version != other.irodori_version
+            || normalize_v4_model(&self.v4_model) != normalize_v4_model(&other.v4_model)
+            || self.checkpoint_v4_mf != other.checkpoint_v4_mf
             || self.active_paths() != other.active_paths()
             || self.model_device != other.model_device
             || self.codec_device != other.codec_device
@@ -977,6 +1075,9 @@ pub fn load_settings() -> AppSettings {
                         normalize_mp3_bitrate_kbps(s.export_mp3_bitrate_kbps);
                     s.export_opus_bitrate_kbps =
                         normalize_opus_bitrate_kbps(s.export_opus_bitrate_kbps);
+                    s.import_asr_break = normalize_import_asr_break(&s.import_asr_break);
+                    s.asr_model = normalize_asr_model(&s.asr_model);
+                    s.v4_model = normalize_v4_model(&s.v4_model);
                     s.accent_light = normalize_accent_light(&s.accent_light);
                     s.accent_dark = normalize_accent_dark(&s.accent_dark);
                     s.slice_review.mode =
@@ -986,6 +1087,16 @@ pub fn load_settings() -> AppSettings {
                     s.http_cors_origins =
                         normalize_http_cors_origins(s.http_cors_origins);
                     let mut rewritten = needs_rewrite;
+                    if s.checkpoint_v4_mf.trim().is_empty() {
+                        let root = s.paths_v4.irodori_root.trim();
+                        if !root.is_empty() {
+                            let inferred = infer_paths_from_root(root, "v4", "mf");
+                            if inferred.checkpoint_found {
+                                s.checkpoint_v4_mf = inferred.checkpoint_path;
+                                rewritten = true;
+                            }
+                        }
+                    }
                     if s.http_token.trim().is_empty() {
                         s.http_token = generate_http_token();
                         rewritten = true;
@@ -1033,6 +1144,20 @@ pub struct PathValidation {
     pub studio_scripts_ok: bool,
     #[serde(default)]
     pub studio_python_dir: Option<String>,
+    /// False when v4.1 MF is selected and this Irodori checkout has no MeanFlow runtime.
+    #[serde(default = "default_model_supported")]
+    pub model_supported: bool,
+}
+
+fn default_model_supported() -> bool {
+    true
+}
+
+fn irodori_supports_meanflow(root: &str) -> bool {
+    Path::new(root)
+        .join("irodori_tts")
+        .join("meanflow.py")
+        .is_file()
 }
 
 /// Resolve a usable Python executable.
@@ -1082,6 +1207,8 @@ pub fn validate_settings(settings: &AppSettings) -> PathValidation {
         train_config_ok: train_cfg.is_file(),
         studio_scripts_ok: studio.is_some(),
         studio_python_dir: studio.map(|p| p.display().to_string()),
+        model_supported: !settings.is_v4_mf()
+            || irodori_supports_meanflow(settings.irodori_root()),
     }
 }
 

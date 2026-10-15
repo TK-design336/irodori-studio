@@ -154,6 +154,30 @@ pub fn clear_resume_info(train_state: &TrainState) {
     *train_state.resume.lock() = None;
 }
 
+/// Line iterator that never drops a line on invalid UTF-8.
+///
+/// `BufReader::lines().flatten()` silently discards any line that is not
+/// valid UTF-8. On Japanese Windows a Python child without UTF-8 mode writes
+/// cp932 to the pipe, so `JOB_DIR=` / `REVIEW_READY=` lines containing a
+/// Japanese speaker name vanished and the manual-review pause was mistaken
+/// for a finished pipeline.
+fn lossy_lines<R: std::io::Read>(reader: R) -> impl Iterator<Item = String> {
+    let mut reader = BufReader::new(reader);
+    std::iter::from_fn(move || {
+        let mut buf: Vec<u8> = Vec::new();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => None,
+            Ok(_) => {
+                while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
+                    buf.pop();
+                }
+                Some(String::from_utf8_lossy(&buf).into_owned())
+            }
+            Err(_) => None,
+        }
+    })
+}
+
 fn extract_review_ready(line: &str) -> Option<String> {
     const MARKER: &str = "REVIEW_READY=";
     let trimmed = line.trim();
@@ -189,6 +213,52 @@ fn pending_manual_review_dir(job_dir: &str, review_mode: &str) -> Option<String>
     } else {
         None
     }
+}
+
+/// Last-resort lookup when `JOB_DIR=` / `REVIEW_READY=` were not observed:
+/// scan `{irodori_root}/data/studio_jobs/{speaker}_*` for the newest job that
+/// was touched after `started_at` and is still waiting for manual review.
+fn find_recent_paused_review_dir(
+    irodori_root: &str,
+    speaker_name: &str,
+    review_mode: &str,
+    started_at: std::time::SystemTime,
+) -> Option<String> {
+    if crate::settings::normalize_slice_review_mode(review_mode) != "manual" {
+        return None;
+    }
+    let jobs = PathBuf::from(irodori_root).join("data").join("studio_jobs");
+    let entries = std::fs::read_dir(&jobs).ok()?;
+    let prefix = format!("{}_", speaker_name.trim());
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !prefix.trim_end_matches('_').is_empty() && !name.starts_with(&prefix) {
+            continue;
+        }
+        let ready = path.join("slice_review").join("ready.json");
+        if !ready.is_file() {
+            continue;
+        }
+        let Ok(modified) = std::fs::metadata(&ready).and_then(|m| m.modified()) else {
+            continue;
+        };
+        if modified < started_at {
+            continue;
+        }
+        let Some(jd) = pending_manual_review_dir(&path.to_string_lossy(), review_mode) else {
+            continue;
+        };
+        match &best {
+            Some((t, _)) if *t >= modified => {}
+            _ => best = Some((modified, jd)),
+        }
+    }
+    best.map(|(_, jd)| jd)
 }
 
 fn parse_step_line(line: &str) -> Option<(u32, u32, String)> {
@@ -390,9 +460,6 @@ pub fn start_train_job(
                         "reverb": af.reverb,
                         "muffle": af.muffle,
                         "enhance": af.enhance,
-                    },
-                    "diarize": {
-                        "enabled": review.diarize_enabled,
                     }
                 });
                 std::fs::write(&p, cfg.to_string()).map_err(|e| e.to_string())?;
@@ -440,6 +507,11 @@ pub fn start_train_job(
                 .env("IRODORI_ROOT", &irodori_root)
                 .env("PYTHONPATH", &irodori_root)
                 .env("PYTHONUNBUFFERED", "1")
+                // Force UTF-8 on the pipe (and on every child the pipeline
+                // spawns). Without this, Japanese Windows emits cp932 and the
+                // marker lines (JOB_DIR= / REVIEW_READY=) become unreadable.
+                .env("PYTHONIOENCODING", "utf-8")
+                .env("PYTHONUTF8", "1")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             if vocal_separate {
@@ -465,6 +537,7 @@ pub fn start_train_job(
                 crate::python_env::hide_console(&mut cmd);
             }
 
+            let started_at = std::time::SystemTime::now();
             let mut child = cmd.spawn().map_err(|e| e.to_string())?;
             let pid = child.id();
             *train_state.child_pid.lock() = Some(pid);
@@ -479,7 +552,6 @@ pub fn start_train_job(
             let review_err = review_job_shared.clone();
             let resume_err = train_state.clone();
             let out_handle = std::thread::spawn(move || {
-                let reader = BufReader::new(stdout);
                 let mut embed: Option<String> = None;
                 let mut current_step = TrainProgressEvent {
                     step: 0,
@@ -488,7 +560,7 @@ pub fn start_train_job(
                     fraction: 0.0,
                     detail: None,
                 };
-                for line in reader.lines().flatten() {
+                for line in lossy_lines(stdout) {
                     if let Some(rest) = line.strip_prefix("EMBED_OK=") {
                         embed = Some(rest.to_string());
                     }
@@ -540,8 +612,7 @@ pub fn start_train_job(
 
             let app_err = app.clone();
             let err_handle = std::thread::spawn(move || {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines().flatten() {
+                for line in lossy_lines(stderr) {
                     if let Some(jd) = extract_review_ready(&line) {
                         *review_err.lock() = Some(jd.clone());
                         if let Some(info) = resume_err.resume.lock().as_mut() {
@@ -563,10 +634,19 @@ pub fn start_train_job(
             let embed = out_handle.join().ok().flatten();
             let _ = err_handle.join();
             let mut review_job = review_job_shared.lock().clone();
-            if review_job.is_none() {
+            if review_job.is_none() && embed.is_none() {
                 let snapshot = train_state.resume.lock().clone();
                 if let Some(info) = snapshot {
-                    if let Some(jd) = pending_manual_review_dir(&info.job_dir, &review_mode) {
+                    let found = pending_manual_review_dir(&info.job_dir, &review_mode)
+                        .or_else(|| {
+                            find_recent_paused_review_dir(
+                                &irodori_root,
+                                &info.speaker_name,
+                                &review_mode,
+                                started_at,
+                            )
+                        });
+                    if let Some(jd) = found {
                         if let Some(cur) = train_state.resume.lock().as_mut() {
                             cur.job_dir = jd.clone();
                             cur.paused_for_review = true;
@@ -1157,41 +1237,3 @@ pub fn complete_slice_review(job_dir: &str) -> Result<u64, String> {
     Ok(reverted)
 }
 
-pub fn load_diarization(job_dir: &str) -> Result<serde_json::Value, String> {
-    let path = slice_review_dir(job_dir)?.join("diarization.json");
-    if !path.is_file() {
-        return Ok(serde_json::json!({
-            "enabled": false,
-            "clusters": [],
-            "labels": {},
-            "selected": [],
-        }));
-    }
-    let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    serde_json::from_str(&text).map_err(|e| e.to_string())
-}
-
-pub fn save_diarization(job_dir: &str, selected: Vec<String>) -> Result<serde_json::Value, String> {
-    let path = slice_review_dir(job_dir)?.join("diarization.json");
-    let mut data = if path.is_file() {
-        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        serde_json::from_str::<serde_json::Value>(&text).map_err(|e| e.to_string())?
-    } else {
-        serde_json::json!({
-            "enabled": true,
-            "clusters": [],
-            "labels": {},
-            "selected": [],
-        })
-    };
-    let arr: Vec<serde_json::Value> = selected
-        .into_iter()
-        .map(|s| serde_json::Value::String(s))
-        .collect();
-    if let Some(obj) = data.as_object_mut() {
-        obj.insert("selected".into(), serde_json::Value::Array(arr));
-    }
-    let text = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
-    std::fs::write(&path, format!("{text}\n")).map_err(|e| e.to_string())?;
-    Ok(data)
-}

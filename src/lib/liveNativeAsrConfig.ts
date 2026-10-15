@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
+import type { AsrModel } from "../types";
+
 export type NativeAsrPrecision = "int8" | "int8_float32" | "float32";
 
 export type NativeAsrConfigWire = {
@@ -7,6 +9,7 @@ export type NativeAsrConfigWire = {
   input_device_host: string | null;
   input_device_name: string | null;
   asr_precision: NativeAsrPrecision;
+  asr_model: AsrModel;
   asr_num_threads: number;
   model_dir: string | null;
   vad_threshold: number;
@@ -27,12 +30,16 @@ const DEFAULT_TUNING = {
   numThreads: 4,
 };
 
-export function buildNativeAsrConfig(deviceId = ""): NativeAsrConfigWire {
+export function buildNativeAsrConfig(
+  deviceId = "",
+  asrModel: AsrModel = "reazonspeech",
+): NativeAsrConfigWire {
   return {
     input_device_id: deviceId || null,
     input_device_host: null,
     input_device_name: null,
     asr_precision: "int8_float32",
+    asr_model: asrModel,
     asr_num_threads: DEFAULT_TUNING.numThreads,
     model_dir: null,
     vad_threshold: DEFAULT_TUNING.vadThreshold,
@@ -46,8 +53,13 @@ export function buildNativeAsrConfig(deviceId = ""): NativeAsrConfigWire {
   };
 }
 
-export async function syncNativeAsrConfig(deviceId = ""): Promise<void> {
-  await invoke("native_asr_set_config", { config: buildNativeAsrConfig(deviceId) });
+export async function syncNativeAsrConfig(
+  deviceId = "",
+  asrModel: AsrModel = "reazonspeech",
+): Promise<void> {
+  await invoke("native_asr_set_config", {
+    config: buildNativeAsrConfig(deviceId, asrModel),
+  });
 }
 
 export async function ensureNativeAsrModels(): Promise<void> {
@@ -59,8 +71,11 @@ export async function ensureNativeAsrModels(): Promise<void> {
   await invoke("native_asr_download_models");
 }
 
-export async function preloadNativeAsr(): Promise<void> {
-  await syncNativeAsrConfig();
+export async function preloadNativeAsr(
+  deviceId = "",
+  asrModel: AsrModel = "reazonspeech",
+): Promise<void> {
+  await syncNativeAsrConfig(deviceId, asrModel);
   const status = await invoke<{
     vad: { installed: boolean };
     asr: { installed: boolean };

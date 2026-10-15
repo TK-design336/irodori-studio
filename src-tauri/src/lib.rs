@@ -1,6 +1,7 @@
 mod asr;
 mod dictionary;
 mod http_server;
+mod manual_cut;
 mod native_asr;
 mod native_output;
 mod project;
@@ -24,7 +25,7 @@ use settings::{
 use speakers::{
     RenameSpeakerArgs, SpeakerInfo, UpdateSpeakerMetaArgs, UpsertSpeakerProfileArgs,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 use train::{
@@ -74,6 +75,9 @@ async fn set_settings(
         settings::normalize_mp3_bitrate_kbps(settings.export_mp3_bitrate_kbps);
     settings.export_opus_bitrate_kbps =
         settings::normalize_opus_bitrate_kbps(settings.export_opus_bitrate_kbps);
+    settings.import_asr_break = settings::normalize_import_asr_break(&settings.import_asr_break);
+    settings.asr_model = settings::normalize_asr_model(&settings.asr_model);
+    settings.v4_model = settings::normalize_v4_model(&settings.v4_model);
     settings.accent_light = settings::normalize_accent_light(&settings.accent_light);
     settings.accent_dark = settings::normalize_accent_dark(&settings.accent_dark);
     settings.http_bind_address = normalize_http_bind_address(&settings.http_bind_address);
@@ -117,8 +121,13 @@ fn regenerate_http_token(
 }
 
 #[tauri::command]
-fn infer_engine_paths(root: String, version: String) -> InferredPaths {
-    infer_paths_from_root(&root, &version)
+fn infer_engine_paths(
+    root: String,
+    version: String,
+    v4_model: Option<String>,
+) -> InferredPaths {
+    let model = v4_model.unwrap_or_else(|| "rf".into());
+    infer_paths_from_root(&root, &version, &model)
 }
 
 #[tauri::command]
@@ -211,19 +220,6 @@ fn start_training(
 }
 
 #[tauri::command]
-fn load_diarization_cmd(job_dir: String) -> Result<serde_json::Value, String> {
-    train::load_diarization(&job_dir)
-}
-
-#[tauri::command]
-fn save_diarization_cmd(
-    job_dir: String,
-    selected: Vec<String>,
-) -> Result<serde_json::Value, String> {
-    train::save_diarization(&job_dir, selected)
-}
-
-#[tauri::command]
 fn load_slice_review_metrics_cmd(job_dir: String) -> Result<serde_json::Value, String> {
     train::load_slice_review_metrics(&job_dir)
 }
@@ -263,6 +259,68 @@ fn run_slice_autofix_cmd(
 ) -> Result<serde_json::Value, String> {
     let settings = state.settings.lock().clone();
     train::run_slice_autofix(&job_dir, &settings)
+}
+
+#[tauri::command]
+async fn manual_cut_separate_cmd(
+    app: AppHandle,
+    source_path: String,
+) -> Result<manual_cut::ManualCutSeparateResult, String> {
+    let settings = with_state_blocking(app, |state| Ok(state.settings.lock().clone())).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        manual_cut::separate_for_playback(&settings, &source_path)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn separate_vocals_inplace_cmd(
+    app: AppHandle,
+    paths: Vec<String>,
+) -> Result<u32, String> {
+    let settings = with_state_blocking(app, |state| Ok(state.settings.lock().clone())).await?;
+    tauri::async_runtime::spawn_blocking(move || manual_cut::replace_with_vocals(&settings, &paths))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn manual_cut_export_cmd(
+    app: AppHandle,
+    source_path: String,
+    dest_dir: String,
+    clips: Vec<manual_cut::ManualCutClip>,
+    name_stem: Option<String>,
+) -> Result<u64, String> {
+    let settings = with_state_blocking(app, |state| Ok(state.settings.lock().clone())).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        manual_cut::export_clips(
+            &settings,
+            &source_path,
+            &dest_dir,
+            &clips,
+            name_stem.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn manual_cut_workspace_save_cmd(
+    path: String,
+    workspace: manual_cut::ManualCutWorkspace,
+    vocals_src: Option<String>,
+) -> Result<(), String> {
+    manual_cut::save_workspace(&path, workspace, vocals_src)
+}
+
+#[tauri::command]
+fn manual_cut_workspace_load_cmd(
+    path: String,
+) -> Result<manual_cut::ManualCutWorkspaceLoadResult, String> {
+    manual_cut::load_workspace(&path)
 }
 
 #[tauri::command]
@@ -424,11 +482,16 @@ async fn ensure_worker(app: AppHandle) -> Result<Value, String> {
         if !worker.is_loaded() {
             let resp = worker.load(&settings)?;
             if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-                return Err(format!("load failed: {resp}"));
+                return Err(crate::worker::load_failure_message(&resp));
             }
             return Ok(resp);
         }
-        Ok(json!({"ok": true, "status": "already_loaded"}))
+        Ok(json!({
+            "ok": true,
+            "status": "already_loaded",
+            "meanflow": worker.is_meanflow(),
+            "default_num_steps": worker.default_num_steps(),
+        }))
     })
     .await
 }
@@ -937,10 +1000,33 @@ fn join_af_parts(parts: &[String]) -> String {
         .join(",")
 }
 
+/// Time-preserving pitch shift in semitones (±12 fits one atempo stage).
+/// Resample to 48 kHz first so the ratio does not depend on the source rate.
+fn pitch_shift_filters(semitones: f64) -> Vec<String> {
+    let semis = if semitones.is_finite() {
+        semitones.clamp(-12.0, 12.0)
+    } else {
+        0.0
+    };
+    if semis.abs() < 0.001 {
+        return Vec::new();
+    }
+    let ratio = 2f64.powf(semis / 12.0);
+    let rate = (48_000.0 * ratio).round().max(1.0);
+    let tempo = (48_000.0 / rate).clamp(0.5, 2.0);
+    vec![
+        "aresample=48000".into(),
+        format!("asetrate={rate:.0}"),
+        "aresample=48000".into(),
+        format!("atempo={tempo:.6}"),
+    ]
+}
+
 /// Keep numeric targets in sync with `src/lib/audioFx.ts`.
 fn build_post_af(
     volume: f64,
     speed: f64,
+    pitch: f64,
     fx: &project::AudioFx,
     playback: bool,
 ) -> String {
@@ -952,6 +1038,8 @@ fn build_post_af(
         let nr = 4.0 + 16.0 * fx.denoise;
         filters.push(format!("afftdn=nr={nr:.2}:nf=-55"));
     }
+
+    filters.extend(pitch_shift_filters(pitch));
 
     if (speed - 1.0).abs() >= 0.001 {
         filters.push(format!("atempo={speed}"));
@@ -1003,13 +1091,14 @@ fn build_post_af(
     filters.join(",")
 }
 
-/// Export audio applying volume + speed + post-FX via ffmpeg.
+/// Export audio applying volume + speed + pitch + post-FX via ffmpeg.
 pub(crate) fn export_wav_adjusted_inner(
     settings: &AppSettings,
     src: String,
     dest: String,
     volume: f64,
     speed: f64,
+    pitch: f64,
     audio_fx: &project::AudioFx,
     format: ExportAudioFormat,
     bitrate_kbps: Option<u32>,
@@ -1018,12 +1107,13 @@ pub(crate) fn export_wav_adjusted_inner(
     let dest = ensure_audio_ext(&dest, format);
     let vol_ok = (volume - 1.0).abs() < 0.001;
     let spd_ok = (speed - 1.0).abs() < 0.001;
+    let pitch_ok = !pitch.is_finite() || pitch.abs() < 0.001;
     let clip = clip_edit.map(|c| c.clamped()).filter(|c| !c.is_identity());
-    if vol_ok && spd_ok && audio_fx.is_identity() && clip.is_none() && format == ExportAudioFormat::Wav {
+    if vol_ok && spd_ok && pitch_ok && audio_fx.is_identity() && clip.is_none() && format == ExportAudioFormat::Wav {
         return copy_file(src, dest);
     }
 
-    let post = build_post_af(volume, speed, audio_fx, false);
+    let post = build_post_af(volume, speed, pitch, audio_fx, false);
     let clip_af = clip.as_ref().map(build_clip_af).unwrap_or_default();
     let af = join_af_parts(&[clip_af, post]);
     let af = if af.is_empty() { None } else { Some(af) };
@@ -1043,6 +1133,7 @@ fn export_wav_adjusted(
     dest: String,
     volume: f64,
     speed: f64,
+    pitch: Option<f64>,
     audio_fx: Option<project::AudioFx>,
     clip_edit: Option<project::ClipEdit>,
     format: Option<String>,
@@ -1052,7 +1143,8 @@ fn export_wav_adjusted(
     let fmt = resolve_export_format(format.as_deref(), &dest);
     let fx = audio_fx.unwrap_or_default();
     let clip = clip_edit.as_ref();
-    export_wav_adjusted_inner(&settings, src, dest, volume, speed, &fx, fmt, bitrate_kbps, clip)
+    let pitch = pitch.unwrap_or(0.0);
+    export_wav_adjusted_inner(&settings, src, dest, volume, speed, pitch, &fx, fmt, bitrate_kbps, clip)
 }
 
 #[derive(serde::Deserialize)]
@@ -1061,6 +1153,8 @@ pub(crate) struct WavExportSeg {
     pub src: String,
     pub volume: f64,
     pub speed: f64,
+    #[serde(default)]
+    pub pitch: f64,
     #[serde(default)]
     pub audio_fx: project::AudioFx,
     #[serde(default)]
@@ -1127,6 +1221,7 @@ pub(crate) fn export_wavs_concatenated_inner(
             adj.display().to_string(),
             seg.volume,
             seg.speed,
+            seg.pitch,
             &seg.audio_fx,
             ExportAudioFormat::Wav,
             None,
@@ -1228,28 +1323,31 @@ pub(crate) fn export_wavs_concatenated_inner(
     result
 }
 
-/// Pitch-preserving speed + denoise into a temp file for playback (EQ left to WebAudio).
+/// Pitch-preserving speed, pitch shift, and denoise into a temp file for playback (EQ left to WebAudio).
 #[tauri::command]
 fn prepare_playback_wav(
     state: tauri::State<'_, AppState>,
     src: String,
     speed: f64,
     denoise: Option<f64>,
+    pitch: Option<f64>,
     clip_edit: Option<project::ClipEdit>,
 ) -> Result<String, String> {
     let settings = state.settings.lock().clone();
     let speed = speed.clamp(0.5, 2.0);
     let denoise = denoise.unwrap_or(0.0);
+    let pitch = pitch.unwrap_or(0.0);
     let mut fx = project::AudioFx::default();
     fx.denoise = denoise;
     let clip = clip_edit.map(|c| c.clamped()).filter(|c| !c.is_identity());
-    if (speed - 1.0).abs() < 0.001 && fx.denoise.abs() < 0.001 && clip.is_none() {
+    let pitch_ok = !pitch.is_finite() || pitch.abs() < 0.001;
+    if (speed - 1.0).abs() < 0.001 && fx.denoise.abs() < 0.001 && pitch_ok && clip.is_none() {
         return Ok(src);
     }
     let dest = studio_cache_dir()
         .join("playback")
         .join(format!("play_{}.wav", uuid::Uuid::new_v4()));
-    let post = build_post_af(1.0, speed, &fx, true);
+    let post = build_post_af(1.0, speed, pitch, &fx, true);
     let clip_af = clip.as_ref().map(build_clip_af).unwrap_or_default();
     let af = join_af_parts(&[clip_af, post]);
     run_ffmpeg_af(&settings, &src, &dest.display().to_string(), &af)?;
@@ -1485,6 +1583,79 @@ async fn transcribe_pcm_asr_cmd(
     .await
 }
 
+fn run_import_transcribe(
+    app: &AppHandle,
+    path: Option<String>,
+    bytes: Option<Vec<u8>>,
+    file_name: Option<String>,
+) -> Result<String, String> {
+    let settings = app.state::<AppState>().settings.lock().clone();
+    let name = file_name.as_deref();
+    let (src_path, cleanup) = if let Some(src) = path.as_deref().filter(|p| !p.trim().is_empty())
+    {
+        (src.to_string(), false)
+    } else {
+        let data = bytes
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .ok_or_else(|| "音声ファイルを渡せませんでした".to_string())?;
+        let label = name.unwrap_or("audio.wav");
+        let tmp = asr::create_import_audio_temp(label)?;
+        asr::append_import_audio_temp(&tmp, data)?;
+        (tmp, true)
+    };
+    let label = name.unwrap_or(src_path.as_str());
+    let pcm = asr::load_import_pcm_16k_mono(&settings, Path::new(&src_path), label);
+    if cleanup {
+        let _ = std::fs::remove_file(&src_path);
+    }
+    let pcm = pcm?;
+    eprintln!(
+        "[import-asr] {label}: {:.2}s of audio",
+        pcm.len() as f64 / 16_000.0
+    );
+    let text = native_asr::transcribe_pcm_offline(
+        app,
+        &pcm,
+        native_asr::ImportAsrBreak::parse(&settings.import_asr_break),
+    )?;
+    if text.trim().is_empty() {
+        return Err("文字起こし結果が空です".into());
+    }
+    Ok(text)
+}
+
+/// Transcribe an imported mp3/wav with the live-dictation ASR pipeline.
+/// Same shape as `transcribe_pcm_asr_cmd`: async command, work on the blocking pool.
+#[tauri::command]
+async fn transcribe_audio_file_cmd(
+    app: AppHandle,
+    path: Option<String>,
+    bytes: Option<Vec<u8>>,
+    file_name: Option<String>,
+) -> Result<String, String> {
+    if native_asr::microphone_in_use_by_asr(&app) {
+        return Err("ライブ音声入力の停止後にインポートしてください".into());
+    }
+    native_asr::ensure_file_asr_models(&app).await?;
+    let app_blocking = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        run_import_transcribe(&app_blocking, path, bytes, file_name)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn create_import_audio_temp_cmd(file_name: String) -> Result<String, String> {
+    asr::create_import_audio_temp(&file_name)
+}
+
+#[tauri::command]
+fn append_import_audio_temp_cmd(path: String, chunk: Vec<u8>) -> Result<(), String> {
+    asr::append_import_audio_temp(&path, &chunk)
+}
+
 /// Return WAV duration in seconds (via ffprobe or WAV header).
 #[tauri::command]
 fn wav_duration_secs(
@@ -1622,10 +1793,13 @@ pub fn run() {
             load_slice_review_log_cmd,
             save_slice_review_exclusions_cmd,
             complete_slice_review_cmd,
-            save_diarization_cmd,
-            load_diarization_cmd,
             load_slice_autofix_log_cmd,
             run_slice_autofix_cmd,
+            manual_cut_separate_cmd,
+            separate_vocals_inplace_cmd,
+            manual_cut_export_cmd,
+            manual_cut_workspace_save_cmd,
+            manual_cut_workspace_load_cmd,
             list_vocal_separator_models,
             blend_embeddings,
             suggest_katakana,
@@ -1659,6 +1833,9 @@ pub fn run() {
             verify_line_asr,
             ensure_asr_model_cmd,
             transcribe_pcm_asr_cmd,
+            transcribe_audio_file_cmd,
+            create_import_audio_temp_cmd,
+            append_import_audio_temp_cmd,
             native_asr::commands::native_asr_get_model_status,
             native_asr::commands::native_asr_download_models,
             native_asr::commands::native_asr_preload,
@@ -1677,4 +1854,34 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod pitch_tests {
+    use super::pitch_shift_filters;
+
+    #[test]
+    fn identity_pitch_adds_no_filters() {
+        assert!(pitch_shift_filters(0.0).is_empty());
+    }
+
+    #[test]
+    fn one_semitone_shifts_pitch_and_keeps_duration() {
+        let filters = pitch_shift_filters(1.0);
+        assert_eq!(filters.len(), 4);
+        let rate: f64 = filters[1].trim_start_matches("asetrate=").parse().unwrap();
+        let tempo: f64 = filters[3].trim_start_matches("atempo=").parse().unwrap();
+        let expected = 2f64.powf(1.0 / 12.0);
+        assert!((rate / 48_000.0 - expected).abs() < 0.001);
+        assert!((tempo * rate / 48_000.0 - 1.0).abs() < 0.002);
+    }
+
+    #[test]
+    fn octave_stays_inside_atempo_range() {
+        for semis in [-12.0_f64, 12.0] {
+            let filters = pitch_shift_filters(semis);
+            let tempo: f64 = filters[3].trim_start_matches("atempo=").parse().unwrap();
+            assert!((0.5..=2.0).contains(&tempo), "{semis} -> {tempo}");
+        }
+    }
 }

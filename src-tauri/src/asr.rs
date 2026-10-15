@@ -4,9 +4,10 @@ use crate::python_env::{ensure_asr_python_deps, resolve_python};
 use crate::settings::{studio_python_dir, AppSettings};
 use serde::Deserialize;
 use std::fs;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// Cache dir for Whisper weights (downloaded on first load by faster-whisper).
 pub fn asr_model_dir() -> PathBuf {
@@ -329,7 +330,7 @@ impl AsrWorker {
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
-                self.reap_if_dead();
+                self.force_kill();
                 return Err("ASR worker timed out".into());
             }
             let recv = {
@@ -348,11 +349,11 @@ impl AsrWorker {
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    self.reap_if_dead();
+                    self.force_kill();
                     return Err("ASR worker timed out".into());
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    self.reap_if_dead();
+                    self.force_kill();
                     return Err("ASR worker disconnected".into());
                 }
             }
@@ -480,21 +481,25 @@ impl AsrWorker {
             .to_string())
     }
 
-    pub fn shutdown(&mut self) {
-        if self.stdin.is_some() {
-            let _ = self.request(
-                serde_json::json!({ "cmd": "shutdown" }),
-                std::time::Duration::from_secs(5),
-            );
-        }
+    fn force_kill(&mut self) {
+        self.stdin = None;
+        self.lines_rx = None;
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
-        self.stdin = None;
-        self.lines_rx = None;
         self.loaded_model_dir = None;
         self.script_mtime_secs = None;
+    }
+
+    pub fn shutdown(&mut self) {
+        if self.stdin.is_some() && self.child.is_some() {
+            let _ = self.request(
+                serde_json::json!({ "cmd": "shutdown" }),
+                Duration::from_secs(2),
+            );
+        }
+        self.force_kill();
     }
 }
 
@@ -549,4 +554,204 @@ pub fn transcribe_pcm_asr(
     let text = worker.transcribe(settings, &path.display().to_string())?;
     let _ = std::fs::remove_file(&path);
     Ok(text)
+}
+
+fn audio_import_ext(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".mp3") {
+        Some("mp3")
+    } else if lower.ends_with(".wav") {
+        Some("wav")
+    } else {
+        None
+    }
+}
+
+pub fn import_asr_dir() -> Result<PathBuf, String> {
+    let dir = crate::studio_cache_dir().join("import_asr");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
+fn path_under_dir(path: &Path, dir: &Path) -> bool {
+    let Ok(dir) = dir.canonicalize() else {
+        return false;
+    };
+    let Ok(path) = path.canonicalize() else {
+        return false;
+    };
+    path.starts_with(dir)
+}
+
+/// Create an empty cache file to receive imported audio in chunks (avoids huge IPC arrays).
+pub fn create_import_audio_temp(file_name: &str) -> Result<String, String> {
+    let ext = audio_import_ext(file_name).ok_or_else(|| {
+        "対応していない音声形式です（.mp3 .wav）".to_string()
+    })?;
+    let dir = import_asr_dir()?;
+    let path = dir.join(format!("up_{}.{ext}", uuid::Uuid::new_v4()));
+    fs::write(&path, b"").map_err(|e| e.to_string())?;
+    Ok(path.display().to_string())
+}
+
+pub fn append_import_audio_temp(path: &str, chunk: &[u8]) -> Result<(), String> {
+    if chunk.is_empty() {
+        return Ok(());
+    }
+    let path = Path::new(path);
+    let dir = import_asr_dir()?;
+    if !path_under_dir(path, &dir) {
+        return Err("invalid import cache path".into());
+    }
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    f.write_all(chunk).map_err(|e| e.to_string())
+}
+
+fn convert_to_wav_16k_mono(
+    settings: &AppSettings,
+    src: &Path,
+    dest: &Path,
+) -> Result<(), String> {
+    let ffmpeg = crate::settings::resolve_ffmpeg(settings)
+        .ok_or_else(|| crate::settings::MISSING_FFMPEG_MSG.to_string())?;
+    let mut cmd = Command::new(ffmpeg);
+    crate::python_env::hide_console(&mut cmd);
+    // -nostdin is required: streaming/malformed WAV headers make ffmpeg wait on stdin forever.
+    cmd.args([
+        "-nostdin",
+        "-hide_banner",
+        "-y",
+        "-i",
+        &src.display().to_string(),
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        "-c:a",
+        "pcm_s16le",
+        "-f",
+        "wav",
+        &dest.display().to_string(),
+    ]);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let stderr = child.stderr.take();
+    let stderr_join = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(pipe) = stderr {
+            let _ = std::io::BufReader::new(pipe).read_to_string(&mut buf);
+        }
+        buf
+    });
+    let timeout = Duration::from_secs(120);
+    let started = Instant::now();
+    let status = loop {
+        if started.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_join.join();
+            return Err("音声の変換がタイムアウトしました".into());
+        }
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(status) => break status,
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    let err = stderr_join.join().unwrap_or_default();
+    if !status.success() {
+        let preview: String = err.chars().take(400).collect();
+        return Err(format!("音声の変換に失敗しました: {preview}"));
+    }
+    let meta = fs::metadata(dest).map_err(|_| "音声の変換結果が空です".to_string())?;
+    if meta.len() < 44 {
+        return Err("音声の変換結果が空です".into());
+    }
+    Ok(())
+}
+
+fn resample_to_16k(samples: &[f32], rate: u32) -> Vec<f32> {
+    const TARGET: u32 = 16_000;
+    if rate == TARGET || samples.is_empty() {
+        return samples.to_vec();
+    }
+    let ratio = f64::from(rate) / f64::from(TARGET);
+    let out_len = ((samples.len() as f64) / ratio).round().max(1.0) as usize;
+    let last = samples.len().saturating_sub(1);
+    (0..out_len)
+        .map(|i| {
+            let src = i as f64 * ratio;
+            let j = (src.floor() as usize).min(last);
+            let frac = (src - j as f64) as f32;
+            let a = samples[j];
+            let b = samples[(j + 1).min(last)];
+            a + (b - a) * frac
+        })
+        .collect()
+}
+
+fn read_wav_mono_f32(path: &Path) -> Result<(Vec<f32>, u32), String> {
+    let mut reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
+    let spec = reader.spec();
+    let rate = spec.sample_rate;
+    if rate == 0 {
+        return Err("sample rate 0".into());
+    }
+    let ch = spec.channels.max(1) as usize;
+    let interleaved: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?,
+        hound::SampleFormat::Int => {
+            let bits = spec.bits_per_sample.clamp(1, 31);
+            let denom = (1i64 << (bits - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .map(|s| s.map(|v| v as f32 / denom))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        }
+    };
+    let mono = if ch <= 1 {
+        interleaved
+    } else {
+        interleaved
+            .chunks(ch)
+            .map(|frame| frame.iter().sum::<f32>() / ch as f32)
+            .collect()
+    };
+    Ok((mono, rate))
+}
+
+/// Decode mp3/wav to 16 kHz mono f32. WAV prefers hound (no ffmpeg / no Python).
+pub fn load_import_pcm_16k_mono(
+    settings: &AppSettings,
+    src: &Path,
+    label: &str,
+) -> Result<Vec<f32>, String> {
+    if !src.is_file() {
+        return Err(format!("ファイルが見つかりません: {}", src.display()));
+    }
+    let ext = audio_import_ext(label)
+        .or_else(|| audio_import_ext(&src.display().to_string()))
+        .ok_or_else(|| "対応していない音声形式です（.mp3 .wav）".to_string())?;
+
+    if ext == "wav" {
+        match read_wav_mono_f32(src) {
+            Ok((mono, rate)) => return Ok(resample_to_16k(&mono, rate)),
+            Err(e) => eprintln!("[import-asr] WAV header not readable ({e}); using ffmpeg"),
+        }
+    }
+
+    let dir = import_asr_dir()?;
+    let wav = dir.join(format!("src_{}.wav", uuid::Uuid::new_v4()));
+    convert_to_wav_16k_mono(settings, src, &wav)?;
+    let result = read_wav_mono_f32(&wav).map(|(mono, rate)| resample_to_16k(&mono, rate));
+    let _ = fs::remove_file(&wav);
+    result
 }

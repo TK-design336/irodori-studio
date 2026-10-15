@@ -14,7 +14,7 @@ import type {
   Project,
   SpeakerInfo,
 } from "./types";
-import { isIrodoriV4 } from "./types";
+import { isIrodoriV4, isMeanflowSettings } from "./types";
 import { applyAppearance } from "./lib/accent";
 import "./App.css";
 
@@ -300,7 +300,11 @@ function App() {
           hidden={tab !== "live"}
           aria-hidden={tab !== "live"}
         >
-          <LiveView speakers={speakers} settings={settings} />
+          <LiveView
+            speakers={speakers}
+            settings={settings}
+            onSettingsChange={setSettings}
+          />
         </div>
         <div
           className="tab-panel"
@@ -311,6 +315,7 @@ function App() {
             speakers={speakers}
             onSpeakersChanged={refreshSpeakers}
             isV4={isIrodoriV4(settings)}
+            meanflow={isMeanflowSettings(settings)}
           />
         </div>
         <div

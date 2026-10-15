@@ -4,17 +4,22 @@ type Props = {
   /** 1-based line number (odd → 奇数行適用, even → 偶数行適用) */
   lineNumber: number;
   disabled?: boolean;
+  /** この行で直前に選んでいた話者名。未変更なら null */
+  formerSpeakerLabel: string | null;
   onApplyAll: () => void;
   onApplyParity: () => void;
   onApplyFromHere: () => void;
+  onApplyFormerSpeaker: () => void;
 };
 
 export function SpeakerApplyMenu({
   lineNumber,
   disabled,
+  formerSpeakerLabel,
   onApplyAll,
   onApplyParity,
   onApplyFromHere,
+  onApplyFormerSpeaker,
 }: Props) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -87,6 +92,26 @@ export function SpeakerApplyMenu({
             }}
           >
             以降の行に適用
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={formerSpeakerLabel == null}
+            title={
+              formerSpeakerLabel == null
+                ? "この行の話者を変更すると使えます"
+                : `変更前の話者「${formerSpeakerLabel}」の行に、今の話者を適用`
+            }
+            onClick={(e) => {
+              e.stopPropagation();
+              if (formerSpeakerLabel == null) return;
+              setOpen(false);
+              onApplyFormerSpeaker();
+            }}
+          >
+            {formerSpeakerLabel == null
+              ? "変更前の話者と同一の行に適用"
+              : `変更前「${formerSpeakerLabel}」と同一の行に適用`}
           </button>
         </div>
       )}

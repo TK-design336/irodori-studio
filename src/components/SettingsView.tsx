@@ -21,6 +21,9 @@ import {
   DEFAULT_VOCAL_SEPARATOR_MODEL,
   sliceReviewSettings,
   generateCompactLinesOf,
+  importAsrBreakOf,
+  asrModelOf,
+  v4ModelOf,
 } from "../types";
 import {
   DEFAULT_EXPORT_FILENAME_PARTS,
@@ -126,6 +129,36 @@ function AccentSwatchRow({
   );
 }
 
+function applyInferredPaths(
+  draft: AppSettings,
+  inferred: InferredPaths,
+  ver: IrodoriVersion,
+  model: "rf" | "mf",
+): AppSettings {
+  if (ver === "v4" && model === "mf") {
+    return {
+      ...draft,
+      v4Model: "mf",
+      checkpointV4Mf: inferred.checkpointPath,
+      pathsV4: {
+        ...draft.pathsV4,
+        irodoriRoot: inferred.irodoriRoot,
+        outputsRoot: inferred.outputsRoot,
+        pythonExe: inferred.pythonExe,
+      },
+    };
+  }
+  const next: VersionPathSettings = {
+    irodoriRoot: inferred.irodoriRoot,
+    outputsRoot: inferred.outputsRoot,
+    pythonExe: inferred.pythonExe,
+    checkpointPath: inferred.checkpointPath,
+  };
+  return ver === "v4"
+    ? { ...draft, v4Model: "rf", pathsV4: next }
+    : { ...draft, pathsV3: next };
+}
+
 export function SettingsView({
   settings,
   validation,
@@ -222,18 +255,14 @@ export function SettingsView({
     ).irodoriRoot.trim();
     if (!root) return;
     let cancelled = false;
-    void invoke<InferredPaths>("infer_engine_paths", { root, version: ver })
+    void invoke<InferredPaths>("infer_engine_paths", {
+      root,
+      version: ver,
+      v4Model: ver === "v4" ? v4ModelOf(settings) : "rf",
+    })
       .then((inferred) => {
         if (cancelled) return;
-        setDraft((d) => {
-          const next: VersionPathSettings = {
-            irodoriRoot: inferred.irodoriRoot,
-            outputsRoot: inferred.outputsRoot,
-            pythonExe: inferred.pythonExe,
-            checkpointPath: inferred.checkpointPath,
-          };
-          return ver === "v4" ? { ...d, pathsV4: next } : { ...d, pathsV3: next };
-        });
+        setDraft((d) => applyInferredPaths(d, inferred, ver, v4ModelOf(d)));
       })
       .catch((e) => {
         if (!cancelled) setMsg(String(e));
@@ -244,7 +273,12 @@ export function SettingsView({
   }, [firstSetup]);
 
   const version = normalizeVersion(draft.irodoriVersion);
+  const v4Model = v4ModelOf(draft);
   const editingPaths = version === "v4" ? draft.pathsV4 : draft.pathsV3;
+  const checkpointValue =
+    version === "v4" && v4Model === "mf"
+      ? (draft.checkpointV4Mf ?? "")
+      : editingPaths.checkpointPath;
   const settingsDirty = useMemo(
     () => JSON.stringify(draft) !== JSON.stringify(settings),
     [draft, settings],
@@ -255,6 +289,8 @@ export function SettingsView({
         irodoriVersion: draft.irodoriVersion,
         pathsV3: draft.pathsV3,
         pathsV4: draft.pathsV4,
+        v4Model: draft.v4Model,
+        checkpointV4Mf: draft.checkpointV4Mf,
         modelPrecision: draft.modelPrecision,
         codecPrecision: draft.codecPrecision,
         modelDevice: draft.modelDevice,
@@ -265,6 +301,8 @@ export function SettingsView({
         irodoriVersion: settings.irodoriVersion,
         pathsV3: settings.pathsV3,
         pathsV4: settings.pathsV4,
+        v4Model: settings.v4Model,
+        checkpointV4Mf: settings.checkpointV4Mf,
         modelPrecision: settings.modelPrecision,
         codecPrecision: settings.codecPrecision,
         modelDevice: settings.modelDevice,
@@ -372,6 +410,9 @@ export function SettingsView({
   const setPath = (key: PathKey, value: string) => {
     setDraft((d) => {
       const ver = normalizeVersion(d.irodoriVersion);
+      if (ver === "v4" && key === "checkpointPath" && v4ModelOf(d) === "mf") {
+        return { ...d, checkpointV4Mf: value };
+      }
       if (ver === "v4") {
         return { ...d, pathsV4: { ...d.pathsV4, [key]: value } };
       }
@@ -379,22 +420,42 @@ export function SettingsView({
     });
   };
 
+  const setV4Model = (next: "rf" | "mf") => {
+    if (v4ModelOf(draft) === next) return;
+    void (async () => {
+      let merged: AppSettings = { ...draft, v4Model: next };
+      const root = merged.pathsV4.irodoriRoot.trim();
+      const ckpt =
+        next === "mf"
+          ? (merged.checkpointV4Mf ?? "").trim()
+          : merged.pathsV4.checkpointPath.trim();
+      if (!ckpt && root) {
+        try {
+          const inferred = await invoke<InferredPaths>("infer_engine_paths", {
+            root,
+            version: "v4",
+            v4Model: next,
+          });
+          merged = applyInferredPaths(merged, inferred, "v4", next);
+        } catch (e) {
+          setMsg(String(e));
+        }
+      }
+      setDraft(merged);
+      if (firstSetup) return;
+      await persist(
+        merged,
+        next === "mf" ? "v4.1 MF に切り替えました" : "v4.1 に切り替えました",
+      );
+    })();
+  };
+
   const applyInferred = (
     inferred: InferredPaths,
     ver: IrodoriVersion = version,
+    model: "rf" | "mf" = v4ModelOf(draft),
   ) => {
-    setDraft((d) => {
-      const next: VersionPathSettings = {
-        irodoriRoot: inferred.irodoriRoot,
-        outputsRoot: inferred.outputsRoot,
-        pythonExe: inferred.pythonExe,
-        checkpointPath: inferred.checkpointPath,
-      };
-      if (ver === "v4") {
-        return { ...d, pathsV4: next };
-      }
-      return { ...d, pathsV3: next };
-    });
+    setDraft((d) => applyInferredPaths(d, inferred, ver, model));
     const notes: string[] = [];
     if (!inferred.pythonFound) notes.push("Python が見つかりませんでした（手修正可）");
     if (!inferred.checkpointFound) notes.push("Checkpoint が見つかりませんでした（手修正可）");
@@ -404,6 +465,7 @@ export function SettingsView({
   const inferFromRoot = async (
     root: string,
     ver: IrodoriVersion = version,
+    model: "rf" | "mf" = v4ModelOf(draft),
   ) => {
     const trimmed = root.trim();
     if (!trimmed) return;
@@ -411,8 +473,9 @@ export function SettingsView({
       const inferred = await invoke<InferredPaths>("infer_engine_paths", {
         root: trimmed,
         version: ver,
+        v4Model: ver === "v4" ? model : "rf",
       });
-      applyInferred(inferred, ver);
+      applyInferred(inferred, ver, model);
     } catch (e) {
       setPath("irodoriRoot", trimmed);
       setMsg(String(e));
@@ -548,6 +611,36 @@ export function SettingsView({
               まず Irodori-TTS のインストールフォルダを指定してください。Outputs・Python・Checkpoint はそこから自動で探します。
             </p>
           )}
+          {version === "v4" && (
+            <>
+              <div className="profile-kind-tabs" role="tablist" aria-label="v4モデル">
+                <button
+                  type="button"
+                  role="tab"
+                  className={v4Model === "rf" ? "active" : ""}
+                  aria-selected={v4Model === "rf"}
+                  disabled={busy}
+                  onClick={() => setV4Model("rf")}
+                >
+                  v4.1
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  className={v4Model === "mf" ? "active" : ""}
+                  aria-selected={v4Model === "mf"}
+                  disabled={busy}
+                  onClick={() => setV4Model("mf")}
+                >
+                  v4.1 MF
+                </button>
+              </div>
+              <p className="hint">
+                チェックポイントだけ別です。ルートと学習済みの話者はそのまま使えます。
+                切り替えた時点で保存されます。
+              </p>
+            </>
+          )}
           {PATH_FIELDS.map(([key, label, isDir]) => (
             <label key={`${version}-${key}`}>
               {label}
@@ -558,12 +651,14 @@ export function SettingsView({
               ) : null}
               {key === "checkpointPath" ? (
                 <span className="hint">
-                  Hugging Face キャッシュ（.cache/huggingface/hub/models--Aratako--…/snapshots/リビジョン/model.safetensors）を優先します。v4 は v4.1 を先に探します。
+                  {version === "v4" && v4Model === "mf"
+                    ? "v4.1 MF のチェックポイントを探します。"
+                    : "Hugging Face キャッシュ（.cache/huggingface/hub/models--Aratako--…/snapshots/リビジョン/model.safetensors）を優先します。v4 は v4.1 を先に探します。"}
                 </span>
               ) : null}
               <div className="row">
                 <input
-                  value={editingPaths[key]}
+                  value={key === "checkpointPath" ? checkpointValue : editingPaths[key]}
                   onChange={(e) => setPath(key, e.target.value)}
                   onBlur={(e) => {
                     if (key === "irodoriRoot") void inferFromRoot(e.currentTarget.value);
@@ -678,6 +773,14 @@ export function SettingsView({
               />
               <Flag ok={validation.pythonOk} label="Python exe" />
               <Flag ok={validation.checkpointOk} label="Checkpoint" />
+              {version === "v4" &&
+                v4Model === "mf" &&
+                validation.modelSupported === false && (
+                  <Flag
+                    ok={false}
+                    label="このチェックポイントには、いまの Irodori では対応していません"
+                  />
+                )}
               <Flag ok={validation.outputsOk} label="Outputs" />
               <Flag
                 ok={validation.trainConfigOk !== false}
@@ -1019,6 +1122,54 @@ export function SettingsView({
                   Math.min(1, Math.max(0, Number(e.target.value) || 0)),
                 )
               }
+            />
+          </label>
+
+          <label>
+            認識モデル
+            <span className="hint">
+              ライブの聞き取りと、音声からのテキスト追加で使います。
+            </span>
+            <BoundedSelect
+              value={asrModelOf(draft)}
+              options={[
+                { value: "reazonspeech", label: "ReazonSpeech" },
+                { value: "parakeet", label: "Parakeet" },
+              ]}
+              onChange={(v) =>
+                setShared(
+                  "asrModel",
+                  v === "parakeet" ? "parakeet" : "reazonspeech",
+                )
+              }
+              aria-label="認識モデル"
+            />
+          </label>
+
+          <label>
+            音声インポートの区切り
+            <span className="hint">
+              テキスト追加で音声を文字起こししたときの句読点と改行です。
+            </span>
+            <BoundedSelect
+              value={importAsrBreakOf(draft)}
+              options={[
+                {
+                  value: "phrase",
+                  label: "短い間は読点（、）、長い間は句点（。）と改行",
+                },
+                {
+                  value: "sentence",
+                  label: "間ごとに句点（。）と改行（旧方式）",
+                },
+              ]}
+              onChange={(v) =>
+                setShared(
+                  "importAsrBreak",
+                  v === "sentence" ? "sentence" : "phrase",
+                )
+              }
+              aria-label="音声インポートの区切り"
             />
           </label>
 

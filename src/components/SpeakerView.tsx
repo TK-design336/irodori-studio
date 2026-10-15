@@ -18,6 +18,7 @@ type Props = {
   speakers: SpeakerInfo[];
   onSpeakersChanged: () => void;
   isV4: boolean;
+  meanflow?: boolean;
 };
 
 type ProfileKind = "ref" | "caption";
@@ -73,7 +74,7 @@ function addUniqueTag(tags: string[], raw: string): string[] {
   return [...tags, tag];
 }
 
-export function SpeakerView({ speakers, onSpeakersChanged, isV4 }: Props) {
+export function SpeakerView({ speakers, onSpeakersChanged, isV4, meanflow = false }: Props) {
   // ── 折りたたみ状態 ──
   const [manageCollapsed, setManageCollapsed] = useState(false);
   const [blendCollapsed, setBlendCollapsed] = useState(false);
@@ -549,7 +550,7 @@ export function SpeakerView({ speakers, onSpeakersChanged, isV4 }: Props) {
         projectName: "_blend_preview",
         lineId: "check",
       });
-      const s = defaultSampling();
+      const s = defaultSampling(meanflow);
       await invoke("synthesize_line", {
         args: {
           text,

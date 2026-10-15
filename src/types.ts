@@ -17,6 +17,9 @@ export type ExportFilenamePart =
   | "utterance";
 
 export type ExportAudioFormat = "wav" | "mp3" | "opus";
+export type ImportAsrBreak = "phrase" | "sentence";
+
+export type AsrModel = "reazonspeech" | "parakeet";
 
 /** Slice review pipeline mode: skip / manual (default) / auto. */
 export type SliceReviewMode = "skip" | "manual" | "auto";
@@ -61,8 +64,6 @@ export type SliceReviewSettings = {
   autoKeepMax?: number;
   /** Non-generative WPE / tilt / denoise on sliced clips before review. */
   autoFix: SliceAutoFixSettings;
-  /** Cluster sliced clips by speaker (multi-speaker sources). */
-  diarizeEnabled?: boolean;
 };
 
 export type SliceAutoFixSettings = {
@@ -117,7 +118,6 @@ export const DEFAULT_SLICE_REVIEW: SliceReviewSettings = {
   autoRemovePercent: 0,
   autoKeepMax: 0,
   autoFix: { ...DEFAULT_SLICE_AUTO_FIX },
-  diarizeEnabled: false,
 };
 
 export function sliceReviewSettings(
@@ -149,12 +149,17 @@ export function sliceReviewSettings(
       : 0,
     autoKeepMax: Number.isFinite(keep) ? Math.max(0, Math.floor(keep)) : 0,
     autoFix: sliceAutoFixSettings(raw.autoFix),
-    diarizeEnabled: raw.diarizeEnabled === true,
   };
 }
 
+export type V4Model = "rf" | "mf";
+
 export type AppSettings = {
   irodoriVersion: IrodoriVersion | string;
+  /** v4 checkpoint family. `rf` is v4.1; `mf` is v4.1 MF. */
+  v4Model?: V4Model | string;
+  /** Checkpoint used when `v4Model` is `mf`. RF stays on `pathsV4.checkpointPath`. */
+  checkpointV4Mf?: string;
   pathsV3: VersionPathSettings;
   pathsV4: VersionPathSettings;
   modelPrecision: string;
@@ -188,6 +193,17 @@ export type AppSettings = {
   exportOpusBitrateKbps?: number;
   /** CER above this → transcription-verify warning (0–1). */
   asrCerWarnThreshold?: number;
+  /**
+   * Audio import transcription breaks.
+   * `phrase`: short pause → `、` on the same line; long pause → `。` + newline.
+   * `sentence`: every pause → `。` + newline (legacy).
+   */
+  importAsrBreak?: ImportAsrBreak;
+  /**
+   * Native recognizer for live dictation and audio import.
+   * `reazonspeech` (default) or `parakeet`.
+   */
+  asrModel?: AsrModel;
   /** Gacha batch size per row (3–9). */
   gachaCount?: number;
   /** audio-separator model filename for optional vocal separation. */
@@ -237,6 +253,14 @@ export function clampCandidateCount(n: number | null | undefined): number {
   return Math.min(MAX_LINE_VARIANTS, Math.max(1, Math.floor(n)));
 }
 
+export function importAsrBreakOf(settings: AppSettings): ImportAsrBreak {
+  return settings.importAsrBreak === "sentence" ? "sentence" : "phrase";
+}
+
+export function asrModelOf(settings: AppSettings): AsrModel {
+  return settings.asrModel === "parakeet" ? "parakeet" : "reazonspeech";
+}
+
 export function asrCerWarnThreshold(settings: AppSettings): number {
   const v = settings.asrCerWarnThreshold;
   return typeof v === "number" && Number.isFinite(v) ? v : 0.15;
@@ -255,6 +279,15 @@ export function activePaths(settings: AppSettings): VersionPathSettings {
 
 export function isIrodoriV4(settings: AppSettings): boolean {
   return settings.irodoriVersion === "v4";
+}
+
+export function v4ModelOf(settings: AppSettings): V4Model {
+  return String(settings.v4Model ?? "rf").toLowerCase() === "mf" ? "mf" : "rf";
+}
+
+/** Selected v4 checkpoint is the 4-step model. */
+export function isMeanflowSettings(settings: AppSettings): boolean {
+  return isIrodoriV4(settings) && v4ModelOf(settings) === "mf";
 }
 
 export type InferredPaths = {
@@ -277,6 +310,7 @@ export type PathValidation = {
   trainConfigOk?: boolean;
   studioScriptsOk?: boolean;
   studioPythonDir?: string | null;
+  modelSupported?: boolean;
 };
 
 /** `"trained" | "blend" | "ref" | "caption"` */
@@ -409,6 +443,8 @@ export type ProjectLine = {
   generatedCfgScaleCaption?: number | null;
   volume: number;
   speed: number;
+  /** Pitch shift in semitones. Missing or 0 = unchanged. Duration stays the same. */
+  pitch?: number;
   /** Post-generation tone / denoise. Missing → all off. */
   audioFx?: AudioFx;
   /** Pad / fade between clips on concat / playback. Trim is per-variant. */
@@ -498,6 +534,16 @@ export function clipEditIsIdentity(edit: ClipEdit): boolean {
     clipNum(edit.fadeInSec) < 0.001 &&
     clipNum(edit.fadeOutSec) < 0.001
   );
+}
+
+/** Semitones, clamped to one octave either way. */
+export function linePitch(
+  line: { pitch?: number | null } | null | undefined,
+): number {
+  const v = line?.pitch;
+  if (typeof v !== "number" || !Number.isFinite(v)) return 0;
+  const clamped = Math.min(12, Math.max(-12, v));
+  return Math.round(clamped * 10) / 10;
 }
 
 export function audioFxActive(fx: AudioFx): boolean {
@@ -660,8 +706,8 @@ export type Project = {
   defaultSampling: SamplingParams;
 };
 
-export const defaultSampling = (): SamplingParams => ({
-  numSteps: 40,
+export const defaultSampling = (meanflow = false): SamplingParams => ({
+  numSteps: meanflow ? 4 : 40,
   numCandidates: 1,
   multiGenerateMode: "candidates",
   seed: null,

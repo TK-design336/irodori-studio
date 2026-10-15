@@ -138,6 +138,9 @@ pub struct ProjectLine {
     pub generated_cfg_scale_caption: Option<f64>,
     pub volume: f64,
     pub speed: f64,
+    /// Pitch shift in semitones. Missing in old projects → 0 (unchanged).
+    #[serde(default)]
+    pub pitch: f64,
     /// Post-generation tone / denoise. Missing in old projects → all off.
     #[serde(default)]
     pub audio_fx: AudioFx,

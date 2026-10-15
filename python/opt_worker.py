@@ -191,6 +191,21 @@ def respond(ok: bool, **payload: Any) -> None:
     sys.stdout.flush()
 
 
+def _flow_parameterization() -> str:
+    cfg = getattr(RUNTIME, "model_cfg", None)
+    if cfg is None:
+        return ""
+    return str(getattr(cfg, "flow_parameterization", "") or "")
+
+
+def _is_meanflow() -> bool:
+    return _flow_parameterization() == "meanflow"
+
+
+def _default_num_steps() -> int:
+    return 4 if _is_meanflow() else 40
+
+
 def handle_load(req: dict[str, Any]) -> None:
     global RUNTIME
     key = RuntimeKey(
@@ -203,12 +218,64 @@ def handle_load(req: dict[str, Any]) -> None:
         compile_model=False,
         compile_dynamic=False,
     )
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    RUNTIME = InferenceRuntime.from_key(key)
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    respond(True, status="loaded", checkpoint=key.checkpoint)
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        RUNTIME = InferenceRuntime.from_key(key)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        meanflow = _is_meanflow()
+        respond(
+            True,
+            status="loaded",
+            checkpoint=key.checkpoint,
+            meanflow=meanflow,
+            default_num_steps=4 if meanflow else 40,
+        )
+    except Exception as exc:
+        text = str(exc).lower()
+        if "meanflow" in text or "flow_parameterization" in text:
+            respond(False, error="このチェックポイントには、いまの Irodori では対応していません")
+            return
+        raise
+
+
+def handle_encode_refs(req: dict[str, Any]) -> None:
+    """Encode reference WAVs once. Missing codec API reports encode_unsupported."""
+    if RUNTIME is None:
+        respond(False, error="encode_unsupported")
+        return
+    import inspect as _inspect
+    _sr_params = set(_inspect.signature(SamplingRequest).parameters)
+    if "ref_latent" not in _sr_params and "ref_latents" not in _sr_params:
+        respond(False, error="encode_unsupported")
+        return
+    codec = getattr(RUNTIME, "codec", None)
+    encode = getattr(codec, "encode_waveform", None) if codec is not None else None
+    if not callable(encode):
+        respond(False, error="encode_unsupported")
+        return
+    wavs = req.get("wavs")
+    outs = req.get("outs")
+    if not isinstance(wavs, list) or not isinstance(outs, list) or len(wavs) != len(outs) or not wavs:
+        respond(False, error="encode_unsupported")
+        return
+    try:
+        normalize_db = getattr(RUNTIME, "normalize_db", None)
+        ensure_max = bool(getattr(RUNTIME, "ensure_max", True))
+        saved: list[str] = []
+        for wav, out in zip(wavs, outs):
+            audio, sr = _load_audio(str(wav))
+            if audio.ndim == 1:
+                audio = audio.unsqueeze(0)
+            piece = encode(audio.unsqueeze(0), int(sr), normalize_db, ensure_max).cpu()
+            path = Path(str(out))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(piece, path)
+            saved.append(str(path))
+        respond(True, status="encoded", latents=saved)
+    except Exception:
+        respond(False, error="encode_unsupported")
 
 
 def handle_synthesize(req: dict[str, Any]) -> None:
@@ -242,10 +309,6 @@ def handle_synthesize(req: dict[str, Any]) -> None:
     # For back-compat: keep ref_wav as primary (first) entry.
     ref_wav = ref_wavs[0] if ref_wavs else None
 
-    no_ref = bool(req.get("no_ref", False))
-    if caption is not None and not ref_embed and not ref_wav:
-        no_ref = True
-
     out_paths: list[Path] = []
     raw_list = req.get("output_wavs")
     if isinstance(raw_list, list):
@@ -267,21 +330,46 @@ def handle_synthesize(req: dict[str, Any]) -> None:
         text=str(req["text"]),
         caption=caption,
         ref_embed=ref_embed,
-        no_ref=no_ref,
+        no_ref=False,
     )
     import inspect as _inspect
     _sr_params = set(_inspect.signature(SamplingRequest).parameters)
-    if "ref_wavs" in _sr_params and ref_wavs:
+    ref_latents_raw = req.get("ref_latents")
+    ref_latent_raw = req.get("ref_latent")
+    ref_latents: list[str] | None = None
+    if isinstance(ref_latents_raw, list):
+        converted_latents = [str(p) for p in ref_latents_raw if p and str(p).strip()]
+        ref_latents = converted_latents or None
+    ref_latent = (
+        str(ref_latent_raw).strip()
+        if ref_latent_raw not in (None, "", "null")
+        else None
+    )
+    no_ref = bool(req.get("no_ref", False))
+    if caption is not None and not ref_embed and not ref_wav and not ref_latents and not ref_latent:
+        no_ref = True
+    sr_kwargs["no_ref"] = no_ref
+    if "ref_latents" in _sr_params and ref_latents:
+        sr_kwargs["ref_latents"] = ref_latents
+    elif "ref_latent" in _sr_params and ref_latent:
+        sr_kwargs["ref_latent"] = ref_latent
+    elif "ref_wavs" in _sr_params and ref_wavs:
         sr_kwargs["ref_wavs"] = ref_wavs
     elif ref_wav:
         sr_kwargs["ref_wav"] = ref_wav
+
+    raw_steps = req.get("num_steps", None)
+    if raw_steps in (None, "", "null"):
+        num_steps = _default_num_steps()
+    else:
+        num_steps = int(raw_steps)
 
     sampling = SamplingRequest(
         **sr_kwargs,
         num_candidates=num_candidates,
         seconds=seconds,
         duration_scale=float(req.get("duration_scale", 1.0)),
-        num_steps=int(req.get("num_steps", 40)),
+        num_steps=num_steps,
         cfg_scale_text=float(req.get("cfg_scale_text", 3.0)),
         cfg_scale_caption=float(req.get("cfg_scale_caption", 3.0)),
         cfg_scale_speaker=float(req.get("cfg_scale_speaker", 5.0)),
@@ -355,6 +443,8 @@ def main() -> int:
                 respond(True, status="pong", loaded=RUNTIME is not None)
             elif cmd == "load":
                 handle_load(req)
+            elif cmd == "encode_refs":
+                handle_encode_refs(req)
             elif cmd == "synthesize":
                 # Echo received text for debugging (first 40 chars)
                 text_preview = str(req.get("text", ""))[:40]

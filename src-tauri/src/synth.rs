@@ -4,7 +4,7 @@ use crate::dictionary::prepare_synth_text;
 use crate::settings::{studio_python_dir, AppSettings};
 use crate::speakers::SpeakerInfo;
 use crate::split_text::{normalize_max_chars_from_settings, prepare_chunks};
-use crate::worker::OptWorkerSimple;
+use crate::worker::{load_failure_message, OptWorkerSimple};
 use crate::{
     export_wav_adjusted_inner, export_wavs_concatenated_inner, studio_cache_dir, ExportAudioFormat,
     WavExportSeg,
@@ -12,7 +12,7 @@ use crate::{
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct UtteranceSynthOpts {
@@ -78,11 +78,12 @@ fn synthesize_chunks_inner(
 ) -> Result<(), String> {
     let silence_secs = opts.silence_ms as f64 / 1000.0;
     let dest_str = dest_wav.display().to_string();
+    let num_steps = http_default_steps(settings, worker)?;
 
     if chunks.len() == 1 {
         let chunk_path = work_dir.join("0000.wav");
         let chunk_str = chunk_path.display().to_string();
-        let args = args_for_speaker(&chunks[0], speaker, chunk_str)?;
+        let args = args_for_speaker(&chunks[0], speaker, chunk_str, num_steps)?;
         synthesize_with_worker(settings, worker, args)?;
         let vol_ok = (opts.volume - 1.0).abs() < 0.001;
         let spd_ok = (opts.speed - 1.0).abs() < 0.001;
@@ -96,6 +97,7 @@ fn synthesize_chunks_inner(
             dest_str,
             opts.volume,
             opts.speed,
+            0.0,
             &Default::default(),
             ExportAudioFormat::Wav,
             None,
@@ -107,7 +109,7 @@ fn synthesize_chunks_inner(
     for (i, chunk) in chunks.iter().enumerate() {
         let chunk_path = work_dir.join(format!("{i:04}.wav"));
         let chunk_str = chunk_path.display().to_string();
-        let args = args_for_speaker(chunk, speaker, chunk_str)?;
+        let args = args_for_speaker(chunk, speaker, chunk_str, num_steps)?;
         synthesize_with_worker(settings, worker, args)?;
         seg_paths.push(chunk_path.display().to_string());
     }
@@ -118,6 +120,7 @@ fn synthesize_chunks_inner(
             src: p.clone(),
             volume: opts.volume,
             speed: opts.speed,
+            pitch: 0.0,
             audio_fx: Default::default(),
             clip_edit: None,
         })
@@ -194,10 +197,10 @@ pub struct SynthesizeArgs {
     pub cfg_scale_speaker: f64,
 }
 
-/// Default sampling used by the HTTP API (matches Studio `defaultSampling()`).
-pub fn default_http_sampling() -> (u32, f64, String, f64, String, f64, f64, f64) {
+/// Default sampling used by the HTTP API. Step count follows the loaded model.
+pub fn default_http_sampling(num_steps: u32) -> (u32, f64, String, f64, String, f64, f64, f64) {
     (
-        40,                 // num_steps
+        num_steps,
         1.0,                // duration_scale
         "linear".into(),    // t_schedule_mode
         -1.0,               // sway_coeff
@@ -209,10 +212,28 @@ pub fn default_http_sampling() -> (u32, f64, String, f64, String, f64, f64, f64)
 }
 
 /// Build synthesize args from speaker profile + text (HTTP / batch jobs).
+fn http_default_steps(
+    settings: &AppSettings,
+    worker: &Mutex<OptWorkerSimple>,
+) -> Result<u32, String> {
+    let python_dir = studio_python_dir()?;
+    let mut worker = worker.lock();
+    let _ = worker.ensure_alive();
+    worker.start(settings, &python_dir)?;
+    if !worker.is_loaded() {
+        let resp = worker.load(settings)?;
+        if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            return Err(load_failure_message(&resp));
+        }
+    }
+    Ok(worker.default_num_steps())
+}
+
 pub fn args_for_speaker(
     text: &str,
     speaker: &SpeakerInfo,
     output_wav: String,
+    num_steps: u32,
 ) -> Result<SynthesizeArgs, String> {
     let (
         num_steps,
@@ -223,7 +244,7 @@ pub fn args_for_speaker(
         cfg_scale_text,
         cfg_scale_caption,
         cfg_scale_speaker,
-    ) = default_http_sampling();
+    ) = default_http_sampling(num_steps);
 
     let mut args = SynthesizeArgs {
         text: text.to_string(),
@@ -326,7 +347,7 @@ pub fn synthesize_with_worker(
     if !worker.is_loaded() {
         let resp = worker.load(settings)?;
         if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            return Err(format!("load failed: {resp}"));
+            return Err(load_failure_message(&resp));
         }
     }
 
@@ -345,7 +366,21 @@ pub fn synthesize_with_worker(
                 .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
         })
-        .filter(|v| !v.is_empty());
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            args.ref_wav
+                .as_ref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(|s| vec![s])
+        });
+    let ref_latents = if ref_embed.is_none() {
+        ref_wavs.as_ref().and_then(|wavs| resolve_ref_latents(settings, &mut worker, wavs))
+    } else {
+        None
+    };
+    let ref_wavs = if ref_latents.is_some() { None } else { ref_wavs };
+
     let ref_wav = if ref_wavs.is_none() {
         args.ref_wav
             .as_ref()
@@ -361,7 +396,10 @@ pub fn synthesize_with_worker(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let has_ref = ref_embed.is_some() || ref_wav.is_some() || ref_wavs.is_some();
+    let has_ref = ref_embed.is_some()
+        || ref_wav.is_some()
+        || ref_wavs.is_some()
+        || ref_latents.is_some();
     let no_ref = args.no_ref.unwrap_or(false) || (caption.is_some() && !has_ref);
 
     if !has_ref && !no_ref {
@@ -388,7 +426,12 @@ pub fn synthesize_with_worker(
     if let Some(ref embed) = ref_embed {
         payload["ref_embed"] = json!(embed);
     }
-    if let Some(ref wavs) = ref_wavs {
+    if let Some(ref lats) = ref_latents {
+        if lats.len() == 1 {
+            payload["ref_latent"] = json!(lats[0]);
+        }
+        payload["ref_latents"] = json!(lats);
+    } else if let Some(ref wavs) = ref_wavs {
         payload["ref_wavs"] = json!(wavs);
         payload["ref_wav"] = json!(wavs[0]);
     } else if let Some(ref wav) = ref_wav {
@@ -435,11 +478,74 @@ pub fn synthesize_with_worker(
             let load_resp = worker.load(settings)?;
             if load_resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
                 return Err(format!(
-                    "再起動後のロードに失敗: {load_resp}（初回エラー: {first_err}）"
+                    "再起動後のロードに失敗: {}（初回エラー: {first_err}）",
+                    load_failure_message(&load_resp)
                 ));
             }
             try_once(&mut worker, payload)
                 .map_err(|e| format!("再試行も失敗: {e}（初回エラー: {first_err}）"))
         }
+    }
+}
+
+fn ref_latent_cache_dir(settings: &AppSettings) -> PathBuf {
+    PathBuf::from(settings.outputs_root())
+        .join("_profiles")
+        .join("ref_latents")
+}
+
+fn latent_path_for(dir: &Path, wav: &str) -> Option<PathBuf> {
+    let path = Path::new(wav);
+    if !path.is_file() {
+        return None;
+    }
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let len = meta.len();
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in wav.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Some(dir.join(format!("{hash:016x}-{mtime}-{len}.pt")))
+}
+
+/// Reuse encoded reference files beside speaker data. `None` keeps the WAV path.
+fn resolve_ref_latents(
+    settings: &AppSettings,
+    worker: &mut OptWorkerSimple,
+    wavs: &[String],
+) -> Option<Vec<String>> {
+    if wavs.is_empty() {
+        return None;
+    }
+    let dir = ref_latent_cache_dir(settings);
+    let mut planned = Vec::with_capacity(wavs.len());
+    for wav in wavs {
+        planned.push(latent_path_for(&dir, wav)?);
+    }
+    let mut need_wavs = Vec::new();
+    let mut need_outs = Vec::new();
+    for (wav, out) in wavs.iter().zip(planned.iter()) {
+        if !out.is_file() {
+            need_wavs.push(wav.clone());
+            need_outs.push(out.display().to_string());
+        }
+    }
+    if !need_wavs.is_empty() {
+        let encoded = worker.encode_refs(&need_wavs, &need_outs).unwrap_or(false);
+        if !encoded {
+            return None;
+        }
+    }
+    if planned.iter().all(|p| p.is_file()) {
+        Some(planned.into_iter().map(|p| p.display().to_string()).collect())
+    } else {
+        None
     }
 }

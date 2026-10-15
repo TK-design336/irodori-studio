@@ -9,14 +9,17 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::{fs::File, io::AsyncWriteExt};
 
-use crate::native_asr::config::NativeAsrConfig;
-use crate::native_asr::model::SherpaOnnxTransducerModelFiles;
+use crate::native_asr::config::{AsrModel, NativeAsrConfig};
+use crate::native_asr::model::{SherpaOnnxParakeetModelFiles, SherpaOnnxTransducerModelFiles};
 
 const VAD_MODEL_URL: &str =
     "https://github.com/snakers4/silero-vad/raw/refs/tags/v6.0/src/silero_vad/data/silero_vad.onnx";
 const ASR_MODEL_BASE_URL: &str =
     "https://huggingface.co/reazon-research/reazonspeech-k2-v2/resolve/main";
 const ASR_MODEL_DIR_NAME_JA: &str = "sherpa-onnx-zipformer-ja-reazonspeech-2024-08-01";
+const PARAKEET_MODEL_BASE_URL: &str =
+    "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8/resolve/main";
+const PARAKEET_MODEL_DIR_NAME: &str = "sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelStatus {
@@ -93,8 +96,12 @@ pub fn vad_model_path(handle: &AppHandle, config: &NativeAsrConfig) -> Result<Pa
     Ok(vad_model_path_from_root(&resolve_models_base(handle, config)?))
 }
 
-pub fn default_asr_model_dir_from_root(root: &Path) -> PathBuf {
-    root.join(ASR_MODEL_DIR_NAME_JA)
+pub fn default_asr_model_dir_from_root(root: &Path, model: AsrModel) -> PathBuf {
+    let name = match model {
+        AsrModel::Reazonspeech => ASR_MODEL_DIR_NAME_JA,
+        AsrModel::Parakeet => PARAKEET_MODEL_DIR_NAME,
+    };
+    root.join(name)
 }
 
 pub fn asr_model_dir(handle: &AppHandle, config: &NativeAsrConfig) -> Result<PathBuf> {
@@ -109,7 +116,7 @@ pub fn asr_model_dir_from_root(root: &Path, config: &NativeAsrConfig) -> PathBuf
         .filter(|path| !path.is_empty())
     {
         Some(path) => PathBuf::from(path),
-        None => default_asr_model_dir_from_root(root),
+        None => default_asr_model_dir_from_root(root, config.asr_model),
     }
 }
 
@@ -164,14 +171,25 @@ pub async fn ensure_models_downloaded(
     let asr_path = asr_model_dir_from_root(&root, config);
     fs::create_dir_all(&asr_path)
         .with_context(|| format!("Failed to create ASR model dir: {}", asr_path.display()))?;
-    for file_name in SherpaOnnxTransducerModelFiles::required_file_names(config.asr_precision) {
+    let (base_url, file_names): (&str, Vec<&str>) = match config.asr_model {
+        AsrModel::Reazonspeech => (
+            ASR_MODEL_BASE_URL,
+            SherpaOnnxTransducerModelFiles::required_file_names(config.asr_precision)
+                .to_vec(),
+        ),
+        AsrModel::Parakeet => (
+            PARAKEET_MODEL_BASE_URL,
+            SherpaOnnxParakeetModelFiles::required_file_names().to_vec(),
+        ),
+    };
+    for file_name in file_names {
         let output_path = asr_path.join(file_name);
         if !output_path.is_file() {
-            let url = format!("{ASR_MODEL_BASE_URL}/{file_name}?download=true");
+            let url = format!("{base_url}/{file_name}?download=true");
             targets.push(DownloadTarget {
                 url,
                 output_path,
-                file_name: (*file_name).to_string(),
+                file_name: file_name.to_string(),
             });
         }
     }
@@ -185,9 +203,13 @@ pub async fn ensure_models_downloaded(
 }
 
 fn asr_model_installed(model_dir: &Path, config: &NativeAsrConfig) -> bool {
-    SherpaOnnxTransducerModelFiles::required_file_names(config.asr_precision)
-        .iter()
-        .all(|file| model_dir.join(file).is_file())
+    let names: &[&str] = match config.asr_model {
+        AsrModel::Reazonspeech => {
+            SherpaOnnxTransducerModelFiles::required_file_names(config.asr_precision)
+        }
+        AsrModel::Parakeet => SherpaOnnxParakeetModelFiles::required_file_names(),
+    };
+    names.iter().all(|file| model_dir.join(file).is_file())
 }
 
 async fn download_file(

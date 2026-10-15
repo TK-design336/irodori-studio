@@ -153,7 +153,7 @@ fn run_asr_worker(
     }
 
     if let Some(engine) = asr {
-        asr_engine_cache.store(engine);
+        asr_engine_cache.store(config.asr_model, engine);
     }
 }
 

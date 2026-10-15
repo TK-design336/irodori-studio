@@ -18,6 +18,7 @@ import {
   POST_TTS_WEB_SPEECH_RESUME_DELAY_MS,
   waitUntilTtsEchoGuardInactive,
 } from "./liveTtsEchoGuard";
+import type { AsrModel } from "../types";
 import { LiveWebSpeechAsrSession } from "./liveWebSpeechAsr";
 
 export type LiveMicAsrEngine = "native" | "web-speech";
@@ -36,6 +37,7 @@ export class LiveMicAsrSession {
   private captureWanted = false;
   private engine: LiveMicAsrEngine = "native";
   private deviceId = "";
+  private asrModel: AsrModel = "reazonspeech";
   private echoResumeUntil = 0;
   private echoTextFilterUntil = 0;
   private recentSpokenText = "";
@@ -126,9 +128,9 @@ export class LiveMicAsrSession {
 
     await ensureLiveAsrEventListeners();
     this.bindNativeListeners();
+    await syncNativeAsrConfig(this.deviceId, this.asrModel);
     await ensureNativeAsrModels();
-    await syncNativeAsrConfig(this.deviceId);
-    await preloadNativeAsr();
+    await preloadNativeAsr(this.deviceId, this.asrModel);
     await invoke("native_asr_start");
     this.nativeActive = true;
     this.callbacks.onStatus?.("話しかけてください");
@@ -152,11 +154,16 @@ export class LiveMicAsrSession {
     }
   }
 
-  async start(engine: LiveMicAsrEngine, deviceId = ""): Promise<void> {
+  async start(
+    engine: LiveMicAsrEngine,
+    deviceId = "",
+    asrModel: AsrModel = "reazonspeech",
+  ): Promise<void> {
     if (this.captureWanted && this.capturing) return;
     this.captureWanted = true;
     this.engine = engine;
     this.deviceId = deviceId;
+    this.asrModel = asrModel;
     this.pausedForPlayback = false;
     this.echoResumeUntil = 0;
     this.echoTextFilterUntil = 0;
@@ -299,9 +306,11 @@ export async function listNativeMicInputDevices(): Promise<
   return out;
 }
 
-export async function preloadLiveNativeAsr(): Promise<void> {
+export async function preloadLiveNativeAsr(
+  asrModel: AsrModel = "reazonspeech",
+): Promise<void> {
   try {
-    await preloadNativeAsr();
+    await preloadNativeAsr("", asrModel);
   } catch {
     /* models may be missing until first download */
   }

@@ -549,7 +549,7 @@ fn convert_wav_to_format(
         "m4b" => ExportAudioFormat::M4b,
         _ => ExportAudioFormat::Wav,
     };
-    export_wav_adjusted_inner(settings, wav_path.to_string(), dest, 1.0, 1.0, &Default::default(), fmt, None, None)?;
+    export_wav_adjusted_inner(settings, wav_path.to_string(), dest, 1.0, 1.0, 0.0, &Default::default(), fmt, None, None)?;
     let bytes = std::fs::read(&tmp).map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(&tmp);
     Ok((bytes, content_type_for(format)))
@@ -1009,6 +1009,7 @@ fn concat_paths_to_bytes(
             src: p.display().to_string(),
             volume,
             speed,
+            pitch: 0.0,
             audio_fx: Default::default(),
             clip_edit: None,
         })
@@ -1213,6 +1214,7 @@ async fn concat_http(
             src: p.display().to_string(),
             volume,
             speed,
+            pitch: 0.0,
             audio_fx: Default::default(),
             clip_edit: None,
         })

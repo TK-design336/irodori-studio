@@ -52,8 +52,6 @@ export type SliceMetricsRow = {
     batchMuffle?: boolean;
     backupDir?: string;
   };
-  /** A / B / ? from speaker diarization */
-  speakerCluster?: string | null;
 };
 
 type ExclusionMeta = {
@@ -70,6 +68,8 @@ type Props = {
   onContinue: () => void;
   onCancel: () => void;
   readOnly?: boolean;
+  /** When true, omit outer panel chrome (parent already provides panel header). */
+  embedded?: boolean;
 };
 
 const ASPECTS: SliceReviewAspectId[] = [
@@ -133,6 +133,7 @@ export function SliceReviewView({
   onContinue,
   onCancel,
   readOnly,
+  embedded,
 }: Props) {
   const [slices, setSlices] = useState<SliceMetricsRow[]>([]);
   const [hist, setHist] = useState<number[]>([]);
@@ -167,9 +168,6 @@ export function SliceReviewView({
   const [playDur, setPlayDur] = useState(0);
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
-  const [diarClusters, setDiarClusters] = useState<string[]>([]);
-  const [diarSelected, setDiarSelected] = useState<string[]>([]);
-  const [speakerFilter, setSpeakerFilter] = useState<string>("all");
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const blobUrlRef = useRef<string | null>(null);
   const listParentRef = useRef<HTMLDivElement>(null);
@@ -201,11 +199,6 @@ export function SliceReviewView({
         excludedCount?: number;
         byAspect?: Record<string, number>;
       }>("load_slice_review_log_cmd", { jobDir });
-      const diar = await invoke<{
-        enabled?: boolean;
-        clusters?: string[];
-        selected?: string[];
-      }>("load_diarization_cmd", { jobDir });
       const af = await invoke<{
         changedCount?: number;
         total?: number;
@@ -217,7 +210,8 @@ export function SliceReviewView({
           medianRt60?: number;
         };
       }>("load_slice_autofix_log_cmd", { jobDir });
-      setSlices(Array.isArray(metrics?.slices) ? metrics.slices : []);
+      const rawSlices = Array.isArray(metrics?.slices) ? metrics.slices : [];
+      setSlices(rawSlices);
       setHist(
         Array.isArray(metrics?.speakerSimHistogram)
           ? metrics.speakerSimHistogram
@@ -227,13 +221,6 @@ export function SliceReviewView({
       setReviewLog(log || null);
       setAutoFixLog(
         af && typeof af === "object" && typeof af.total === "number" ? af : null,
-      );
-      const clusters = Array.isArray(diar?.clusters)
-        ? diar.clusters.map(String)
-        : [];
-      setDiarClusters(clusters);
-      setDiarSelected(
-        Array.isArray(diar?.selected) ? diar.selected.map(String) : [],
       );
       setStatus("");
     } catch (e) {
@@ -263,9 +250,6 @@ export function SliceReviewView({
 
   const filtered = useMemo(() => {
     let rows = [...slices];
-    if (speakerFilter !== "all") {
-      rows = rows.filter((r) => (r.speakerCluster ?? "?") === speakerFilter);
-    }
     if (tab !== "all") {
       rows = rows.filter((r) => r.flags?.[tab] || r.hitAspects?.includes(tab));
     }
@@ -302,7 +286,7 @@ export function SliceReviewView({
       return cmpName(a, b);
     });
     return rows;
-  }, [slices, tab, allSort, speakerFilter]);
+  }, [slices, tab, allSort]);
 
   const filteredRef = useRef(filtered);
   filteredRef.current = filtered;
@@ -312,8 +296,10 @@ export function SliceReviewView({
     getScrollElement: () => listParentRef.current,
     estimateSize: (index) => {
       const row = filtered[index];
-      const extra = row?.autoFix?.changed ? 36 : 0;
-      return (row && loadedFile === row.file && playDur > 0 ? 96 : 56) + extra;
+      // Auto Fix バッジは meta 内の1行分（過剰見積もりだと行間に白隙間が出る）
+      const extra = row?.autoFix?.changed ? 22 : 0;
+      const seek = row && loadedFile === row.file && playDur > 0 ? 40 : 0;
+      return 56 + extra + seek;
     },
     overscan: 12,
     getItemKey: (index) => filtered[index]?.file ?? index,
@@ -802,16 +788,23 @@ export function SliceReviewView({
 
   return (
     <div
-      className={`slice-review panel${reviewLog?.mode === "auto" ? " is-auto-mode" : ""}`}
+      className={`slice-review${embedded ? "" : " panel"}${reviewLog?.mode === "auto" ? " is-auto-mode" : ""}`}
       id="slice-review-panel"
     >
-      <header className="panel-header">
-        <h3>スライスレビュー</h3>
-        <span className="hint">
-          Space=再生/停止 · ←→=前後 · [ ]=フラグ済み前後 · Enter=フラグ · Auto Fix ON/OFF=処理前後
-        </span>
-      </header>
-      <div className="panel-body form-stack">
+      {!embedded && (
+        <header className="panel-header">
+          <h3>スライスレビュー</h3>
+          <span className="hint">
+            Space=再生/停止 · ←→=前後 · [ ]=フラグ済み前後 · Enter=フラグ · Auto Fix ON/OFF=処理前後
+          </span>
+        </header>
+      )}
+      <div className={embedded ? "form-stack" : "panel-body form-stack"}>
+        {embedded && (
+          <span className="hint">
+            Space=再生/停止 · ←→=前後 · [ ]=フラグ済み前後 · Enter=フラグ · Auto Fix ON/OFF=処理前後
+          </span>
+        )}
         <div className="slice-review-stats" aria-live="polite">
           <span className="slice-review-stat">
             全体
@@ -876,54 +869,6 @@ export function SliceReviewView({
                   .join(", ")}）`
               : ""}
           </p>
-        )}
-        {diarClusters.length > 0 && (
-          <div className="row slice-review-diarize">
-            <span className="hint">話者クラスタ:</span>
-            <button
-              type="button"
-              className={speakerFilter === "all" ? "chip active" : "chip"}
-              onClick={() => setSpeakerFilter("all")}
-            >
-              すべて
-            </button>
-            {diarClusters.map((c) => (
-              <button
-                key={c}
-                type="button"
-                className={speakerFilter === c ? "chip active" : "chip"}
-                onClick={() => setSpeakerFilter(c)}
-              >
-                {c === "?" ? "判別不能" : `話者 ${c}`}
-              </button>
-            ))}
-            {!readOnly && diarClusters.filter((c) => c !== "?").length > 1 && (
-              <span className="hint">
-                学習に使う話者:
-                {diarClusters
-                  .filter((c) => c !== "?")
-                  .map((c) => (
-                    <label key={c} style={{ marginLeft: 8 }}>
-                      <input
-                        type="checkbox"
-                        checked={diarSelected.includes(c)}
-                        onChange={(e) => {
-                          const next = e.target.checked
-                            ? [...new Set([...diarSelected, c])]
-                            : diarSelected.filter((x) => x !== c);
-                          setDiarSelected(next);
-                          void invoke("save_diarization_cmd", {
-                            jobDir,
-                            selected: next,
-                          });
-                        }}
-                      />
-                      {c}
-                    </label>
-                  ))}
-              </span>
-            )}
-          </div>
         )}
         <div className="row slice-review-tabs" role="tablist">
           <button
@@ -1198,7 +1143,7 @@ export function SliceReviewView({
                     )}
                   </div>
                   {!readOnly && (
-                    <div className="row">
+                    <div className="slice-review-row-actions">
                       {autoFixed && (
                         <button
                           type="button"
